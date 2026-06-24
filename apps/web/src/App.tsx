@@ -6,7 +6,12 @@ import {
   exportEpisode,
   importDataset,
   listEpisodes,
+  runCleaning,
+  updateEpisodeDecision,
+  type CleaningStatus,
+  type CleaningSummary,
   type Episode,
+  type EpisodeQualityResult,
   type Project,
 } from "./api";
 import RerunViewer from "./RerunViewer";
@@ -18,12 +23,39 @@ function episodeLabel(index: number) {
   return `Episode ${index.toString().padStart(6, "0")}`;
 }
 
+function compactEpisodeLabel(index: number) {
+  return `#${index.toString().padStart(6, "0")}`;
+}
+
+function scoreLabel(score: number | null) {
+  return score === null ? "unscored" : `${Math.round(score * 100)} / 100`;
+}
+
+function statusLabel(status: CleaningStatus) {
+  return {
+    passed: "通过",
+    review: "待审查",
+    excluded: "排除",
+    unscored: "未评分",
+  }[status];
+}
+
+function pickEpisodeAfterCleaning(summary: CleaningSummary) {
+  const review = summary.results.find((result) => result.status === "review");
+  if (review) return review.episode_index;
+  const scored = summary.results
+    .filter((result) => result.score !== null)
+    .sort((left, right) => (left.score ?? 1) - (right.score ?? 1));
+  return scored[0]?.episode_index ?? summary.results[0]?.episode_index ?? null;
+}
+
 export default function App() {
   const [path, setPath] = useState(defaultPath);
   const [project, setProject] = useState<Project | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [cleaningSummary, setCleaningSummary] = useState<CleaningSummary | null>(null);
 
   const importMutation = useMutation({
     mutationFn: () => importDataset(path),
@@ -32,12 +64,35 @@ export default function App() {
       setSelected(0);
       setRecordingUrl(null);
       setExportedPath(null);
+      setCleaningSummary(null);
     },
   });
   const episodesQuery = useQuery({
     queryKey: ["episodes", project?.id],
     queryFn: () => listEpisodes(project!.id),
     enabled: Boolean(project),
+  });
+  const cleaningMutation = useMutation({
+    mutationFn: () => runCleaning(project!.id),
+    onSuccess: ({ summary }) => {
+      setCleaningSummary(summary);
+      setSelected(pickEpisodeAfterCleaning(summary));
+      setRecordingUrl(null);
+      setExportedPath(null);
+    },
+  });
+  const decisionMutation = useMutation({
+    mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
+      updateEpisodeDecision(project!.id, episodeIndex, status),
+    onSuccess: (updated) => {
+      setCleaningSummary((summary) => {
+        if (!summary) return summary;
+        const results = summary.results.map((result) =>
+          result.episode_index === updated.episode_index ? updated : result,
+        );
+        return summarizeCleaning({ ...summary, results });
+      });
+    },
   });
   const recordingMutation = useMutation({
     mutationFn: (episodeIndex: number) => createRecording(project!.id, episodeIndex),
@@ -48,10 +103,15 @@ export default function App() {
     onSuccess: ({ output_path }) => setExportedPath(output_path),
   });
 
+  const qualityByEpisode = useMemo(
+    () => new Map(cleaningSummary?.results.map((result) => [result.episode_index, result]) ?? []),
+    [cleaningSummary],
+  );
   const selectedEpisode = useMemo(
     () => episodesQuery.data?.find((episode) => episode.episode_index === selected) ?? null,
     [episodesQuery.data, selected],
   );
+  const selectedQuality = selected === null ? null : qualityByEpisode.get(selected) ?? null;
 
   return (
     <main className="app-shell">
@@ -91,7 +151,7 @@ export default function App() {
             <div><span>Dataset</span><strong>{project.dataset.total_episodes} episodes</strong></div>
             <div><span>Frames</span><strong>{project.dataset.total_frames.toLocaleString()}</strong></div>
             <div><span>Rate</span><strong>{project.dataset.fps} Hz</strong></div>
-            <div><span>Streams</span><strong>{project.dataset.video_keys.length} video</strong></div>
+            <div><span>Cleaning</span><strong>{cleaningSummary ? `${cleaningSummary.review_count} review` : "not run"}</strong></div>
           </section>
 
           <section className="workspace">
@@ -101,18 +161,16 @@ export default function App() {
                 <small>{episodesQuery.data?.length ?? 0} indexed</small>
               </div>
               <div className="episode-list">
-                {episodesQuery.data?.map((episode) => (
-                  <EpisodeRow
-                    key={episode.episode_index}
-                    episode={episode}
-                    active={episode.episode_index === selected}
-                    onSelect={() => {
-                      setSelected(episode.episode_index);
-                      setRecordingUrl(null);
-                      setExportedPath(null);
-                    }}
-                  />
-                ))}
+                <EpisodeNavigation
+                  episodes={episodesQuery.data ?? []}
+                  qualityByEpisode={qualityByEpisode}
+                  selected={selected}
+                  onSelect={(episodeIndex) => {
+                    setSelected(episodeIndex);
+                    setRecordingUrl(null);
+                    setExportedPath(null);
+                  }}
+                />
               </div>
             </aside>
 
@@ -123,6 +181,13 @@ export default function App() {
                   <h2>{selectedEpisode ? episodeLabel(selectedEpisode.episode_index) : "Episode"}</h2>
                 </div>
                 <div className="actions">
+                  <button
+                    className="secondary"
+                    disabled={cleaningMutation.isPending}
+                    onClick={() => cleaningMutation.mutate()}
+                  >
+                    {cleaningMutation.isPending ? "清洗中…" : "运行清洗 Pipeline"}
+                  </button>
                   <button
                     className="secondary"
                     disabled={selected === null || recordingMutation.isPending}
@@ -162,6 +227,14 @@ export default function App() {
               )}
               {exportedPath && <div className="success">Exported to {exportedPath}</div>}
             </section>
+
+            <QualityReport
+              quality={selectedQuality}
+              pending={decisionMutation.isPending}
+              onDecision={(status) => {
+                if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
+              }}
+            />
           </section>
         </>
       )}
@@ -169,22 +242,152 @@ export default function App() {
   );
 }
 
+function summarizeCleaning(summary: CleaningSummary): CleaningSummary {
+  return {
+    ...summary,
+    passed_count: summary.results.filter((result) => result.status === "passed").length,
+    review_count: summary.results.filter((result) => result.status === "review").length,
+    excluded_count: summary.results.filter((result) => result.status === "excluded").length,
+    unscored_count: summary.results.filter((result) => result.status === "unscored").length,
+  };
+}
+
+function EpisodeNavigation({
+  episodes,
+  qualityByEpisode,
+  selected,
+  onSelect,
+}: {
+  episodes: Episode[];
+  qualityByEpisode: Map<number, EpisodeQualityResult>;
+  selected: number | null;
+  onSelect: (episodeIndex: number) => void;
+}) {
+  if (qualityByEpisode.size === 0) {
+    return (
+      <>
+        {episodes.map((episode) => (
+          <EpisodeRow
+            key={episode.episode_index}
+            episode={episode}
+            quality={null}
+            active={episode.episode_index === selected}
+            onSelect={() => onSelect(episode.episode_index)}
+          />
+        ))}
+      </>
+    );
+  }
+  const groups: Array<{ status: CleaningStatus; label: string; episodes: Episode[] }> = [
+    { status: "review", label: "待审查", episodes: [] },
+    { status: "excluded", label: "排除", episodes: [] },
+    { status: "passed", label: "通过", episodes: [] },
+  ];
+  for (const episode of episodes) {
+    const quality = qualityByEpisode.get(episode.episode_index);
+    const group = groups.find((item) => item.status === quality?.status);
+    if (group) group.episodes.push(episode);
+  }
+  return (
+    <>
+      {groups.map((group) => (
+        <section className="episode-folder" key={group.status}>
+          <div className="folder-heading">
+            <span>{group.label}</span>
+            <small>{group.episodes.length}</small>
+          </div>
+          {group.episodes.map((episode) => (
+            <EpisodeRow
+              key={episode.episode_index}
+              episode={episode}
+              quality={qualityByEpisode.get(episode.episode_index) ?? null}
+              active={episode.episode_index === selected}
+              onSelect={() => onSelect(episode.episode_index)}
+            />
+          ))}
+        </section>
+      ))}
+    </>
+  );
+}
+
 function EpisodeRow({
   episode,
+  quality,
   active,
   onSelect,
 }: {
   episode: Episode;
+  quality: EpisodeQualityResult | null;
   active: boolean;
   onSelect: () => void;
 }) {
   return (
     <button className={`episode-row ${active ? "active" : ""}`} onClick={onSelect}>
       <span>
-        <strong>{episodeLabel(episode.episode_index)}</strong>
-        <small>{episode.length} frames · {episode.duration_seconds.toFixed(1)} s</small>
+        <strong>{quality ? compactEpisodeLabel(episode.episode_index) : episodeLabel(episode.episode_index)}</strong>
+        <small>
+          {quality
+            ? `${scoreLabel(quality.score)} · ${statusLabel(quality.status)} · ${quality.findings.length} issues`
+            : `${episode.length} frames · ${episode.duration_seconds.toFixed(1)} s`}
+        </small>
       </span>
       <b>›</b>
     </button>
+  );
+}
+
+function QualityReport({
+  quality,
+  pending,
+  onDecision,
+}: {
+  quality: EpisodeQualityResult | null;
+  pending: boolean;
+  onDecision: (status: "passed" | "excluded") => void;
+}) {
+  return (
+    <aside className="quality-panel">
+      <div className="panel-heading">
+        <span>Quality Report</span>
+      </div>
+      {!quality ? (
+        <div className="quality-empty">
+          <strong>Not scored</strong>
+          <p>Run the cleaning pipeline to classify episodes.</p>
+        </div>
+      ) : (
+        <div className="quality-body">
+          <div className="quality-score">
+            <span>{scoreLabel(quality.score)}</span>
+            <small>{statusLabel(quality.status)} · {quality.source}</small>
+          </div>
+          <div className="score-list">
+            {Object.entries(quality.per_attribute_scores).map(([name, value]) => (
+              <div key={name}>
+                <span>{name.replaceAll("_", " ")}</span>
+                <strong>{Math.round(value * 100)}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="finding-list">
+            <h3>发现 {quality.findings.length} 个问题</h3>
+            {quality.findings.length === 0 ? (
+              <p>No quality findings.</p>
+            ) : (
+              quality.findings.map((finding) => (
+                <div className="finding" key={`${finding.code}-${finding.message}`}>
+                  {finding.message}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="review-actions">
+            <button disabled={pending} onClick={() => onDecision("passed")}>通过</button>
+            <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>排除</button>
+          </div>
+        </div>
+      )}
+    </aside>
   );
 }

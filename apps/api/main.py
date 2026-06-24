@@ -3,8 +3,9 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from robot_data_studio.projects.models import CreateProjectRequest, ExportRequest, Project
+from robot_data_studio.projects.models import CleaningRunRequest, CreateProjectRequest, ExportRequest, Project
 from robot_data_studio.projects.service import ProjectService
+from robot_data_studio.quality import CleaningRun, CleaningSummary, EpisodeDecisionRequest, EpisodeQualityResult
 from robot_data_studio.viewer import create_episode_recording
 
 
@@ -69,6 +70,40 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
+    @app.post(
+        "/api/projects/{project_id}/cleaning/runs",
+        status_code=201,
+        response_model=CleaningRun,
+    )
+    def run_cleaning(project_id: str, request: CleaningRunRequest) -> CleaningRun:
+        try:
+            return service.run_cleaning(project_id, request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/projects/{project_id}/cleaning", response_model=CleaningSummary)
+    def cleaning(project_id: str) -> CleaningSummary:
+        try:
+            return service.cleaning_summary(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.patch(
+        "/api/projects/{project_id}/episodes/{episode_index}/decision",
+        response_model=EpisodeQualityResult,
+    )
+    def decision(
+        project_id: str,
+        episode_index: int,
+        request: EpisodeDecisionRequest,
+    ) -> EpisodeQualityResult:
+        try:
+            return service.update_episode_decision(project_id, episode_index, request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
     @app.get("/api/artifacts/{filename}")
     def artifact(filename: str) -> FileResponse:
         path = service.artifact_root / Path(filename).name
@@ -80,4 +115,3 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
 
 
 app = create_app()
-

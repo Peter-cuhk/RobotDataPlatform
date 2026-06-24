@@ -3,9 +3,11 @@
 一个 local-first 的机器人数据工作台 MVP。当前版本已经支持：
 
 - 导入本地 LeRobot v3 数据集并索引 episode
+- 运行清洗 Pipeline，为 episode 生成质量分数并分入通过、待审查、排除三类
+- 在待审查队列中结合 Rerun 回放做人工通过/排除决策
 - 使用 Rerun WebViewer 回放 episode 的 action、state 和视频数据
 - 将单个 episode 导出为 ACT 风格 HDF5
-- 在浏览器中完成导入、选择、回放和导出
+- 在浏览器中完成导入、清洗、选择、回放和导出
 
 ## 使用教程
 
@@ -62,10 +64,13 @@ pnpm test:web
 pnpm build:web
 ```
 
-导出的 `.rrd` 和 `.hdf5` 位于 `.rds-artifacts/`。Rerun 的 WASM 文件会在
-`dev` 或 `build` 前自动从 npm 依赖复制，不需要提交到 Git。
+导出的 `.rrd` 和 `.hdf5` 位于 `.rds-artifacts/`。每个项目的清洗状态保存在
+`.rds-artifacts/projects/<project_id>/cleaning_state.json`，只记录分数和人工决策，
+不会复制或改写源数据集。Rerun 的 WASM 文件会在 `dev` 或 `build` 前自动从 npm 依赖复制，
+不需要提交到 Git。
 
 ## 当前边界
 
-第一版只实现 LeRobot v3 输入和单 episode ACT HDF5 输出。清洗规则、质量评分、
-坐标系转换以及更多格式适配会通过 reader / exporter / validator 接口继续扩展。
+第一版只实现 LeRobot v3 输入、质量状态清单、Rerun 回放和单 episode ACT HDF5 输出。
+清洗评分当前使用本地 `score_lerobot_episodes` 兼容 adapter，后续可替换为外部库调用、
+后台任务、坐标系转换以及更多格式适配。

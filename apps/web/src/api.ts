@@ -27,6 +27,46 @@ export type Episode = {
   video_end_seconds: Record<string, number>;
 };
 
+export type CleaningStatus = "passed" | "review" | "excluded" | "unscored";
+
+export type QualityFinding = {
+  code: string;
+  severity: "info" | "warn" | "error";
+  message: string;
+};
+
+export type EpisodeQualityResult = {
+  episode_index: number;
+  score: number | null;
+  status: CleaningStatus;
+  source: "auto" | "manual";
+  per_attribute_scores: Record<string, number>;
+  findings: QualityFinding[];
+  review_note: string | null;
+  updated_at: string;
+};
+
+export type CleaningSummary = {
+  total: number;
+  passed_count: number;
+  review_count: number;
+  excluded_count: number;
+  unscored_count: number;
+  results: EpisodeQualityResult[];
+  config: {
+    pass_threshold: number;
+    review_threshold: number;
+    overwrite_manual: boolean;
+  };
+  scorer_version: string;
+};
+
+export type CleaningRun = {
+  run_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  summary: CleaningSummary;
+};
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -64,3 +104,23 @@ export function exportEpisode(projectId: string, episodeIndex: number) {
   });
 }
 
+export function runCleaning(projectId: string) {
+  return request<CleaningRun>(`/api/projects/${projectId}/cleaning/runs`, {
+    method: "POST",
+    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6 }),
+  });
+}
+
+export function updateEpisodeDecision(
+  projectId: string,
+  episodeIndex: number,
+  status: Exclude<CleaningStatus, "unscored">,
+) {
+  return request<EpisodeQualityResult>(
+    `/api/projects/${projectId}/episodes/${episodeIndex}/decision`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    },
+  );
+}

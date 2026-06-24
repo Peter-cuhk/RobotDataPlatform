@@ -145,7 +145,27 @@ data/samples/lerobot-pusht
 
 左侧会出现 episode 列表。第一版建议先选择 `episode 0` 做验证。
 
-## 8. 用 Rerun 回放 episode
+## 8. 运行清洗 Pipeline
+
+导入数据集后，点击页面工具栏里的 `运行清洗 Pipeline`。
+
+后台会读取每个 episode 的 action、state、timestamp 和视频可用性，生成一个 0 到 1 的质量分数。
+前端会把 episode 分成三个虚拟文件夹：
+
+- 待审查：分数处在中间区间，建议人工复核
+- 排除：质量分数较低，默认不进入后续清洗结果
+- 通过：质量分数较高，可直接保留
+
+第一版不会复制、删除或改写源数据集。清洗状态保存在：
+
+```bash
+.rds-artifacts/projects/<project_id>/cleaning_state.json
+```
+
+选择待审查 episode 后，可以继续用 Rerun 回放，再在右侧 Quality Report 中点击 `通过` 或 `排除`。
+人工决策会覆盖自动分桶，并在后续重新运行清洗时默认保留。
+
+## 9. 用 Rerun 回放 episode
 
 选择一个 episode 后，点击 Rerun 回放按钮。
 
@@ -169,7 +189,7 @@ data/samples/lerobot-pusht
 .rds-artifacts/
 ```
 
-## 9. 导出 ACT 风格 HDF5
+## 10. 导出 ACT 风格 HDF5
 
 选择 episode 后，点击 HDF5 导出按钮。
 
@@ -201,7 +221,7 @@ episode_index
 e252f69849d4-episode-000000.hdf5
 ```
 
-## 10. 验证整个流程
+## 11. 验证整个流程
 
 如果你想确认本地状态是健康的，执行：
 
@@ -225,6 +245,8 @@ pnpm build:web
 - 前端测试通过
 - 前端 production build 通过
 - LeRobot 样例数据可导入
+- 清洗 Pipeline 可生成通过、待审查、排除三类状态
+- 待审查 episode 可人工通过或排除
 - episode 0 可生成 Rerun `.rrd`
 - Rerun WebViewer 可正常加载
 - episode 0 可导出 HDF5

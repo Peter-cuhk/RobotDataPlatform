@@ -61,3 +61,92 @@ def test_export_episode_to_act_hdf5(tmp_path: Path) -> None:
         assert file["action"].shape == (161, 2)
         assert file["observations/qpos"].shape == (161, 2)
         assert file.attrs["sim"] is True or file.attrs["sim"] == 1
+
+
+def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "succeeded"
+    assert body["run_id"]
+    summary = body["summary"]
+    assert summary["total"] == 206
+    assert summary["passed_count"] + summary["review_count"] + summary["excluded_count"] == 206
+    assert summary["unscored_count"] == 0
+    assert summary["config"] == {
+        "pass_threshold": 0.85,
+        "review_threshold": 0.65,
+        "overwrite_manual": False,
+    }
+    first_result = summary["results"][0]
+    assert first_result["episode_index"] == 0
+    assert 0 <= first_result["score"] <= 1
+    assert first_result["source"] == "auto"
+    assert "smoothness" in first_result["per_attribute_scores"]
+
+    stored = client.get(f"/api/projects/{project['id']}/cleaning")
+
+    assert stored.status_code == 200
+    assert stored.json()["total"] == 206
+
+
+def test_manual_episode_decision_is_persisted_and_preserved_by_rerun(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    decision = client.patch(
+        f"/api/projects/{project['id']}/episodes/0/decision",
+        json={"status": "excluded", "note": "bad wrist camera"},
+    )
+
+    assert decision.status_code == 200
+    result = decision.json()
+    assert result["episode_index"] == 0
+    assert result["status"] == "excluded"
+    assert result["source"] == "manual"
+    assert result["review_note"] == "bad wrist camera"
+
+    client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.1, "review_threshold": 0.05},
+    )
+    preserved = client.get(f"/api/projects/{project['id']}/cleaning").json()["results"][0]
+
+    assert preserved["status"] == "excluded"
+    assert preserved["source"] == "manual"
+    assert preserved["review_note"] == "bad wrist camera"
+
+
+def test_cleaning_rerun_can_overwrite_manual_decisions(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+    client.patch(
+        f"/api/projects/{project['id']}/episodes/0/decision",
+        json={"status": "excluded", "note": "bad wrist camera"},
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.1, "review_threshold": 0.05, "overwrite_manual": True},
+    )
+
+    assert response.status_code == 201
+    first_result = response.json()["summary"]["results"][0]
+    assert first_result["source"] == "auto"
+    assert first_result["status"] == "passed"
+    assert first_result["review_note"] is None
