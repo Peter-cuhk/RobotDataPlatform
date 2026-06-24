@@ -1,0 +1,17 @@
+.venv/
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.rds-artifacts/
+.coverage
+*.pyc
+*.tsbuildinfo
+.DS_Store
+.prd_build/
+.prd_render/
+.superpowers/
+data/samples/*
+!data/samples/.gitkeep
+apps/web/public/rerun/

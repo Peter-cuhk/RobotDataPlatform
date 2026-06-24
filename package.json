@@ -1,0 +1,10 @@
+{
+  "name": "robot-data-studio",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev:web": "node scripts/copy-rerun-wasm.mjs && cd apps/web && node node_modules/vite/bin/vite.js --host 127.0.0.1",
+    "test:web": "cd apps/web && node node_modules/vitest/vitest.mjs --run",
+    "build:web": "node scripts/copy-rerun-wasm.mjs && cd apps/web && node node_modules/typescript/bin/tsc -b && node node_modules/vite/bin/vite.js build"
+  }
+}
