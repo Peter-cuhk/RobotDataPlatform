@@ -5,6 +5,8 @@ from .models import (
     EpisodeDecisionRequest,
     EpisodeQualityResult,
     QualityFinding,
+    VlmEvaluation,
+    VlmSettings,
 )
 from .scorer import EpisodeQualityScorer
 
@@ -16,4 +18,6 @@ __all__ = [
     "EpisodeQualityResult",
     "EpisodeQualityScorer",
     "QualityFinding",
+    "VlmEvaluation",
+    "VlmSettings",
 ]

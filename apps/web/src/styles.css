@@ -27,7 +27,7 @@ button { cursor: pointer; }
   top: 46px;
   right: 0;
   z-index: 10;
-  width: 260px;
+  width: 360px;
   display: grid;
   gap: 12px;
   padding: 14px;
@@ -38,7 +38,7 @@ button { cursor: pointer; }
   box-shadow: 0 16px 40px #0008;
 }
 .vlm-popover label { display: grid; gap: 6px; font-size: 11px; font-weight: 800; color: #8fa0b2; }
-.vlm-popover input:not([type="checkbox"]), .vlm-popover select {
+.vlm-popover input:not([type="checkbox"]), .vlm-popover select, .vlm-popover textarea {
   width: 100%;
   padding: 9px 10px;
   color: #dce6ef;
@@ -46,17 +46,22 @@ button { cursor: pointer; }
   border: 1px solid #2b3745;
   border-radius: 7px;
 }
+.vlm-popover textarea {
+  min-height: 112px;
+  resize: vertical;
+  line-height: 1.45;
+}
 .vlm-popover .checkbox-row { display: flex; align-items: center; gap: 8px; color: #dce6ef; }
 
 .import-bar {
   display: grid;
-  grid-template-columns: minmax(500px, 1fr) auto;
+  grid-template-columns: minmax(420px, 1fr) 220px auto;
   gap: 14px;
   align-items: end;
   padding: 20px 0;
 }
 .import-bar label { display: grid; gap: 7px; color: #8c9aaa; font-size: 11px; font-weight: 700; }
-.import-bar input {
+.import-bar input, .import-bar select {
   width: 100%;
   padding: 12px 14px;
   color: #d9e2eb;
@@ -66,6 +71,7 @@ button { cursor: pointer; }
   outline: none;
 }
 .import-bar input:focus { border-color: #4a8fd8; box-shadow: 0 0 0 3px #1b477440; }
+.import-bar select:focus { border-color: #4a8fd8; box-shadow: 0 0 0 3px #1b477440; outline: none; }
 button {
   padding: 11px 16px;
   color: white;
@@ -201,7 +207,60 @@ button:disabled { cursor: wait; opacity: .55; }
 .viewer-toolbar h2 { margin: 2px 0 0; font-size: 18px; }
 .actions { display: flex; gap: 8px; }
 .viewer-stage { height: 530px; background: #080c11; }
+.export-panel {
+  display: grid;
+  grid-template-columns: 220px 220px;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid #25303c;
+  background: #0e151d;
+}
+.export-panel label { display: grid; gap: 6px; color: #8292a4; font-size: 11px; font-weight: 850; }
+.export-panel select {
+  width: 100%;
+  padding: 9px 10px;
+  color: #e6edf5;
+  background: #0b1118;
+  border: 1px solid #2d3a49;
+  border-radius: 7px;
+  outline: none;
+}
+.rerun-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
 .rerun-host { width: 100%; height: 100%; }
+.rerun-controls {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px;
+  background: #0b1118e6;
+  border: 1px solid #2b3948;
+  border-radius: 8px;
+  box-shadow: 0 12px 30px #0008;
+  transform: translateX(-50%);
+}
+.rerun-controls button {
+  min-width: 38px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 7px;
+}
+.rerun-controls .icon-button {
+  color: #dbe7f2;
+  background: #16212c;
+  border-color: #304052;
+  font-size: 18px;
+  line-height: 1;
+}
+.rerun-controls .play-toggle {
+  min-width: 62px;
+}
 .viewer-placeholder {
   height: 100%;
   display: grid;

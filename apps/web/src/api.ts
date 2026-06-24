@@ -16,6 +16,15 @@ export type Project = {
   dataset: DatasetMetadata;
 };
 
+export type FormatInfo = {
+  id: string;
+  label: string;
+  profile: string;
+  can_import: boolean;
+  can_export: boolean;
+  requires_extra?: boolean;
+};
+
 export type Episode = {
   episode_index: number;
   length: number;
@@ -67,10 +76,21 @@ export type CleaningRun = {
   summary: CleaningSummary;
 };
 
+export type ExportResult = {
+  output_path: string;
+  report_path: string;
+  format: string;
+  episode_count: number;
+};
+
 export type VlmSettings = {
   enabled: boolean;
   provider: string;
   model: string;
+  api_base_url: string | null;
+  api_key?: string | null;
+  prompt: string;
+  sample_frames: number;
 };
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -85,10 +105,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return response.json();
 }
 
-export function importDataset(path: string) {
+export function listFormats() {
+  return request<FormatInfo[]>("/api/formats");
+}
+
+export function importDataset(path: string, formatHint?: string) {
+  const normalizedPath = path.trim().replace(/^(['"])(.*)\1$/, "$2").trim();
+  const body = formatHint && formatHint !== "auto" ? { path: normalizedPath, format_hint: formatHint } : { path: normalizedPath };
   return request<Project>("/api/projects", {
     method: "POST",
-    body: JSON.stringify({ path }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -103,10 +129,10 @@ export function createRecording(projectId: string, episodeIndex: number) {
   );
 }
 
-export function exportEpisode(projectId: string, episodeIndex: number) {
-  return request<{ output_path: string }>(`/api/projects/${projectId}/exports`, {
+export function exportDataset(projectId: string, episodeIndexes: number[], format: string) {
+  return request<ExportResult>(`/api/projects/${projectId}/exports`, {
     method: "POST",
-    body: JSON.stringify({ episode_indexes: [episodeIndex], format: "act_hdf5" }),
+    body: JSON.stringify({ episode_indexes: episodeIndexes, format, options: {} }),
   });
 }
 
@@ -114,6 +140,13 @@ export function runCleaning(projectId: string, vlm?: VlmSettings) {
   return request<CleaningRun>(`/api/projects/${projectId}/cleaning/runs`, {
     method: "POST",
     body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6, ...(vlm ? { vlm } : {}) }),
+  });
+}
+
+export function saveVlmSettings(projectId: string, settings: VlmSettings) {
+  return request<VlmSettings>(`/api/projects/${projectId}/vlm-settings`, {
+    method: "PATCH",
+    body: JSON.stringify(settings),
   });
 }
 

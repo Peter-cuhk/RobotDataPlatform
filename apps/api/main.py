@@ -3,9 +3,16 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from robot_data_studio.formats import UnsupportedDatasetFormat
 from robot_data_studio.projects.models import CleaningRunRequest, CreateProjectRequest, ExportRequest, Project
 from robot_data_studio.projects.service import ProjectService
-from robot_data_studio.quality import CleaningRun, CleaningSummary, EpisodeDecisionRequest, EpisodeQualityResult
+from robot_data_studio.quality import (
+    CleaningRun,
+    CleaningSummary,
+    EpisodeDecisionRequest,
+    EpisodeQualityResult,
+    VlmSettings,
+)
 from robot_data_studio.viewer import create_episode_recording
 
 
@@ -17,11 +24,15 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/api/formats")
+    def formats():
+        return service.formats()
+
     @app.post("/api/projects", status_code=201, response_model=Project)
     def create_project(request: CreateProjectRequest) -> Project:
         try:
-            return service.create(request.path)
-        except (ValueError, OSError) as error:
+            return service.create(request.path, request.format_hint)
+        except (UnsupportedDatasetFormat, ValueError, OSError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}", response_model=Project)
@@ -59,16 +70,19 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.post("/api/projects/{project_id}/exports", status_code=201)
-    def export(project_id: str, request: ExportRequest) -> dict[str, str]:
-        if request.format != "act_hdf5":
-            raise HTTPException(status_code=400, detail="Only act_hdf5 is supported")
-        if len(request.episode_indexes) != 1:
-            raise HTTPException(status_code=400, detail="Export exactly one episode")
+    def export(project_id: str, request: ExportRequest) -> dict[str, str | int]:
         try:
-            output = service.export_act(project_id, request.episode_indexes[0])
-            return {"output_path": str(output)}
+            output = service.export_dataset(project_id, request.format, request.episode_indexes)
+            return {
+                "output_path": str(output.output_path),
+                "report_path": str(output.report_path),
+                "format": output.format,
+                "episode_count": output.episode_count,
+            }
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        except UnsupportedDatasetFormat as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post(
         "/api/projects/{project_id}/cleaning/runs",
@@ -87,6 +101,20 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
     def cleaning(project_id: str) -> CleaningSummary:
         try:
             return service.cleaning_summary(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get("/api/projects/{project_id}/vlm-settings", response_model=VlmSettings)
+    def vlm_settings(project_id: str) -> VlmSettings:
+        try:
+            return service.vlm_settings(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.patch("/api/projects/{project_id}/vlm-settings", response_model=VlmSettings)
+    def update_vlm_settings(project_id: str, request: VlmSettings) -> VlmSettings:
+        try:
+            return service.update_vlm_settings(project_id, request)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 

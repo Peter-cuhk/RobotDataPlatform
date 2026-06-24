@@ -22,6 +22,24 @@ def test_import_dataset_and_list_episodes(tmp_path: Path) -> None:
     assert [item["episode_index"] for item in episodes.json()] == [0, 1]
 
 
+def test_import_dataset_requires_non_empty_path(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+
+    response = client.post("/api/projects", json={"path": ""})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Dataset path is required"
+
+
+def test_import_dataset_accepts_shell_quoted_path(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+
+    response = client.post("/api/projects", json={"path": f"'{SAMPLE}'"})
+
+    assert response.status_code == 201
+    assert response.json()["dataset"]["path"] == str(SAMPLE)
+
+
 def test_get_episode_frames(tmp_path: Path) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
@@ -84,6 +102,18 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
         "pass_threshold": 0.85,
         "review_threshold": 0.65,
         "overwrite_manual": False,
+        "vlm": {
+            "enabled": False,
+            "provider": "OpenAI",
+            "model": "gpt-4o-mini",
+            "api_base_url": None,
+            "prompt": (
+                "You are an automated robot episode evaluator. Return only JSON with "
+                "success, score, and reason. Judge whether the task was successfully "
+                "completed from the visual evidence."
+            ),
+            "sample_frames": 4,
+        },
     }
     first_result = summary["results"][0]
     assert first_result["episode_index"] == 0
@@ -150,3 +180,38 @@ def test_cleaning_rerun_can_overwrite_manual_decisions(tmp_path: Path) -> None:
     assert first_result["source"] == "auto"
     assert first_result["status"] == "passed"
     assert first_result["review_note"] is None
+
+
+def test_project_vlm_settings_are_persisted_without_returning_api_key(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.patch(
+        f"/api/projects/{project['id']}/vlm-settings",
+        json={
+            "enabled": True,
+            "provider": "OpenAI",
+            "model": "gpt-4o-mini",
+            "api_base_url": "http://localhost:11434/v1",
+            "api_key": "secret-key",
+            "prompt": "Return JSON. Task: {task}",
+            "sample_frames": 6,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "enabled": True,
+        "provider": "OpenAI",
+        "model": "gpt-4o-mini",
+        "api_base_url": "http://localhost:11434/v1",
+        "prompt": "Return JSON. Task: {task}",
+        "sample_frames": 6,
+    }
+    assert "api_key" not in body
+
+    stored = client.get(f"/api/projects/{project['id']}/vlm-settings")
+
+    assert stored.status_code == 200
+    assert stored.json() == body

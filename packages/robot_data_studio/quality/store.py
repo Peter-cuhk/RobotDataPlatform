@@ -5,7 +5,7 @@ from pathlib import Path
 
 from robot_data_studio.lerobot.models import EpisodeSummary
 
-from .models import CleaningConfig, CleaningSummary, EpisodeQualityResult, utc_now
+from .models import CleaningConfig, CleaningSummary, EpisodeQualityResult, VlmSettings, utc_now
 
 SCORER_VERSION = "score_lerobot_episodes-compatible-v1"
 
@@ -23,6 +23,21 @@ class CleaningStateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(summary.model_dump(mode="json"), indent=2))
         return summary
+
+
+class VlmSettingsStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> VlmSettings:
+        if not self.path.is_file():
+            return VlmSettings()
+        return VlmSettings.model_validate_json(self.path.read_text())
+
+    def save(self, settings: VlmSettings) -> VlmSettings:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(settings.model_dump(mode="json"), indent=2))
+        return settings
 
 
 def build_summary(

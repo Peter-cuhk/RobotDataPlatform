@@ -3,15 +3,19 @@ import { useMemo, useState } from "react";
 
 import {
   createRecording,
-  exportEpisode,
+  exportDataset,
   importDataset,
+  listFormats,
   listEpisodes,
   runCleaning,
+  saveVlmSettings,
   updateEpisodeDecision,
   type CleaningStatus,
   type CleaningSummary,
   type Episode,
   type EpisodeQualityResult,
+  type ExportResult,
+  type FormatInfo,
   type Project,
   type VlmSettings,
 } from "./api";
@@ -19,6 +23,9 @@ import RerunViewer from "./RerunViewer";
 import "./styles.css";
 
 const defaultPath = "data/samples/lerobot-pusht";
+const datasetPathPlaceholder = "data/samples/lerobot-pusht";
+const defaultVlmPrompt =
+  "You are an automated robot episode evaluator. Return only JSON with success, score, and reason. Judge whether the task was successfully completed from the visual evidence.";
 const findingFilters = [
   { code: "blur", label: "模糊帧" },
   { code: "time_sync", label: "时间不同步" },
@@ -58,10 +65,13 @@ function pickEpisodeAfterCleaning(summary: CleaningSummary) {
 
 export default function App() {
   const [path, setPath] = useState(defaultPath);
+  const [importFormat, setImportFormat] = useState("auto");
+  const [exportFormat, setExportFormat] = useState("act_hdf5");
+  const [exportScope, setExportScope] = useState<"selected" | "all">("selected");
   const [project, setProject] = useState<Project | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
-  const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [exportedResult, setExportedResult] = useState<ExportResult | null>(null);
   const [cleaningSummary, setCleaningSummary] = useState<CleaningSummary | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFindingFilters, setActiveFindingFilters] = useState<string[]>([]);
@@ -70,15 +80,22 @@ export default function App() {
     enabled: false,
     provider: "OpenAI",
     model: "gpt-4o-mini",
+    api_base_url: null,
+    prompt: defaultVlmPrompt,
+    sample_frames: 4,
   });
 
+  const formatsQuery = useQuery({
+    queryKey: ["formats"],
+    queryFn: listFormats,
+  });
   const importMutation = useMutation({
-    mutationFn: () => importDataset(path),
+    mutationFn: () => importDataset(path, importFormat),
     onSuccess: (value) => {
       setProject(value);
       setSelected(0);
       setRecordingUrl(null);
-      setExportedPath(null);
+      setExportedResult(null);
       setCleaningSummary(null);
     },
   });
@@ -93,8 +110,11 @@ export default function App() {
       setCleaningSummary(summary);
       setSelected(pickEpisodeAfterCleaning(summary));
       setRecordingUrl(null);
-      setExportedPath(null);
+      setExportedResult(null);
     },
+  });
+  const vlmSettingsMutation = useMutation({
+    mutationFn: (settings: VlmSettings) => saveVlmSettings(project!.id, settings),
   });
   const decisionMutation = useMutation({
     mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
@@ -114,8 +134,16 @@ export default function App() {
     onSuccess: ({ recording_url }) => setRecordingUrl(recording_url),
   });
   const exportMutation = useMutation({
-    mutationFn: (episodeIndex: number) => exportEpisode(project!.id, episodeIndex),
-    onSuccess: ({ output_path }) => setExportedPath(output_path),
+    mutationFn: () => {
+      const episodeIndexes =
+        exportScope === "all"
+          ? (episodesQuery.data ?? []).map((episode) => episode.episode_index)
+          : selected !== null
+            ? [selected]
+            : [];
+      return exportDataset(project!.id, episodeIndexes, exportFormat);
+    },
+    onSuccess: (result) => setExportedResult(result),
   });
 
   const qualityByEpisode = useMemo(
@@ -126,7 +154,33 @@ export default function App() {
     () => episodesQuery.data?.find((episode) => episode.episode_index === selected) ?? null,
     [episodesQuery.data, selected],
   );
+  const selectedEpisodePosition = useMemo(
+    () => (selected === null ? -1 : (episodesQuery.data ?? []).findIndex((episode) => episode.episode_index === selected)),
+    [episodesQuery.data, selected],
+  );
   const selectedQuality = selected === null ? null : qualityByEpisode.get(selected) ?? null;
+  const formats = formatsQuery.data ?? [];
+  const importFormats = formats.filter((format) => format.can_import);
+  const exportFormats = formats.filter((format) => format.can_export);
+  const updateVlmSettings = (nextSettings: VlmSettings) => {
+    setVlmSettings(nextSettings);
+    if (project) {
+      vlmSettingsMutation.mutate(nextSettings);
+    }
+  };
+  const replayEpisode = (episodeIndex: number) => {
+    setSelected(episodeIndex);
+    setRecordingUrl(null);
+    setExportedResult(null);
+    recordingMutation.mutate(episodeIndex);
+  };
+  const replayAdjacentEpisode = (offset: -1 | 1) => {
+    const episodes = episodesQuery.data ?? [];
+    if (selectedEpisodePosition < 0) return;
+    const nextEpisode = episodes[selectedEpisodePosition + offset];
+    if (!nextEpisode) return;
+    replayEpisode(nextEpisode.episode_index);
+  };
 
   return (
     <main className="app-shell">
@@ -143,7 +197,7 @@ export default function App() {
           {showVlmSettings && (
             <VlmSettingsPanel
               settings={vlmSettings}
-              onChange={setVlmSettings}
+              onChange={updateVlmSettings}
             />
           )}
         </div>
@@ -154,9 +208,25 @@ export default function App() {
           <span>Dataset path</span>
           <input
             aria-label="Dataset path"
+            placeholder={datasetPathPlaceholder}
             value={path}
             onChange={(event) => setPath(event.target.value)}
           />
+        </label>
+        <label>
+          <span>Import format</span>
+          <select
+            aria-label="Import format"
+            value={importFormat}
+            onChange={(event) => setImportFormat(event.target.value)}
+          >
+            <option value="auto">Auto detect</option>
+            {importFormats.map((format) => (
+              <option key={format.id} value={format.id}>
+                {format.label}
+              </option>
+            ))}
+          </select>
         </label>
         <button onClick={() => importMutation.mutate()} disabled={importMutation.isPending}>
           {importMutation.isPending ? "Scanning…" : "Import dataset"}
@@ -167,13 +237,13 @@ export default function App() {
       {!project ? (
         <section className="empty-state">
           <div className="empty-icon">↳</div>
-          <h2>Open a LeRobot v3 dataset</h2>
-          <p>Metadata, episodes, synchronized signals and replay stay on this machine.</p>
+          <h2>Open a robot dataset</h2>
+          <p>LeRobot, HDF5 and UMI/Zarr data stay on this machine.</p>
         </section>
       ) : (
         <>
           <section className="dataset-strip">
-            <div><span>Format</span><strong>{project.dataset.version}</strong></div>
+            <div><span>Format</span><strong>{project.dataset.format} · {project.dataset.version}</strong></div>
             <div><span>Dataset</span><strong>{project.dataset.total_episodes} episodes</strong></div>
             <div><span>Frames</span><strong>{project.dataset.total_frames.toLocaleString()}</strong></div>
             <div><span>Rate</span><strong>{project.dataset.fps} Hz</strong></div>
@@ -204,7 +274,7 @@ export default function App() {
                   onSelect={(episodeIndex) => {
                     setSelected(episodeIndex);
                     setRecordingUrl(null);
-                    setExportedPath(null);
+                    setExportedResult(null);
                   }}
                 />
               </div>
@@ -227,22 +297,44 @@ export default function App() {
                   <button
                     className="secondary"
                     disabled={selected === null || recordingMutation.isPending}
-                    onClick={() => selected !== null && recordingMutation.mutate(selected)}
+                    onClick={() => selected !== null && replayEpisode(selected)}
                   >
                     {recordingMutation.isPending ? "Building replay…" : "Replay in Rerun"}
                   </button>
                   <button
-                    disabled={selected === null || exportMutation.isPending}
-                    onClick={() => selected !== null && exportMutation.mutate(selected)}
+                    disabled={
+                      exportMutation.isPending ||
+                      (exportScope === "selected" && selected === null) ||
+                      (exportScope === "all" && !episodesQuery.data?.length)
+                    }
+                    onClick={() => exportMutation.mutate()}
                   >
-                    {exportMutation.isPending ? "Exporting…" : "Export ACT HDF5"}
+                    {exportMutation.isPending ? "Exporting…" : exportScope === "all" ? "Export all" : "Export selected"}
                   </button>
                 </div>
               </div>
 
+              <ExportPanel
+                formats={exportFormats}
+                selectedFormat={exportFormat}
+                scope={exportScope}
+                onFormatChange={setExportFormat}
+                onScopeChange={setExportScope}
+              />
+
               <div className="viewer-stage">
                 {recordingUrl ? (
-                  <RerunViewer recordingUrl={recordingUrl} />
+                  <RerunViewer
+                    recordingUrl={recordingUrl}
+                    canGoPrevious={selectedEpisodePosition > 0 && !recordingMutation.isPending}
+                    canGoNext={
+                      selectedEpisodePosition >= 0 &&
+                      selectedEpisodePosition < (episodesQuery.data?.length ?? 0) - 1 &&
+                      !recordingMutation.isPending
+                    }
+                    onPreviousEpisode={() => replayAdjacentEpisode(-1)}
+                    onNextEpisode={() => replayAdjacentEpisode(1)}
+                  />
                 ) : (
                   <div className="viewer-placeholder">
                     <div className="signal-preview">
@@ -261,7 +353,13 @@ export default function App() {
                   <div className="task"><span>Task</span><strong>{selectedEpisode.tasks[0]}</strong></div>
                 </footer>
               )}
-              {exportedPath && <div className="success">Exported to {exportedPath}</div>}
+              {exportedResult && (
+                <div className="success">
+                  Exported {exportedResult.episode_count} episode(s) to {exportedResult.output_path}
+                  <br />
+                  Report: {exportedResult.report_path}
+                </div>
+              )}
             </section>
 
             <QualityReport
@@ -276,6 +374,50 @@ export default function App() {
         </>
       )}
     </main>
+  );
+}
+
+function ExportPanel({
+  formats,
+  selectedFormat,
+  scope,
+  onFormatChange,
+  onScopeChange,
+}: {
+  formats: FormatInfo[];
+  selectedFormat: string;
+  scope: "selected" | "all";
+  onFormatChange: (value: string) => void;
+  onScopeChange: (value: "selected" | "all") => void;
+}) {
+  return (
+    <div className="export-panel">
+      <label>
+        <span>Export format</span>
+        <select
+          aria-label="Export format"
+          value={selectedFormat}
+          onChange={(event) => onFormatChange(event.target.value)}
+        >
+          {formats.map((format) => (
+            <option key={format.id} value={format.id}>
+              {format.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>Export scope</span>
+        <select
+          aria-label="Export scope"
+          value={scope}
+          onChange={(event) => onScopeChange(event.target.value as "selected" | "all")}
+        >
+          <option value="selected">Selected episode</option>
+          <option value="all">All indexed episodes</option>
+        </select>
+      </label>
+    </div>
   );
 }
 
@@ -521,6 +663,7 @@ function VlmSettingsPanel({
   settings: VlmSettings;
   onChange: (settings: VlmSettings) => void;
 }) {
+  const update = (changes: Partial<VlmSettings>) => onChange({ ...settings, ...changes });
   return (
     <div className="vlm-popover">
       <label className="checkbox-row">
@@ -528,7 +671,7 @@ function VlmSettingsPanel({
           type="checkbox"
           aria-label="启用 VLM"
           checked={settings.enabled}
-          onChange={(event) => onChange({ ...settings, enabled: event.target.checked })}
+          onChange={(event) => update({ enabled: event.target.checked })}
         />
         启用 VLM
       </label>
@@ -537,7 +680,7 @@ function VlmSettingsPanel({
         <select
           aria-label="VLM Provider"
           value={settings.provider}
-          onChange={(event) => onChange({ ...settings, provider: event.target.value })}
+          onChange={(event) => update({ provider: event.target.value })}
         >
           <option>OpenAI</option>
           <option>Gemini</option>
@@ -549,7 +692,45 @@ function VlmSettingsPanel({
         <input
           aria-label="VLM 模型"
           value={settings.model}
-          onChange={(event) => onChange({ ...settings, model: event.target.value })}
+          onChange={(event) => update({ model: event.target.value })}
+        />
+      </label>
+      <label>
+        <span>API Base URL</span>
+        <input
+          aria-label="VLM API Base URL"
+          placeholder="https://api.openai.com/v1"
+          value={settings.api_base_url ?? ""}
+          onChange={(event) => update({ api_base_url: event.target.value || null })}
+        />
+      </label>
+      <label>
+        <span>API Key</span>
+        <input
+          aria-label="VLM API Key"
+          type="password"
+          placeholder="Use env var if blank"
+          value={settings.api_key ?? ""}
+          onChange={(event) => update({ api_key: event.target.value || null })}
+        />
+      </label>
+      <label>
+        <span>Sample Frames</span>
+        <input
+          aria-label="VLM Sample Frames"
+          type="number"
+          min={1}
+          max={12}
+          value={settings.sample_frames}
+          onChange={(event) => update({ sample_frames: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        <span>Prompt</span>
+        <textarea
+          aria-label="VLM Prompt"
+          value={settings.prompt}
+          onChange={(event) => update({ prompt: event.target.value })}
         />
       </label>
     </div>

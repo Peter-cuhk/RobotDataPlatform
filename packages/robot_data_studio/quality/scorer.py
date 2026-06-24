@@ -6,7 +6,8 @@ from statistics import median
 from robot_data_studio.lerobot.models import EpisodeFrame
 from robot_data_studio.lerobot.reader import LeRobotDatasetReader
 
-from .models import CleaningConfig, EpisodeQualityResult, QualityFinding, utc_now
+from .models import CleaningConfig, EpisodeQualityResult, QualityFinding, VlmEvaluation, utc_now
+from .vlm import VlmEvaluationError, VlmTaskSuccessEvaluator
 
 
 def _distance(left: list[float], right: list[float]) -> float:
@@ -101,10 +102,33 @@ def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]
     return findings
 
 
+def _vlm_findings(evaluation: VlmEvaluation | None, error: str | None) -> list[QualityFinding]:
+    if error:
+        return [
+            QualityFinding(
+                code="vlm_unavailable",
+                severity="warn",
+                message=error,
+            )
+        ]
+    if evaluation and not evaluation.success:
+        return [
+            QualityFinding(
+                code="vlm_failed",
+                severity="warn",
+                message=evaluation.reason or "VLM task success check failed.",
+            )
+        ]
+    return []
+
+
 class EpisodeQualityScorer:
     """A local scorer adapter shaped after RoboticsData/score_lerobot_episodes output."""
 
     scorer_version = "score_lerobot_episodes-compatible-v1"
+
+    def __init__(self, vlm_evaluator: VlmTaskSuccessEvaluator | None = None) -> None:
+        self._vlm_evaluator = vlm_evaluator or VlmTaskSuccessEvaluator()
 
     def score_dataset(
         self,
@@ -137,6 +161,14 @@ class EpisodeQualityScorer:
             "runtime": _runtime_score(duration_seconds, nominal_duration),
             "actuator_saturation": _tracking_score(frames),
         }
+        vlm_evaluation = None
+        vlm_error = None
+        if config.vlm.enabled:
+            try:
+                vlm_evaluation = self._vlm_evaluator.evaluate(reader, episode_index, config.vlm)
+                per_attribute_scores["task_success"] = vlm_evaluation.score
+            except VlmEvaluationError as error:
+                vlm_error = str(error)
         score = sum(per_attribute_scores.values()) / len(per_attribute_scores)
         return EpisodeQualityResult(
             episode_index=episode_index,
@@ -144,6 +176,9 @@ class EpisodeQualityScorer:
             status=_status_for_score(score, config),
             source="auto",
             per_attribute_scores=per_attribute_scores,
-            findings=_findings(per_attribute_scores, has_video),
+            findings=[
+                *_findings(per_attribute_scores, has_video),
+                *_vlm_findings(vlm_evaluation, vlm_error),
+            ],
             updated_at=utc_now(),
         )

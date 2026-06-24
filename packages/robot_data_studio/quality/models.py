@@ -9,12 +9,38 @@ from pydantic import BaseModel, Field
 CleaningStatus = Literal["passed", "review", "excluded", "unscored"]
 DecisionSource = Literal["auto", "manual"]
 FindingSeverity = Literal["info", "warn", "error"]
+VlmProvider = Literal["OpenAI", "Gemini", "Local"]
+
+
+DEFAULT_VLM_PROMPT = (
+    "You are an automated robot episode evaluator. Return only JSON with success, "
+    "score, and reason. Judge whether the task was successfully completed from the "
+    "visual evidence."
+)
+
+
+class VlmSettings(BaseModel):
+    enabled: bool = False
+    provider: VlmProvider = "OpenAI"
+    model: str = "gpt-4o-mini"
+    api_base_url: str | None = None
+    api_key: str | None = Field(default=None, exclude=True)
+    prompt: str = DEFAULT_VLM_PROMPT
+    sample_frames: int = Field(default=4, ge=1, le=12)
+
+
+class VlmEvaluation(BaseModel):
+    success: bool
+    score: float = Field(ge=0, le=1)
+    reason: str = ""
+    raw_response: dict | None = None
 
 
 class CleaningConfig(BaseModel):
     pass_threshold: float = Field(default=0.8, ge=0, le=1)
     review_threshold: float = Field(default=0.6, ge=0, le=1)
     overwrite_manual: bool = False
+    vlm: VlmSettings = Field(default_factory=VlmSettings)
 
 
 class QualityFinding(BaseModel):

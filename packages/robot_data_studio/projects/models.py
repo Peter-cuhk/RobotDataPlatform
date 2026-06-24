@@ -11,11 +11,13 @@ class Project(BaseModel):
 
 class CreateProjectRequest(BaseModel):
     path: str
+    format_hint: str | None = None
 
 
 class ExportRequest(BaseModel):
     episode_indexes: list[int]
     format: str
+    options: dict = {}
 
 
 class CleaningRunRequest(CleaningConfig):
