@@ -7,7 +7,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 1100px; background: #0c1117; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { cursor: pointer; }
 
 .app-shell { min-height: 100vh; padding: 0 28px 28px; }
@@ -21,6 +21,32 @@ button { cursor: pointer; }
 .topbar h1 { margin: 2px 0 0; font-size: 23px; letter-spacing: -0.03em; }
 .eyebrow { color: #718096; font-size: 10px; font-weight: 800; letter-spacing: .18em; }
 .status-dot { color: #5bd69b; font-size: 12px; }
+.topbar-actions { position: relative; display: flex; align-items: center; gap: 10px; }
+.vlm-popover {
+  position: absolute;
+  top: 46px;
+  right: 0;
+  z-index: 10;
+  width: 260px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  color: #c9d5e2;
+  background: #111922;
+  border: 1px solid #314052;
+  border-radius: 8px;
+  box-shadow: 0 16px 40px #0008;
+}
+.vlm-popover label { display: grid; gap: 6px; font-size: 11px; font-weight: 800; color: #8fa0b2; }
+.vlm-popover input:not([type="checkbox"]), .vlm-popover select {
+  width: 100%;
+  padding: 9px 10px;
+  color: #dce6ef;
+  background: #0b121a;
+  border: 1px solid #2b3745;
+  border-radius: 7px;
+}
+.vlm-popover .checkbox-row { display: flex; align-items: center; gap: 8px; color: #dce6ef; }
 
 .import-bar {
   display: grid;
@@ -100,6 +126,31 @@ button:disabled { cursor: wait; opacity: .55; }
 }
 .panel-heading small { color: #6f7d8d; font-weight: 500; }
 .episode-list { height: 620px; overflow: auto; padding: 8px; }
+.sidebar-tools { display: grid; gap: 12px; padding: 8px 6px 12px; }
+.search-box {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  color: #8fa0b2;
+  background: #131c26;
+  border: 1px solid #263444;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 850;
+}
+.search-box input {
+  width: 100%;
+  padding: 9px 10px;
+  color: #e6edf5;
+  background: #0b1118;
+  border: 1px solid #2d3a49;
+  border-radius: 7px;
+  outline: none;
+}
+.filter-box { display: grid; gap: 7px; padding: 0 2px; color: #8292a4; font-size: 11px; }
+.filter-box > span { color: #d0d9e3; font-weight: 850; }
+.filter-box label { display: flex; align-items: center; gap: 7px; }
+.filter-box input { width: 13px; height: 13px; accent-color: #4a8fd8; }
 .episode-folder { display: grid; gap: 4px; padding-bottom: 10px; }
 .folder-heading {
   display: flex;
@@ -213,4 +264,5 @@ button:disabled { cursor: wait; opacity: .55; }
 .finding { padding: 10px; color: #d8bf86; background: #2a2113; border: 1px solid #4e3a18; border-radius: 7px; font-size: 12px; line-height: 1.4; }
 .finding + .finding { margin-top: 8px; }
 .review-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.span-all { grid-column: 1 / -1; }
 .danger { color: #ffd2d8; border-color: #713641; background: #2b151a; }

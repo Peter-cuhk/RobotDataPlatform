@@ -13,11 +13,18 @@ import {
   type Episode,
   type EpisodeQualityResult,
   type Project,
+  type VlmSettings,
 } from "./api";
 import RerunViewer from "./RerunViewer";
 import "./styles.css";
 
 const defaultPath = "data/samples/lerobot-pusht";
+const findingFilters = [
+  { code: "blur", label: "模糊帧" },
+  { code: "time_sync", label: "时间不同步" },
+  { code: "action_jump", label: "Action 跳变" },
+  { code: "vlm_failed", label: "VLM 失败" },
+] as const;
 
 function episodeLabel(index: number) {
   return `Episode ${index.toString().padStart(6, "0")}`;
@@ -56,6 +63,14 @@ export default function App() {
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [cleaningSummary, setCleaningSummary] = useState<CleaningSummary | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeFindingFilters, setActiveFindingFilters] = useState<string[]>([]);
+  const [showVlmSettings, setShowVlmSettings] = useState(false);
+  const [vlmSettings, setVlmSettings] = useState<VlmSettings>({
+    enabled: false,
+    provider: "OpenAI",
+    model: "gpt-4o-mini",
+  });
 
   const importMutation = useMutation({
     mutationFn: () => importDataset(path),
@@ -73,7 +88,7 @@ export default function App() {
     enabled: Boolean(project),
   });
   const cleaningMutation = useMutation({
-    mutationFn: () => runCleaning(project!.id),
+    mutationFn: () => runCleaning(project!.id, vlmSettings),
     onSuccess: ({ summary }) => {
       setCleaningSummary(summary);
       setSelected(pickEpisodeAfterCleaning(summary));
@@ -120,7 +135,18 @@ export default function App() {
           <span className="eyebrow">LOCAL-FIRST ROBOT DATA</span>
           <h1>Robot Data Studio</h1>
         </div>
-        <span className="status-dot">● local</span>
+        <div className="topbar-actions">
+          <button className="secondary" onClick={() => setShowVlmSettings((value) => !value)}>
+            VLM 设置
+          </button>
+          <span className="status-dot">● local</span>
+          {showVlmSettings && (
+            <VlmSettingsPanel
+              settings={vlmSettings}
+              onChange={setVlmSettings}
+            />
+          )}
+        </div>
       </header>
 
       <section className="import-bar">
@@ -165,6 +191,16 @@ export default function App() {
                   episodes={episodesQuery.data ?? []}
                   qualityByEpisode={qualityByEpisode}
                   selected={selected}
+                  searchQuery={searchQuery}
+                  activeFindingFilters={activeFindingFilters}
+                  onSearchChange={setSearchQuery}
+                  onToggleFindingFilter={(code) =>
+                    setActiveFindingFilters((filters) =>
+                      filters.includes(code)
+                        ? filters.filter((filter) => filter !== code)
+                        : [...filters, code],
+                    )
+                  }
                   onSelect={(episodeIndex) => {
                     setSelected(episodeIndex);
                     setRecordingUrl(null);
@@ -234,6 +270,7 @@ export default function App() {
               onDecision={(status) => {
                 if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
               }}
+              onAddToPipeline={() => cleaningMutation.mutate()}
             />
           </section>
         </>
@@ -256,17 +293,34 @@ function EpisodeNavigation({
   episodes,
   qualityByEpisode,
   selected,
+  searchQuery,
+  activeFindingFilters,
+  onSearchChange,
+  onToggleFindingFilter,
   onSelect,
 }: {
   episodes: Episode[];
   qualityByEpisode: Map<number, EpisodeQualityResult>;
   selected: number | null;
+  searchQuery: string;
+  activeFindingFilters: string[];
+  onSearchChange: (value: string) => void;
+  onToggleFindingFilter: (code: string) => void;
   onSelect: (episodeIndex: number) => void;
 }) {
+  const visibleEpisodes = episodes.filter((episode) =>
+    episodeMatchesFilters(episode, qualityByEpisode.get(episode.episode_index), searchQuery, activeFindingFilters),
+  );
   if (qualityByEpisode.size === 0) {
     return (
       <>
-        {episodes.map((episode) => (
+        <SidebarFilters
+          searchQuery={searchQuery}
+          activeFindingFilters={activeFindingFilters}
+          onSearchChange={onSearchChange}
+          onToggleFindingFilter={onToggleFindingFilter}
+        />
+        {visibleEpisodes.map((episode) => (
           <EpisodeRow
             key={episode.episode_index}
             episode={episode}
@@ -284,12 +338,19 @@ function EpisodeNavigation({
     { status: "passed", label: "通过", episodes: [] },
   ];
   for (const episode of episodes) {
+    if (!visibleEpisodes.includes(episode)) continue;
     const quality = qualityByEpisode.get(episode.episode_index);
     const group = groups.find((item) => item.status === quality?.status);
     if (group) group.episodes.push(episode);
   }
   return (
     <>
+      <SidebarFilters
+        searchQuery={searchQuery}
+        activeFindingFilters={activeFindingFilters}
+        onSearchChange={onSearchChange}
+        onToggleFindingFilter={onToggleFindingFilter}
+      />
       {groups.map((group) => (
         <section className="episode-folder" key={group.status}>
           <div className="folder-heading">
@@ -308,6 +369,62 @@ function EpisodeNavigation({
         </section>
       ))}
     </>
+  );
+}
+
+function episodeMatchesFilters(
+  episode: Episode,
+  quality: EpisodeQualityResult | undefined,
+  query: string,
+  activeFilters: string[],
+) {
+  const normalizedQuery = query.trim().toLowerCase();
+  const text = [
+    compactEpisodeLabel(episode.episode_index),
+    episodeLabel(episode.episode_index),
+    episode.tasks.join(" "),
+  ].join(" ").toLowerCase();
+  if (normalizedQuery && !text.includes(normalizedQuery)) return false;
+  if (activeFilters.length === 0) return true;
+  return activeFilters.every((filter) => quality?.findings.some((finding) => finding.code === filter));
+}
+
+function SidebarFilters({
+  searchQuery,
+  activeFindingFilters,
+  onSearchChange,
+  onToggleFindingFilter,
+}: {
+  searchQuery: string;
+  activeFindingFilters: string[];
+  onSearchChange: (value: string) => void;
+  onToggleFindingFilter: (code: string) => void;
+}) {
+  return (
+    <div className="sidebar-tools">
+      <label className="search-box">
+        <span>搜索 / 筛选</span>
+        <input
+          aria-label="搜索 / 筛选"
+          value={searchQuery}
+          onChange={(event) => onSearchChange(event.target.value)}
+          placeholder="#000184"
+        />
+      </label>
+      <div className="filter-box">
+        <span>筛选器</span>
+        {findingFilters.map((filter) => (
+          <label key={filter.code}>
+            <input
+              type="checkbox"
+              checked={activeFindingFilters.includes(filter.code)}
+              onChange={() => onToggleFindingFilter(filter.code)}
+            />
+            {filter.label}
+          </label>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -341,10 +458,12 @@ function QualityReport({
   quality,
   pending,
   onDecision,
+  onAddToPipeline,
 }: {
   quality: EpisodeQualityResult | null;
   pending: boolean;
   onDecision: (status: "passed" | "excluded") => void;
+  onAddToPipeline: () => void;
 }) {
   return (
     <aside className="quality-panel">
@@ -385,9 +504,54 @@ function QualityReport({
           <div className="review-actions">
             <button disabled={pending} onClick={() => onDecision("passed")}>通过</button>
             <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>排除</button>
+            <button className="secondary span-all" disabled={pending} onClick={onAddToPipeline}>
+              加入清洗 Pipeline
+            </button>
           </div>
         </div>
       )}
     </aside>
+  );
+}
+
+function VlmSettingsPanel({
+  settings,
+  onChange,
+}: {
+  settings: VlmSettings;
+  onChange: (settings: VlmSettings) => void;
+}) {
+  return (
+    <div className="vlm-popover">
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          aria-label="启用 VLM"
+          checked={settings.enabled}
+          onChange={(event) => onChange({ ...settings, enabled: event.target.checked })}
+        />
+        启用 VLM
+      </label>
+      <label>
+        <span>Provider</span>
+        <select
+          aria-label="VLM Provider"
+          value={settings.provider}
+          onChange={(event) => onChange({ ...settings, provider: event.target.value })}
+        >
+          <option>OpenAI</option>
+          <option>Gemini</option>
+          <option>Local</option>
+        </select>
+      </label>
+      <label>
+        <span>Model</span>
+        <input
+          aria-label="VLM 模型"
+          value={settings.model}
+          onChange={(event) => onChange({ ...settings, model: event.target.value })}
+        />
+      </label>
+    </div>
   );
 }

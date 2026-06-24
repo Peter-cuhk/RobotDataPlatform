@@ -150,6 +150,131 @@ test("marks a review episode as passed", async () => {
   );
 });
 
+test("filters cleaning results by search and finding type", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => episodesResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          run_id: "run-1",
+          status: "succeeded",
+          summary: cleaningSummary(),
+        }),
+      }),
+  );
+  renderApp();
+
+  await user.click(screen.getByRole("button", { name: "Import dataset" }));
+  await user.click(await screen.findByRole("button", { name: "运行清洗 Pipeline" }));
+  await user.type(await screen.findByLabelText("搜索 / 筛选"), "000001");
+
+  expect(screen.queryByText("#000000")).not.toBeInTheDocument();
+  expect(screen.getByText("#000001")).toBeInTheDocument();
+
+  await user.clear(screen.getByLabelText("搜索 / 筛选"));
+  await user.click(screen.getByLabelText("VLM 失败"));
+
+  expect(screen.queryByText("#000000")).not.toBeInTheDocument();
+  expect(screen.getByText("#000001")).toBeInTheDocument();
+});
+
+test("sends VLM settings when running cleaning", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        run_id: "run-1",
+        status: "succeeded",
+        summary: cleaningSummary(),
+      }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await user.click(screen.getByRole("button", { name: "VLM 设置" }));
+  await user.click(screen.getByLabelText("启用 VLM"));
+  await user.clear(screen.getByLabelText("VLM 模型"));
+  await user.type(screen.getByLabelText("VLM 模型"), "gpt-4o-mini");
+  await user.click(screen.getByRole("button", { name: "Import dataset" }));
+  await user.click(await screen.findByRole("button", { name: "运行清洗 Pipeline" }));
+
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/cleaning/runs",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        pass_threshold: 0.8,
+        review_threshold: 0.6,
+        vlm: { enabled: true, provider: "OpenAI", model: "gpt-4o-mini" },
+      }),
+    }),
+  );
+});
+
+test("shows three quality findings and can add the selected episode to cleaning pipeline", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        run_id: "run-1",
+        status: "succeeded",
+        summary: cleaningSummary(),
+      }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        run_id: "run-2",
+        status: "succeeded",
+        summary: cleaningSummary(),
+      }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await user.click(screen.getByRole("button", { name: "Import dataset" }));
+  await user.click(await screen.findByRole("button", { name: "运行清洗 Pipeline" }));
+
+  expect(await screen.findByText("发现 3 个问题")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "加入清洗 Pipeline" }));
+
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/cleaning/runs",
+    expect.objectContaining({ method: "POST" }),
+  );
+});
+
 function projectResponse() {
   return {
     id: "project-1",
@@ -227,7 +352,11 @@ function cleaningSummary() {
           smoothness: 0.7,
           runtime: 0.62,
         },
-        findings: [{ code: "low_runtime", severity: "warn", message: "Runtime score is low." }],
+        findings: [
+          { code: "blur", severity: "warn", message: "Wrist camera freeze around 3.2s." },
+          { code: "time_sync", severity: "warn", message: "RGB / state offset is around 67ms." },
+          { code: "action_jump", severity: "warn", message: "Action has a jump near the start." },
+        ],
         review_note: null,
         updated_at: "2026-06-24T00:00:00Z",
       },
@@ -237,7 +366,11 @@ function cleaningSummary() {
         status: "excluded",
         source: "auto",
         per_attribute_scores: { smoothness: 0.41 },
-        findings: [{ code: "low_smoothness", severity: "warn", message: "Smoothness score is low." }],
+        findings: [
+          { code: "blur", severity: "warn", message: "Wrist camera freeze around 3.2s." },
+          { code: "time_sync", severity: "warn", message: "RGB / state offset is around 67ms." },
+          { code: "vlm_failed", severity: "warn", message: "VLM semantic check failed." },
+        ],
         review_note: null,
         updated_at: "2026-06-24T00:00:00Z",
       },

@@ -165,6 +165,10 @@ data/samples/lerobot-pusht
 选择待审查 episode 后，可以继续用 Rerun 回放，再在右侧 Quality Report 中点击 `通过` 或 `排除`。
 人工决策会覆盖自动分桶，并在后续重新运行清洗时默认保留。
 
+左侧 `搜索 / 筛选` 可以按 episode 编号或任务文本过滤列表，也可以勾选问题类型，例如模糊帧、
+时间不同步、Action 跳变和 VLM 失败。右上角的 `VLM 设置` 可以直接设置 provider、model 和是否启用
+VLM 检查；当前前端会把这些参数随清洗请求发送给本地 API，后续可在后端 scorer adapter 中接入真实 VLM。
+
 ## 9. 用 Rerun 回放 episode
 
 选择一个 episode 后，点击 Rerun 回放按钮。

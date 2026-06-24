@@ -67,6 +67,12 @@ export type CleaningRun = {
   summary: CleaningSummary;
 };
 
+export type VlmSettings = {
+  enabled: boolean;
+  provider: string;
+  model: string;
+};
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -104,10 +110,10 @@ export function exportEpisode(projectId: string, episodeIndex: number) {
   });
 }
 
-export function runCleaning(projectId: string) {
+export function runCleaning(projectId: string, vlm?: VlmSettings) {
   return request<CleaningRun>(`/api/projects/${projectId}/cleaning/runs`, {
     method: "POST",
-    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6 }),
+    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6, ...(vlm ? { vlm } : {}) }),
   });
 }
 
