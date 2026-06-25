@@ -7,7 +7,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from .models import DatasetMetadata, DatasetProbe, EpisodeFrame, EpisodeSummary
+from .models import DatasetMetadata, DatasetProbe, EpisodeFrame, EpisodeSubtask, EpisodeSummary
 
 
 class NotLeRobotDataset(ValueError):
@@ -19,6 +19,7 @@ class LeRobotDatasetReader:
         self.root = Path(root).expanduser().resolve()
         self.probe(self.root)
         self._info = json.loads((self.root / "meta" / "info.json").read_text())
+        self._version = str(self._info.get("codebase_version", ""))
 
     @classmethod
     def probe(cls, root: str | Path) -> DatasetProbe:
@@ -31,8 +32,8 @@ class LeRobotDatasetReader:
         except (json.JSONDecodeError, OSError) as error:
             raise NotLeRobotDataset(f"Invalid LeRobot metadata: {info_path}") from error
         version = str(info.get("codebase_version", ""))
-        if not version.startswith("v3"):
-            raise NotLeRobotDataset(f"Only LeRobot v3 is supported, got {version!r}")
+        if not version.startswith(("v2", "v3")):
+            raise NotLeRobotDataset(f"Only LeRobot v2/v3 is supported, got {version!r}")
         return DatasetProbe(format="lerobot", version=version, confidence=1.0)
 
     def metadata(self) -> DatasetMetadata:
@@ -54,6 +55,11 @@ class LeRobotDatasetReader:
         )
 
     def list_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
+        if self._version.startswith("v2"):
+            return self._list_v2_episodes(limit)
+        return self._list_v3_episodes(limit)
+
+    def _list_v3_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
         files = sorted((self.root / "meta" / "episodes").glob("**/*.parquet"))
         table = ds.dataset(files, format="parquet").to_table()
         if limit is not None:
@@ -83,6 +89,7 @@ class LeRobotDatasetReader:
                     length=row["length"],
                     duration_seconds=row["length"] / float(self._info["fps"]),
                     tasks=row.get("tasks") or [],
+                    subtasks=[],
                     data_file=data_file,
                     video_files=video_files,
                     video_start_seconds=video_starts,
@@ -90,6 +97,98 @@ class LeRobotDatasetReader:
                 )
             )
         return summaries
+
+    def _list_v2_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
+        episodes_path = self.root / "meta" / "episodes.jsonl"
+        if not episodes_path.is_file():
+            raise NotLeRobotDataset(f"Missing LeRobot v2 episodes metadata: {episodes_path}")
+        rows = _read_jsonl(episodes_path)
+        if limit is not None:
+            rows = rows[:limit]
+        fps = float(self._info["fps"])
+        annotations = self._v2_subtasks_by_episode()
+        video_keys = self.metadata().video_keys
+        summaries = []
+        for row in rows:
+            episode_index = int(row["episode_index"])
+            length = int(row["length"])
+            episode_chunk = int(row.get("episode_chunk", episode_index // int(self._info.get("chunks_size", 1000))))
+            video_files = {
+                key: self._format_template(
+                    self._info["video_path"],
+                    episode_index=episode_index,
+                    episode_chunk=episode_chunk,
+                    video_key=key,
+                )
+                for key in video_keys
+            }
+            summaries.append(
+                EpisodeSummary(
+                    episode_index=episode_index,
+                    length=length,
+                    duration_seconds=length / fps,
+                    tasks=row.get("tasks") or [],
+                    subtasks=annotations.get(episode_index, []),
+                    data_file=self._format_template(
+                        self._info["data_path"],
+                        episode_index=episode_index,
+                        episode_chunk=episode_chunk,
+                    ),
+                    video_files=video_files,
+                    video_start_seconds={key: 0.0 for key in video_keys},
+                    video_end_seconds={key: length / fps for key in video_keys},
+                )
+            )
+        return summaries
+
+    def _v2_subtasks_by_episode(self) -> dict[int, list[EpisodeSubtask]]:
+        annotations_path = self.root / "meta" / "annotations.json"
+        if not annotations_path.is_file():
+            return {}
+        try:
+            payload = json.loads(annotations_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        fps = float(self._info["fps"])
+        by_episode: dict[int, list[EpisodeSubtask]] = {}
+        for annotation in payload.values():
+            if not isinstance(annotation, dict) or "episode_index" not in annotation:
+                continue
+            episode_index = int(annotation["episode_index"])
+            subtasks = []
+            for step in annotation.get("action_steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                start_frame = int(step.get("start_frame", 0))
+                end_frame = int(step.get("end_frame", start_frame))
+                prompt = str(step.get("action_text") or "").strip()
+                if not prompt:
+                    continue
+                subtasks.append(
+                    EpisodeSubtask(
+                        start_frame=start_frame,
+                        end_frame=end_frame,
+                        start_seconds=start_frame / fps,
+                        end_seconds=end_frame / fps,
+                        prompt=prompt,
+                        skill=step.get("skill"),
+                        track=step.get("track"),
+                        is_mistake=bool(step.get("is_mistake", False)),
+                    )
+                )
+            if subtasks:
+                by_episode[episode_index] = subtasks
+        return by_episode
+
+    @staticmethod
+    def _format_template(template: str, **values: object) -> str:
+        return template.format(
+            chunk_index=values.get("episode_chunk"),
+            file_index=values.get("episode_index"),
+            **values,
+        )
 
     def episode(self, episode_index: int) -> EpisodeSummary:
         episodes = self.list_episodes()
@@ -119,3 +218,11 @@ class LeRobotDatasetReader:
             raise KeyError(f"Video key {video_key!r} not found")
         return self.root / episode.video_files[video_key]
 
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+    return rows

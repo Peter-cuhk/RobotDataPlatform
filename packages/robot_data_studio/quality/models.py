@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 CleaningStatus = Literal["passed", "review", "excluded", "unscored"]
@@ -27,6 +27,11 @@ class VlmSettings(BaseModel):
     api_key: str | None = Field(default=None, exclude=True)
     prompt: str = DEFAULT_VLM_PROMPT
     sample_frames: int = Field(default=4, ge=1, le=12)
+
+    @computed_field
+    @property
+    def api_key_configured(self) -> bool:
+        return bool(self.api_key)
 
 
 class VlmEvaluation(BaseModel):

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DatasetProbe(BaseModel):
@@ -20,11 +20,23 @@ class DatasetMetadata(BaseModel):
     features: dict[str, dict]
 
 
+class EpisodeSubtask(BaseModel):
+    start_frame: int
+    end_frame: int
+    start_seconds: float
+    end_seconds: float
+    prompt: str
+    skill: str | None = None
+    track: str | None = None
+    is_mistake: bool = False
+
+
 class EpisodeSummary(BaseModel):
     episode_index: int
     length: int
     duration_seconds: float
     tasks: list[str]
+    subtasks: list[EpisodeSubtask] = Field(default_factory=list)
     data_file: str
     video_files: dict[str, str]
     video_start_seconds: dict[str, float]
@@ -36,4 +48,3 @@ class EpisodeFrame(BaseModel):
     timestamp: float
     observation_state: list[float]
     action: list[float]
-

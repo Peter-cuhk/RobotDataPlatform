@@ -30,10 +30,22 @@ export type Episode = {
   length: number;
   duration_seconds: number;
   tasks: string[];
+  subtasks?: EpisodeSubtask[];
   data_file: string;
   video_files: Record<string, string>;
   video_start_seconds: Record<string, number>;
   video_end_seconds: Record<string, number>;
+};
+
+export type EpisodeSubtask = {
+  start_frame: number;
+  end_frame: number;
+  start_seconds: number;
+  end_seconds: number;
+  prompt: string;
+  skill: string | null;
+  track: string | null;
+  is_mistake: boolean;
 };
 
 export type CleaningStatus = "passed" | "review" | "excluded" | "unscored";
@@ -89,8 +101,73 @@ export type VlmSettings = {
   model: string;
   api_base_url: string | null;
   api_key?: string | null;
+  api_key_configured?: boolean;
   prompt: string;
   sample_frames: number;
+};
+
+export type FilterStageId =
+  | "sudden_change"
+  | "state_action_alignment"
+  | "extreme_value"
+  | "kinematic_consistency"
+  | "orientation_alignment";
+
+export type FilterStatus = "passed" | "review" | "skipped";
+
+export type FilterFinding = {
+  code: string;
+  severity: "info" | "warn" | "error";
+  message: string;
+};
+
+export type FilterDetail = {
+  stage_id: FilterStageId;
+  episode_index: number;
+  title: string;
+  status: FilterStatus;
+  series: Record<string, number[]>;
+  thresholds: Record<string, Record<string, number>>;
+  table_rows: Array<Record<string, unknown>>;
+  parameters: Record<string, unknown>;
+  findings: FilterFinding[];
+  skipped_reason: string | null;
+};
+
+export type FilterSummary = {
+  dataset_path: string;
+  total_episodes: number;
+  total_frames: number;
+  stages: Array<{
+    id: FilterStageId;
+    label: string;
+    count: number;
+    status: FilterStatus;
+    skipped_reason: string | null;
+  }>;
+  episodes: Array<{
+    episode_index: number;
+    stage_status: Record<FilterStageId, { count: number; status: FilterStatus; skipped_reason: string | null }>;
+  }>;
+};
+
+export type FilterRun = {
+  run_id: string;
+  status: "succeeded" | "failed";
+  summary: FilterSummary;
+};
+
+export type FilterConfig = {
+  gripper_indices: number[];
+  kinematics: {
+    urdf_path: string | null;
+    end_effector_link: string | null;
+    joint_names: string[];
+    joint_state_indices: number[];
+    eef_position_indices: number[];
+    position_tolerance: number;
+    resolve_tcp_offset: boolean;
+  };
 };
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -129,25 +206,39 @@ export function createRecording(projectId: string, episodeIndex: number) {
   );
 }
 
-export function exportDataset(projectId: string, episodeIndexes: number[], format: string) {
+export function exportDataset(projectId: string, episodeIndexes: number[], format: string, outputDir = "") {
+  const trimmedOutputDir = outputDir.trim();
   return request<ExportResult>(`/api/projects/${projectId}/exports`, {
     method: "POST",
-    body: JSON.stringify({ episode_indexes: episodeIndexes, format, options: {} }),
+    body: JSON.stringify({
+      episode_indexes: episodeIndexes,
+      format,
+      options: trimmedOutputDir ? { output_dir: trimmedOutputDir } : {},
+    }),
   });
 }
 
 export function runCleaning(projectId: string, vlm?: VlmSettings) {
   return request<CleaningRun>(`/api/projects/${projectId}/cleaning/runs`, {
     method: "POST",
-    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6, ...(vlm ? { vlm } : {}) }),
+    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6, ...(vlm ? { vlm: writableVlmSettings(vlm) } : {}) }),
   });
 }
 
 export function saveVlmSettings(projectId: string, settings: VlmSettings) {
   return request<VlmSettings>(`/api/projects/${projectId}/vlm-settings`, {
     method: "PATCH",
-    body: JSON.stringify(settings),
+    body: JSON.stringify(writableVlmSettings(settings)),
   });
+}
+
+export function getVlmSettings(projectId: string) {
+  return request<VlmSettings>(`/api/projects/${projectId}/vlm-settings`);
+}
+
+function writableVlmSettings(settings: VlmSettings) {
+  const { api_key_configured: _apiKeyConfigured, ...writable } = settings;
+  return writable;
 }
 
 export function updateEpisodeDecision(
@@ -162,4 +253,35 @@ export function updateEpisodeDecision(
       body: JSON.stringify({ status }),
     },
   );
+}
+
+export function runFilters(projectId: string) {
+  return request<FilterRun>(`/api/projects/${projectId}/filters/runs`, { method: "POST" });
+}
+
+export function getFilterDetail(projectId: string, stageId: FilterStageId, episodeIndex: number) {
+  return request<FilterDetail>(`/api/projects/${projectId}/filters/${stageId}/episodes/${episodeIndex}`);
+}
+
+export function saveFilterConfig(projectId: string, config: Partial<FilterConfig>) {
+  return request<FilterConfig>(`/api/projects/${projectId}/filters/config`, {
+    method: "PATCH",
+    body: JSON.stringify(config),
+  });
+}
+
+export async function uploadKinematicsUrdf(projectId: string, file: File) {
+  const response = await fetch(
+    `/api/projects/${projectId}/filters/kinematics/urdf?filename=${encodeURIComponent(file.name)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: await file.arrayBuffer(),
+    },
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(body.detail ?? "Request failed");
+  }
+  return response.json() as Promise<{ filename: string; path: string }>;
 }

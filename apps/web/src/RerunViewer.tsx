@@ -1,10 +1,13 @@
 import { WebViewer } from "@rerun-io/web-viewer";
 import { useEffect, useRef, useState } from "react";
 
+import { translations, type Translation } from "./i18n";
+
 const episodeTimeline = "episode_time";
 const nanosPerSecond = 1_000_000_000;
 const seekStepsSeconds = [1, 2, 5, 10] as const;
 const seekBurstWindowMs = 800;
+const defaultLabels = translations.en.rerun;
 
 type ViewerEventPayload = {
   recording_id: string;
@@ -16,6 +19,7 @@ type RerunViewerProps = {
   recordingUrl: string;
   canGoPrevious?: boolean;
   canGoNext?: boolean;
+  labels?: Translation["rerun"];
   onPreviousEpisode?: () => void;
   onNextEpisode?: () => void;
 };
@@ -28,6 +32,7 @@ export default function RerunViewer({
   recordingUrl,
   canGoPrevious = false,
   canGoNext = false,
+  labels = defaultLabels,
   onPreviousEpisode,
   onNextEpisode,
 }: RerunViewerProps) {
@@ -54,9 +59,6 @@ export default function RerunViewer({
       base_url: new URL("/rerun/", window.location.href).toString(),
     } as const;
     const absoluteRecordingUrl = new URL(recordingUrl, window.location.href).toString();
-    const offReady = nextViewer.on("ready", () => {
-      nextViewer.override_panel_state("time", "hidden");
-    });
     const offRecordingOpen = nextViewer.on("recording_open", (event: ViewerEventPayload) => {
       recordingId.current = event.recording_id;
       setActiveRecordingId(event.recording_id);
@@ -81,7 +83,6 @@ export default function RerunViewer({
 
     void nextViewer.start(absoluteRecordingUrl, host.current, options);
     return () => {
-      offReady();
       offRecordingOpen();
       offPlay();
       offPause();
@@ -124,21 +125,21 @@ export default function RerunViewer({
 
   return (
     <div className="rerun-shell">
-      <div className="rerun-host" ref={host} aria-label="Rerun episode replay" />
-      <div className="rerun-controls" aria-label="Rerun playback controls">
-        <button className="icon-button" aria-label="上一集" disabled={!canGoPrevious} onClick={onPreviousEpisode}>
+      <div className="rerun-host" ref={host} aria-label={labels.host} />
+      <div className="rerun-controls" aria-label={labels.controls}>
+        <button className="icon-button" aria-label={labels.previousEpisode} disabled={!canGoPrevious} onClick={onPreviousEpisode}>
           ‹‹
         </button>
-        <button className="icon-button" aria-label="后退" disabled={!timelineReady} onClick={() => seek(-1)}>
+        <button className="icon-button" aria-label={labels.rewind} disabled={!timelineReady} onClick={() => seek(-1)}>
           ‹
         </button>
-        <button className="play-toggle" aria-label={playing ? "暂停" : "播放"} disabled={!timelineReady} onClick={togglePlayback}>
-          {playing ? "暂停" : "播放"}
+        <button className="play-toggle" aria-label={playing ? labels.pause : labels.play} disabled={!timelineReady} onClick={togglePlayback}>
+          {playing ? labels.pause : labels.play}
         </button>
-        <button className="icon-button" aria-label="前进" disabled={!timelineReady} onClick={() => seek(1)}>
+        <button className="icon-button" aria-label={labels.forward} disabled={!timelineReady} onClick={() => seek(1)}>
           ›
         </button>
-        <button className="icon-button" aria-label="下一集" disabled={!canGoNext} onClick={onNextEpisode}>
+        <button className="icon-button" aria-label={labels.nextEpisode} disabled={!canGoNext} onClick={onNextEpisode}>
           ››
         </button>
       </div>

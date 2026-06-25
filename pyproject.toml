@@ -14,7 +14,7 @@ dependencies = [
   "numpy>=1.26,<3",
   "pydantic>=2.10,<3",
   "pyarrow>=18,<20",
-  "rerun-sdk>=0.23,<1",
+  "rerun-sdk>=0.33,<0.34",
   "uvicorn[standard]>=0.34,<1",
   "zarr>=2.18,<3",
 ]

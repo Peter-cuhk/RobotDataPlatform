@@ -69,12 +69,12 @@ test("loads the Rerun WASM bundle from the public asset directory without intern
   expect(start.mock.calls[0][2]).not.toHaveProperty("panel_state_overrides");
 });
 
-test("hides the built-in Rerun time panel after the viewer is ready", () => {
+test("keeps the built-in Rerun time panel visible for the time-series cursor", () => {
   render(<RerunViewer recordingUrl="/api/artifacts/episode.rrd" />);
 
   emitViewerEvent("ready", undefined);
 
-  expect(overridePanelState).toHaveBeenCalledWith("time", "hidden");
+  expect(overridePanelState).not.toHaveBeenCalled();
 });
 
 test("toggles playback through the active Rerun recording", async () => {
@@ -83,13 +83,13 @@ test("toggles playback through the active Rerun recording", async () => {
   render(<RerunViewer recordingUrl="/api/artifacts/episode.rrd" />);
 
   emitViewerEvent("recording_open", { recording_id: "recording-1" });
-  await user.click(screen.getByRole("button", { name: "播放" }));
+  await user.click(screen.getByRole("button", { name: "Play" }));
 
   expect(setActiveTimeline).toHaveBeenCalledWith("recording-1", "episode_time");
   expect(setPlaying).toHaveBeenCalledWith("recording-1", true);
 
   emitViewerEvent("play", { recording_id: "recording-1" });
-  await user.click(screen.getByRole("button", { name: "暂停" }));
+  await user.click(screen.getByRole("button", { name: "Pause" }));
 
   expect(setPlaying).toHaveBeenLastCalledWith("recording-1", false);
 });
@@ -101,7 +101,7 @@ test("seeks on episode_time with clamped one-second jumps", async () => {
   render(<RerunViewer recordingUrl="/api/artifacts/episode.rrd" />);
 
   emitViewerEvent("recording_open", { recording_id: "recording-1" });
-  await user.click(screen.getByRole("button", { name: "前进" }));
+  await user.click(screen.getByRole("button", { name: "Forward" }));
 
   expect(setCurrentTime).toHaveBeenCalledWith("recording-1", "episode_time", 6_000_000_000);
 });
@@ -114,7 +114,7 @@ test("accelerates repeated same-direction seeks and resets after the burst windo
   render(<RerunViewer recordingUrl="/api/artifacts/episode.rrd" />);
 
   emitViewerEvent("recording_open", { recording_id: "recording-1" });
-  const forwardButton = screen.getByRole("button", { name: "前进" });
+  const forwardButton = screen.getByRole("button", { name: "Forward" });
   fireEvent.click(forwardButton);
   now = 1_200;
   fireEvent.click(forwardButton);
@@ -124,4 +124,29 @@ test("accelerates repeated same-direction seeks and resets after the burst windo
   expect(setCurrentTime).toHaveBeenNthCalledWith(1, "recording-1", "episode_time", 1_000_000_000);
   expect(setCurrentTime).toHaveBeenNthCalledWith(2, "recording-1", "episode_time", 2_000_000_000);
   expect(setCurrentTime).toHaveBeenNthCalledWith(3, "recording-1", "episode_time", 1_000_000_000);
+});
+
+test("accepts Chinese playback labels", async () => {
+  const user = userEvent.setup();
+  getTimeRange.mockReturnValue({ min: 0, max: 10_000_000_000 });
+  render(
+    <RerunViewer
+      recordingUrl="/api/artifacts/episode.rrd"
+      labels={{
+        previousEpisode: "上一集",
+        rewind: "后退",
+        play: "播放",
+        pause: "暂停",
+        forward: "前进",
+        nextEpisode: "下一集",
+        host: "Rerun episode replay",
+        controls: "Rerun playback controls",
+      }}
+    />,
+  );
+
+  emitViewerEvent("recording_open", { recording_id: "recording-1" });
+  await user.click(screen.getByRole("button", { name: "播放" }));
+
+  expect(setPlaying).toHaveBeenCalledWith("recording-1", true);
 });

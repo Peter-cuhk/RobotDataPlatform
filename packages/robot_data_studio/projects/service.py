@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from uuid import uuid4
 
 from robot_data_studio.formats import ExportResult, FormatRegistry
@@ -12,8 +13,14 @@ from robot_data_studio.quality import (
     EpisodeDecisionRequest,
     EpisodeQualityScorer,
     EpisodeQualityResult,
+    FilterConfig,
+    FilterConfigPatch,
+    FilterDetail,
+    FilterRun,
+    FilterSummary,
     VlmSettings,
 )
+from robot_data_studio.quality.filter_service import DatasetFilterService, infer_gripper_indices
 from robot_data_studio.quality.models import utc_now
 from robot_data_studio.quality.store import CleaningStateStore, VlmSettingsStore, build_summary
 
@@ -52,10 +59,17 @@ class ProjectService:
         project_id: str,
         format_id: str,
         episode_indexes: list[int],
+        output_dir: str | None = None,
     ) -> ExportResult:
-        output = self.artifact_root / f"{project_id}-{format_id}"
+        output_base = self.artifact_root
+        if output_dir and output_dir.strip():
+            output_base = Path(output_dir).expanduser().resolve()
+            if output_base.exists() and not output_base.is_dir():
+                raise ValueError("Export output directory must be a directory")
+
+        output = output_base / f"{project_id}-{format_id}"
         if len(episode_indexes) == 1:
-            output = self.artifact_root / f"{project_id}-episode-{episode_indexes[0]:06d}-{format_id}"
+            output = output_base / f"{project_id}-episode-{episode_indexes[0]:06d}-{format_id}"
         return self._formats.export_dataset(
             adapter=self.reader(project_id),
             target_format=format_id,
@@ -80,13 +94,16 @@ class ProjectService:
 
     def update_vlm_settings(self, project_id: str, settings: VlmSettings) -> VlmSettings:
         self.project(project_id)
+        if "api_key" not in settings.model_fields_set:
+            existing = self._vlm_settings_store(project_id).load()
+            settings = settings.model_copy(update={"api_key": existing.api_key})
         return self._vlm_settings_store(project_id).save(settings)
 
     def run_cleaning(self, project_id: str, config: CleaningConfig) -> CleaningRun:
         if config.review_threshold > config.pass_threshold:
             raise ValueError("review_threshold must be less than or equal to pass_threshold")
         if "vlm" in config.model_fields_set:
-            self.update_vlm_settings(project_id, config.vlm)
+            config = config.model_copy(update={"vlm": self.update_vlm_settings(project_id, config.vlm)})
         else:
             config = config.model_copy(update={"vlm": self.vlm_settings(project_id)})
         reader = self.reader(project_id)
@@ -136,6 +153,70 @@ class ProjectService:
         self._cleaning_store(project_id).save(new_summary)
         return updated
 
+    def run_filters(self, project_id: str) -> FilterRun:
+        self.project(project_id)
+        result = self._filter_service(project_id).run()
+        self._filter_summary_store(project_id).write_text(
+            result.summary.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        return result
+
+    def filter_summary(self, project_id: str) -> FilterSummary:
+        self.project(project_id)
+        store = self._filter_summary_store(project_id)
+        if store.is_file():
+            return FilterSummary.model_validate_json(store.read_text())
+        return self._filter_service(project_id).summary()
+
+    def filter_detail(self, project_id: str, stage_id: str, episode_index: int) -> FilterDetail:
+        self.reader(project_id).episode(episode_index)
+        allowed = {
+            "sudden_change",
+            "state_action_alignment",
+            "extreme_value",
+            "kinematic_consistency",
+            "orientation_alignment",
+        }
+        if stage_id not in allowed:
+            raise KeyError(f"Filter stage {stage_id!r} not found")
+        return self._filter_service(project_id).detail(stage_id, episode_index)  # type: ignore[arg-type]
+
+    def filter_config(self, project_id: str) -> FilterConfig:
+        self.project(project_id)
+        store = self._filter_config_store(project_id)
+        if store.is_file():
+            return FilterConfig.model_validate_json(store.read_text())
+        config = FilterConfig(gripper_indices=infer_gripper_indices(self.reader(project_id)))
+        self._save_filter_config(project_id, config)
+        return config
+
+    def update_filter_config(self, project_id: str, patch: FilterConfigPatch) -> FilterConfig:
+        config = self.filter_config(project_id)
+        update = {}
+        if patch.gripper_indices is not None:
+            update["gripper_indices"] = patch.gripper_indices
+        if patch.kinematics is not None:
+            update["kinematics"] = config.kinematics.model_copy(
+                update=patch.kinematics.model_dump(exclude_unset=True)
+            )
+        updated = config.model_copy(update=update)
+        self._save_filter_config(project_id, updated)
+        return updated
+
+    def save_filter_urdf(self, project_id: str, filename: str, content: bytes) -> dict[str, str]:
+        self.project(project_id)
+        safe_name = Path(filename).name or "robot.urdf"
+        if not safe_name.endswith(".urdf"):
+            raise ValueError("URDF filename must end with .urdf")
+        output = self.project_artifact_dir(project_id) / "filters" / "urdf" / safe_name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(content)
+        config = self.filter_config(project_id)
+        updated_kinematics = config.kinematics.model_copy(update={"urdf_path": str(output)})
+        self._save_filter_config(project_id, config.model_copy(update={"kinematics": updated_kinematics}))
+        return {"filename": safe_name, "path": str(output)}
+
     def _entry(self, project_id: str) -> tuple[Project, DatasetAdapter]:
         try:
             return self._projects[project_id]
@@ -154,3 +235,17 @@ class ProjectService:
 
     def _vlm_settings_store(self, project_id: str) -> VlmSettingsStore:
         return VlmSettingsStore(self.project_artifact_dir(project_id) / "vlm_settings.json")
+
+    def _filter_service(self, project_id: str) -> DatasetFilterService:
+        return DatasetFilterService(self.reader(project_id), self.filter_config(project_id))
+
+    def _filter_config_store(self, project_id: str) -> Path:
+        return self.project_artifact_dir(project_id) / "filter_config.json"
+
+    def _filter_summary_store(self, project_id: str) -> Path:
+        return self.project_artifact_dir(project_id) / "filter_summary.json"
+
+    def _save_filter_config(self, project_id: str, config: FilterConfig) -> None:
+        path = self._filter_config_store(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config.model_dump(mode="json"), indent=2), encoding="utf-8")

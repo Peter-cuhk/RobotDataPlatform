@@ -22,6 +22,7 @@ class UnsupportedDatasetFormat(ValueError):
 class FormatRegistry:
     def __init__(self) -> None:
         self._readers: dict[str, type] = {
+            "lerobot_v2_1": LeRobotDatasetReader,
             "lerobot_v3": LeRobotDatasetReader,
             "lerobot": LeRobotDatasetReader,
             "act_hdf5": ActHDF5DatasetAdapter,
@@ -91,17 +92,24 @@ class FormatRegistry:
             raise UnsupportedDatasetFormat(f"Unsupported export format: {target_format}")
         report_path = output_path if output_path.is_dir() else output_path.parent
         report_path = report_path / "conversion_report.json"
+        backend = {
+            "lerobot_available": importlib.util.find_spec("lerobot") is not None,
+            "forge_available": importlib.util.find_spec("forge") is not None,
+            "any4lerobot_available": importlib.util.find_spec("any4lerobot") is not None,
+        }
+        if target_format in {"lerobot_v3", "lerobot_v2_1"}:
+            backend["writer_backend"] = (
+                "jsonl_fallback"
+                if output_path.is_dir() and (output_path / "frames.jsonl").is_file()
+                else "lerobot"
+            )
         report = conversion_report(
             source=adapter.metadata(),
             target_format=target_format,
             episode_indexes=episode_indexes,
             output_path=output_path,
             field_mapping=mapping,
-            backend={
-                "lerobot_available": importlib.util.find_spec("lerobot") is not None,
-                "forge_available": importlib.util.find_spec("forge") is not None,
-                "any4lerobot_available": importlib.util.find_spec("any4lerobot") is not None,
-            },
+            backend=backend,
         )
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return ExportResult(

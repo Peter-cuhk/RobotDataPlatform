@@ -36,7 +36,7 @@ class VlmSettingsStore:
 
     def save(self, settings: VlmSettings) -> VlmSettings:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(settings.model_dump(mode="json"), indent=2))
+        self.path.write_text(json.dumps(settings.__dict__, indent=2))
         return settings
 
 

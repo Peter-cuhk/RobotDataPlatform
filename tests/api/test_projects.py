@@ -4,9 +4,11 @@ import h5py
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
+from tests.lerobot.test_reader import write_agibot_v2_episode_fixture
 
 
 SAMPLE = Path("data/samples/lerobot-pusht").resolve()
+ALOHA_SAMPLE = Path("data/samples/aloha_static_coffee").resolve()
 
 
 def test_import_dataset_and_list_episodes(tmp_path: Path) -> None:
@@ -20,6 +22,24 @@ def test_import_dataset_and_list_episodes(tmp_path: Path) -> None:
     episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=2")
     assert episodes.status_code == 200
     assert [item["episode_index"] for item in episodes.json()] == [0, 1]
+
+
+def test_import_agibot_v2_dataset_exposes_subtasks(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    sample = write_agibot_v2_episode_fixture(tmp_path / "agibot-one-episode")
+
+    response = client.post("/api/projects", json={"path": str(sample), "format_hint": "lerobot_v2_1"})
+
+    assert response.status_code == 201
+    project = response.json()
+    assert project["dataset"]["version"] == "v2.1"
+    episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=1")
+    assert episodes.status_code == 200
+    episode = episodes.json()[0]
+    assert episode["tasks"] == ["Clear the desktop"]
+    assert episode["subtasks"][0]["prompt"] == "Put the pen into the pen holder."
+    assert episode["subtasks"][0]["start_seconds"] == 0.0
+    assert episode["subtasks"][1]["skill"] == "Rotation"
 
 
 def test_import_dataset_requires_non_empty_path(tmp_path: Path) -> None:
@@ -63,6 +83,28 @@ def test_generate_rerun_recording(tmp_path: Path) -> None:
     assert (tmp_path / body["recording_url"].split("/")[-1]).stat().st_size > 0
 
 
+def test_aloha_static_coffee_exposes_all_video_views_and_generates_recording(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(ALOHA_SAMPLE)}).json()
+
+    episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=1")
+
+    assert episodes.status_code == 200
+    video_files = episodes.json()[0]["video_files"]
+    assert set(video_files) == {
+        "observation.images.cam_high",
+        "observation.images.cam_left_wrist",
+        "observation.images.cam_low",
+        "observation.images.cam_right_wrist",
+    }
+
+    response = client.post(f"/api/projects/{project['id']}/episodes/0/recording")
+
+    assert response.status_code == 201
+    artifact = tmp_path / response.json()["recording_url"].split("/")[-1]
+    assert artifact.stat().st_size > 0
+
+
 def test_export_episode_to_act_hdf5(tmp_path: Path) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
@@ -79,6 +121,27 @@ def test_export_episode_to_act_hdf5(tmp_path: Path) -> None:
         assert file["action"].shape == (161, 2)
         assert file["observations/qpos"].shape == (161, 2)
         assert file.attrs["sim"] is True or file.attrs["sim"] == 1
+
+
+def test_export_episode_to_user_selected_output_directory(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    output_dir = tmp_path / "user-exports"
+
+    response = client.post(
+        f"/api/projects/{project['id']}/exports",
+        json={
+            "episode_indexes": [0],
+            "format": "act_hdf5",
+            "options": {"output_dir": str(output_dir)},
+        },
+    )
+
+    assert response.status_code == 201
+    output_path = Path(response.json()["output_path"])
+    assert output_path.exists()
+    assert output_path.parent == output_dir
+    assert Path(response.json()["report_path"]).parent == output_dir
 
 
 def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
@@ -107,6 +170,7 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
             "provider": "OpenAI",
             "model": "gpt-4o-mini",
             "api_base_url": None,
+            "api_key_configured": False,
             "prompt": (
                 "You are an automated robot episode evaluator. Return only JSON with "
                 "success, score, and reason. Judge whether the task was successfully "
@@ -206,6 +270,7 @@ def test_project_vlm_settings_are_persisted_without_returning_api_key(tmp_path: 
         "provider": "OpenAI",
         "model": "gpt-4o-mini",
         "api_base_url": "http://localhost:11434/v1",
+        "api_key_configured": True,
         "prompt": "Return JSON. Task: {task}",
         "sample_frames": 6,
     }
@@ -215,3 +280,42 @@ def test_project_vlm_settings_are_persisted_without_returning_api_key(tmp_path: 
 
     assert stored.status_code == 200
     assert stored.json() == body
+
+
+def test_saved_vlm_api_key_is_used_when_cleaning_runs_without_key(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    client.patch(
+        f"/api/projects/{project['id']}/vlm-settings",
+        json={
+            "enabled": True,
+            "provider": "OpenAI",
+            "model": "gpt-4o-mini",
+            "api_base_url": "http://localhost:11434/v1",
+            "api_key": "secret-key",
+            "prompt": "Return JSON. Task: {task}",
+            "sample_frames": 6,
+        },
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={
+            "pass_threshold": 0.8,
+            "review_threshold": 0.6,
+            "vlm": {
+                "enabled": True,
+                "provider": "OpenAI",
+                "model": "gpt-4o-mini",
+                "api_base_url": "http://localhost:11434/v1",
+                "prompt": "Return JSON. Task: {task}",
+                "sample_frames": 6,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    first_result = response.json()["summary"]["results"][0]
+    messages = [finding["message"] for finding in first_result["findings"]]
+    assert "Set OPENAI_API_KEY or enter an API key to use OpenAI VLM scoring." not in messages

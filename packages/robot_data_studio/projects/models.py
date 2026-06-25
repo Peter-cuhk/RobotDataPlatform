@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from robot_data_studio.lerobot.models import DatasetMetadata
 from robot_data_studio.quality import CleaningConfig
@@ -14,10 +14,14 @@ class CreateProjectRequest(BaseModel):
     format_hint: str | None = None
 
 
+class ExportOptions(BaseModel):
+    output_dir: str | None = None
+
+
 class ExportRequest(BaseModel):
     episode_indexes: list[int]
     format: str
-    options: dict = {}
+    options: ExportOptions = Field(default_factory=ExportOptions)
 
 
 class CleaningRunRequest(CleaningConfig):

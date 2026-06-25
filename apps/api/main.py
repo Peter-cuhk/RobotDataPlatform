@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from robot_data_studio.formats import UnsupportedDatasetFormat
@@ -11,6 +11,11 @@ from robot_data_studio.quality import (
     CleaningSummary,
     EpisodeDecisionRequest,
     EpisodeQualityResult,
+    FilterConfig,
+    FilterConfigPatch,
+    FilterDetail,
+    FilterRun,
+    FilterSummary,
     VlmSettings,
 )
 from robot_data_studio.viewer import create_episode_recording
@@ -72,7 +77,12 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
     @app.post("/api/projects/{project_id}/exports", status_code=201)
     def export(project_id: str, request: ExportRequest) -> dict[str, str | int]:
         try:
-            output = service.export_dataset(project_id, request.format, request.episode_indexes)
+            output = service.export_dataset(
+                project_id,
+                request.format,
+                request.episode_indexes,
+                request.options.output_dir,
+            )
             return {
                 "output_path": str(output.output_path),
                 "report_path": str(output.report_path),
@@ -81,7 +91,7 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             }
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
-        except UnsupportedDatasetFormat as error:
+        except (UnsupportedDatasetFormat, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post(
@@ -103,6 +113,60 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             return service.cleaning_summary(project_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/projects/{project_id}/filters/runs",
+        status_code=201,
+        response_model=FilterRun,
+    )
+    def run_filters(project_id: str) -> FilterRun:
+        try:
+            return service.run_filters(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/projects/{project_id}/filters", response_model=FilterSummary)
+    def filters(project_id: str) -> FilterSummary:
+        try:
+            return service.filter_summary(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get(
+        "/api/projects/{project_id}/filters/{stage_id}/episodes/{episode_index}",
+        response_model=FilterDetail,
+    )
+    def filter_detail(project_id: str, stage_id: str, episode_index: int) -> FilterDetail:
+        try:
+            return service.filter_detail(project_id, stage_id, episode_index)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.patch("/api/projects/{project_id}/filters/config", response_model=FilterConfig)
+    def update_filter_config(project_id: str, request: FilterConfigPatch) -> FilterConfig:
+        try:
+            return service.update_filter_config(project_id, request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/filters/kinematics/urdf", status_code=201)
+    async def upload_filter_urdf(
+        project_id: str,
+        request: Request,
+        filename: str = Query(default="robot.urdf"),
+    ) -> dict[str, str]:
+        try:
+            return service.save_filter_urdf(project_id, filename, await request.body())
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}/vlm-settings", response_model=VlmSettings)
     def vlm_settings(project_id: str) -> VlmSettings:

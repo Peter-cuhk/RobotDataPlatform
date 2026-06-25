@@ -240,6 +240,7 @@ def write_robomimic_hdf5(adapter: object, episode_indexes: list[int], output: Pa
             demo.create_dataset("states", data=states)
             obs = demo.create_group("obs")
             obs.create_dataset("qpos", data=states)
+            obs.create_dataset("robot0_joint_pos", data=states)
             demo.attrs["num_samples"] = len(frames)
             demo.attrs["source_episode_index"] = episode_index
             data.attrs["total"] = int(data.attrs["total"]) + len(frames)
