@@ -78,6 +78,8 @@ export type CleaningSummary = {
     pass_threshold: number;
     review_threshold: number;
     overwrite_manual: boolean;
+    enabled_filter_stages: FilterStageId[];
+    quality_weights: Record<string, number>;
   };
   scorer_version: string;
 };
@@ -170,6 +172,15 @@ export type FilterConfig = {
   };
 };
 
+export type CleaningRuleConfig = {
+  enabled_filter_stages: FilterStageId[];
+  quality_weights: Record<string, number>;
+};
+
+function normalizeFilesystemPath(path: string) {
+  return path.trim().replace(/^(['"])(.*)\1$/, "$2").trim();
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -187,7 +198,7 @@ export function listFormats() {
 }
 
 export function importDataset(path: string, formatHint?: string) {
-  const normalizedPath = path.trim().replace(/^(['"])(.*)\1$/, "$2").trim();
+  const normalizedPath = normalizeFilesystemPath(path);
   const body = formatHint && formatHint !== "auto" ? { path: normalizedPath, format_hint: formatHint } : { path: normalizedPath };
   return request<Project>("/api/projects", {
     method: "POST",
@@ -207,21 +218,32 @@ export function createRecording(projectId: string, episodeIndex: number) {
 }
 
 export function exportDataset(projectId: string, episodeIndexes: number[], format: string, outputDir = "") {
-  const trimmedOutputDir = outputDir.trim();
+  const normalizedOutputDir = normalizeFilesystemPath(outputDir);
   return request<ExportResult>(`/api/projects/${projectId}/exports`, {
     method: "POST",
     body: JSON.stringify({
       episode_indexes: episodeIndexes,
       format,
-      options: trimmedOutputDir ? { output_dir: trimmedOutputDir } : {},
+      options: normalizedOutputDir ? { output_dir: normalizedOutputDir } : {},
     }),
   });
 }
 
-export function runCleaning(projectId: string, vlm?: VlmSettings) {
+export function runCleaning(
+  projectId: string,
+  vlm?: VlmSettings,
+  episodeIndexes?: number[],
+  ruleConfig?: CleaningRuleConfig,
+) {
   return request<CleaningRun>(`/api/projects/${projectId}/cleaning/runs`, {
     method: "POST",
-    body: JSON.stringify({ pass_threshold: 0.8, review_threshold: 0.6, ...(vlm ? { vlm: writableVlmSettings(vlm) } : {}) }),
+    body: JSON.stringify({
+      pass_threshold: 0.8,
+      review_threshold: 0.6,
+      ...(ruleConfig ?? {}),
+      ...(vlm ? { vlm: writableVlmSettings(vlm) } : {}),
+      ...(episodeIndexes ? { episode_indexes: episodeIndexes } : {}),
+    }),
   });
 }
 

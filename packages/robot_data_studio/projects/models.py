@@ -25,4 +25,4 @@ class ExportRequest(BaseModel):
 
 
 class CleaningRunRequest(CleaningConfig):
-    pass
+    episode_indexes: list[int] | None = None

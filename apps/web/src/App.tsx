@@ -15,6 +15,7 @@ import {
   saveVlmSettings,
   updateEpisodeDecision,
   uploadKinematicsUrdf,
+  type CleaningRuleConfig,
   type CleaningStatus,
   type CleaningSummary,
   type Episode,
@@ -32,8 +33,8 @@ import { languageStorageKey, readStoredLanguage, translations, type Language, ty
 import RerunViewer from "./RerunViewer";
 import "./styles.css";
 
-const defaultPath = "data/samples/lerobot-pusht";
-const datasetPathPlaceholder = "data/samples/lerobot-pusht";
+const defaultPath = "";
+const datasetPathPlaceholder = "Enter a local dataset path";
 const defaultVlmPrompt =
   "You are an automated robot episode evaluator. Return only JSON with success, score, and reason. Judge whether the task was successfully completed from the visual evidence.";
 
@@ -57,6 +58,15 @@ const filterStageIds: FilterStageId[] = [
   "kinematic_consistency",
   "orientation_alignment",
 ];
+
+const defaultQualityWeights: Record<string, number> = {
+  sudden_change: 1,
+  state_action_alignment: 1,
+  extreme_value: 1,
+  kinematic_consistency: 1,
+  orientation_alignment: 1,
+  task_success: 2,
+};
 
 function isFilterStageId(value: string): value is FilterStageId {
   return filterStageIds.includes(value as FilterStageId);
@@ -83,6 +93,10 @@ function dataFilters(copy: Translation): Array<{ id: FilterStageId; label: strin
     { id: "kinematic_consistency", label: copy.filters.kinematicConsistency, code: "kinematic_consistency" },
     { id: "orientation_alignment", label: copy.filters.orientationAlignment, code: "orientation_alignment" },
   ];
+}
+
+function cleaningRules(copy: Translation): Array<{ id: FilterStageId; label: string }> {
+  return dataFilters(copy).map((filter) => ({ id: filter.id, label: filter.label }));
 }
 
 function episodeLabel(index: number) {
@@ -117,6 +131,17 @@ function pickEpisodeAfterCleaning(summary: CleaningSummary) {
     .filter((result) => result.score !== null)
     .sort((left, right) => (left.score ?? 1) - (right.score ?? 1));
   return scored[0]?.episode_index ?? summary.results[0]?.episode_index ?? null;
+}
+
+function pickNextReviewEpisode(summary: CleaningSummary, currentEpisodeIndex: number) {
+  const reviews = summary.results
+    .filter((result) => result.status === "review")
+    .sort((left, right) => left.episode_index - right.episode_index);
+  return (
+    reviews.find((result) => result.episode_index > currentEpisodeIndex)?.episode_index ??
+    reviews[0]?.episode_index ??
+    null
+  );
 }
 
 function resolveExportEpisodeIndexes(
@@ -166,6 +191,8 @@ export default function App() {
   const [activeFilterStage, setActiveFilterStage] = useState<FilterStageId | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFindingFilters, setActiveFindingFilters] = useState<string[]>([]);
+  const [enabledFilterStages, setEnabledFilterStages] = useState<FilterStageId[]>(() => [...filterStageIds]);
+  const [qualityWeights, setQualityWeights] = useState<Record<string, number>>(() => ({ ...defaultQualityWeights }));
   const [showVlmSettings, setShowVlmSettings] = useState(false);
   const [vlmSettingsDirty, setVlmSettingsDirty] = useState(false);
   const [vlmSettings, setVlmSettings] = useState<VlmSettings>({
@@ -199,6 +226,8 @@ export default function App() {
       setCleaningSummary(null);
       setFilterSummary(null);
       setActiveFilterStage(null);
+      setEnabledFilterStages([...filterStageIds]);
+      setQualityWeights({ ...defaultQualityWeights });
     },
   });
   const episodesQuery = useQuery({
@@ -207,8 +236,18 @@ export default function App() {
     enabled: Boolean(project),
   });
   const cleaningMutation = useMutation({
-    mutationFn: async () => {
-      const cleaning = await runCleaning(project!.id, vlmSettings);
+    mutationFn: async (episodeIndexes?: number[]) => {
+      const activeQualityWeights = Object.fromEntries(
+        filterStageIds.map((stageId) => [stageId, qualityWeights[stageId] ?? 1]),
+      );
+      if (vlmSettings.enabled) {
+        activeQualityWeights.task_success = qualityWeights.task_success ?? 2;
+      }
+      const ruleConfig: CleaningRuleConfig = {
+        enabled_filter_stages: enabledFilterStages,
+        quality_weights: activeQualityWeights,
+      };
+      const cleaning = await runCleaning(project!.id, vlmSettings, episodeIndexes, ruleConfig);
       const filters = await runFilters(project!.id);
       return { cleaning, filters };
     },
@@ -228,19 +267,6 @@ export default function App() {
     queryKey: ["vlm-settings", project?.id],
     queryFn: () => getVlmSettings(project!.id),
     enabled: Boolean(project && showVlmSettings && !vlmSettingsDirty),
-  });
-  const decisionMutation = useMutation({
-    mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
-      updateEpisodeDecision(project!.id, episodeIndex, status),
-    onSuccess: (updated) => {
-      setCleaningSummary((summary) => {
-        if (!summary) return summary;
-        const results = summary.results.map((result) =>
-          result.episode_index === updated.episode_index ? updated : result,
-        );
-        return summarizeCleaning({ ...summary, results });
-      });
-    },
   });
   const recordingMutation = useMutation({
     mutationFn: (episodeIndex: number) => createRecording(project!.id, episodeIndex),
@@ -337,6 +363,16 @@ export default function App() {
       setVlmSettings(vlmSettingsQuery.data);
     }
   }, [vlmSettingsQuery.data]);
+  const updateRuleWeight = (key: string, value: number) => {
+    setQualityWeights((current) => ({ ...current, [key]: value }));
+  };
+  const toggleFilterStage = (stageId: FilterStageId) => {
+    setEnabledFilterStages((current) =>
+      current.includes(stageId)
+        ? current.filter((item) => item !== stageId)
+        : [...current, stageId],
+    );
+  };
   const toggleCheckedEpisode = (episodeIndex: number) => {
     setCheckedEpisodeIndexes((current) => {
       const next = new Set(current);
@@ -370,6 +406,31 @@ export default function App() {
     if (!nextEpisode) return;
     replayEpisode(nextEpisode.episode_index);
   };
+  const decisionMutation = useMutation({
+    mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
+      updateEpisodeDecision(project!.id, episodeIndex, status),
+    onSuccess: (updated) => {
+      const updatedSummary = cleaningSummary
+        ? summarizeCleaning({
+            ...cleaningSummary,
+            results: cleaningSummary.results.map((result) =>
+              result.episode_index === updated.episode_index ? updated : result,
+            ),
+          })
+        : null;
+      setCleaningSummary(updatedSummary);
+      const nextReviewEpisode = updatedSummary ? pickNextReviewEpisode(updatedSummary, updated.episode_index) : null;
+      if (nextReviewEpisode === null) return;
+      setActiveFilterStage(null);
+      if (recordingUrl && !activeFilterStage) {
+        replayEpisode(nextReviewEpisode);
+      } else {
+        setSelected(nextReviewEpisode);
+        setRecordingUrl(null);
+        setExportedResult(null);
+      }
+    },
+  });
 
   return (
     <main className="app-shell">
@@ -434,7 +495,7 @@ export default function App() {
             ))}
           </select>
         </label>
-        <button onClick={() => importMutation.mutate()} disabled={importMutation.isPending}>
+        <button onClick={() => importMutation.mutate()} disabled={importMutation.isPending || !path.trim()}>
           {importMutation.isPending ? copy.import.scanning : copy.import.importDataset}
         </button>
         {importMutation.error && <p className="error">{importMutation.error.message}</p>}
@@ -507,9 +568,16 @@ export default function App() {
                   <button
                     className="secondary"
                     disabled={cleaningMutation.isPending}
-                    onClick={() => cleaningMutation.mutate()}
+                    onClick={() => cleaningMutation.mutate(undefined)}
                   >
                     {cleaningMutation.isPending ? copy.viewer.cleaning : copy.viewer.runCleaning}
+                  </button>
+                  <button
+                    className="secondary"
+                    disabled={cleaningMutation.isPending || selected === null}
+                    onClick={() => selected !== null && cleaningMutation.mutate([selected])}
+                  >
+                    {cleaningMutation.isPending ? copy.viewer.cleaning : copy.viewer.runSelected}
                   </button>
                   <button
                     className="secondary"
@@ -538,6 +606,16 @@ export default function App() {
                 onExport={() => exportMutation.mutate()}
               />
 
+              <CleaningRulesPanel
+                copy={copy}
+                rules={cleaningRules(copy)}
+                enabledFilterStages={enabledFilterStages}
+                weights={qualityWeights}
+                vlmEnabled={vlmSettings.enabled}
+                onToggleRule={toggleFilterStage}
+                onWeightChange={updateRuleWeight}
+              />
+
               <div className="viewer-stage">
                 {activeFilterStage ? (
                   <FilterDetailView
@@ -561,6 +639,16 @@ export default function App() {
                     }
                     onPreviousEpisode={() => replayAdjacentEpisode(-1)}
                     onNextEpisode={() => replayAdjacentEpisode(1)}
+                  />
+                ) : cleaningSummary ? (
+                  <CleaningSummaryView
+                    copy={copy}
+                    summary={cleaningSummary}
+                    onSelect={(episodeIndex) => {
+                      setSelected(episodeIndex);
+                      setRecordingUrl(null);
+                      setExportedResult(null);
+                    }}
                   />
                 ) : (
                   <div className="viewer-placeholder">
@@ -625,7 +713,7 @@ export default function App() {
               onDecision={(status) => {
                 if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
               }}
-              onAddToPipeline={() => cleaningMutation.mutate()}
+              onAddToPipeline={() => cleaningMutation.mutate(undefined)}
             />
           </section>
         </>
@@ -714,6 +802,139 @@ function ExportPanel({
       <button type="button" disabled={disabled} onClick={onExport}>
         {pending ? copy.viewer.exporting : copy.exportPanel.exportCount(exportCount)}
       </button>
+    </div>
+  );
+}
+
+function CleaningRulesPanel({
+  copy,
+  rules,
+  enabledFilterStages,
+  weights,
+  vlmEnabled,
+  onToggleRule,
+  onWeightChange,
+}: {
+  copy: Translation;
+  rules: Array<{ id: FilterStageId; label: string }>;
+  enabledFilterStages: FilterStageId[];
+  weights: Record<string, number>;
+  vlmEnabled: boolean;
+  onToggleRule: (stageId: FilterStageId) => void;
+  onWeightChange: (key: string, value: number) => void;
+}) {
+  return (
+    <div className="cleaning-rules-panel">
+      <div className="cleaning-rules-heading">
+        <span>{copy.cleaningRules.title}</span>
+        <small>{copy.cleaningRules.enabledCount(enabledFilterStages.length)}</small>
+      </div>
+      <div className="rule-slider-grid">
+        {rules.map((rule) => {
+          const checked = enabledFilterStages.includes(rule.id);
+          const value = weights[rule.id] ?? 1;
+          return (
+            <div className={`rule-slider ${checked ? "enabled" : ""}`} key={rule.id}>
+              <label className="rule-toggle">
+                <input
+                  aria-label={`${rule.label} rule`}
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => onToggleRule(rule.id)}
+                />
+                <span>{rule.label}</span>
+              </label>
+              <input
+                aria-label={`${rule.label} weight`}
+                type="range"
+                min="0.25"
+                max="3"
+                step="0.25"
+                value={value}
+                disabled={!checked}
+                onChange={(event) => onWeightChange(rule.id, Number(event.target.value))}
+              />
+              <strong>{value.toFixed(2)}x</strong>
+            </div>
+          );
+        })}
+        {vlmEnabled && (
+          <div className="rule-slider enabled">
+            <label className="rule-toggle">
+              <input type="checkbox" checked readOnly aria-label={`${copy.cleaningRules.vlmTaskSuccess} rule`} />
+              <span>{copy.cleaningRules.vlmTaskSuccess}</span>
+            </label>
+            <input
+              aria-label={`${copy.cleaningRules.vlmTaskSuccess} weight`}
+              type="range"
+              min="0.25"
+              max="3"
+              step="0.25"
+              value={weights.task_success ?? 2}
+              onChange={(event) => onWeightChange("task_success", Number(event.target.value))}
+            />
+            <strong>{(weights.task_success ?? 2).toFixed(2)}x</strong>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CleaningSummaryView({
+  copy,
+  summary,
+  onSelect,
+}: {
+  copy: Translation;
+  summary: CleaningSummary;
+  onSelect: (episodeIndex: number) => void;
+}) {
+  const scored = [...summary.results]
+    .filter((result) => result.score !== null)
+    .sort((left, right) => (left.score ?? 1) - (right.score ?? 1));
+  const chartResults = [...summary.results].sort((left, right) => left.episode_index - right.episode_index);
+  return (
+    <div className="cleaning-summary-view">
+      <div className="cleaning-summary-header">
+        <div>
+          <span className="eyebrow">{copy.cleaningSummary.eyebrow}</span>
+          <h3>{copy.cleaningSummary.title}</h3>
+        </div>
+        <div className="summary-counts">
+          <span className="passed">{copy.status.passed} {summary.passed_count}</span>
+          <span className="review">{copy.status.review} {summary.review_count}</span>
+          <span className="excluded">{copy.status.excluded} {summary.excluded_count}</span>
+        </div>
+      </div>
+      <div className="score-bars" role="list" aria-label={copy.cleaningSummary.scoreChart}>
+        {chartResults.map((result) => {
+          const score = result.score ?? 0;
+          return (
+            <button
+              aria-label={`${episodeLabel(result.episode_index)} score ${Math.round(score * 100)} status ${statusLabel(result.status, copy)}`}
+              className={`score-bar ${result.status}`}
+              key={result.episode_index}
+              onClick={() => onSelect(result.episode_index)}
+              style={{ "--bar-height": `${Math.max(5, Math.round(score * 100))}%` } as CSSProperties}
+              type="button"
+            >
+              <i />
+              <span>{compactEpisodeLabel(result.episode_index)}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="lowest-episodes">
+        <h4>{copy.cleaningSummary.lowest}</h4>
+        {scored.slice(0, 6).map((result) => (
+          <button key={result.episode_index} type="button" onClick={() => onSelect(result.episode_index)}>
+            <span>{compactEpisodeLabel(result.episode_index)}</span>
+            <strong>{scoreLabel(result.score, copy)}</strong>
+            <small className={result.status}>{statusLabel(result.status, copy)}</small>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1293,8 +1514,12 @@ function QualityReport({
             )}
           </div>
           <div className="review-actions">
-            <button disabled={pending} onClick={() => onDecision("passed")}>{copy.status.passed}</button>
-            <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>{copy.status.excluded}</button>
+            {quality.status !== "passed" && (
+              <button disabled={pending} onClick={() => onDecision("passed")}>{copy.status.passed}</button>
+            )}
+            {quality.status !== "excluded" && (
+              <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>{copy.status.excluded}</button>
+            )}
             <button className="secondary span-all" disabled={pending} onClick={onAddToPipeline}>
               {copy.quality.addToPipeline}
             </button>

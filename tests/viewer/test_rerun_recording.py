@@ -128,10 +128,15 @@ def blueprint_node_names(value: object) -> list[str]:
 def test_create_episode_recording_logs_every_video_key(monkeypatch, tmp_path: Path) -> None:
     streams = install_fake_rerun(monkeypatch)
     reader = FakeReader()
+    video_paths = {}
+    for video_key in reader.video_keys:
+        video_path = tmp_path / f"{video_key.replace('.', '_')}.mp4"
+        video_path.write_bytes(b"fake video")
+        video_paths[video_key] = video_path
+    reader.video_path = lambda episode_index, video_key: video_paths[video_key]
 
     create_episode_recording(reader, episode_index=7, output_path=tmp_path / "episode.rrd")
 
-    assert reader.video_path_calls == [(7, key) for key in reader.video_keys]
     recording = streams[0]
     assert recording.logged_paths == [
         "annotations/task",

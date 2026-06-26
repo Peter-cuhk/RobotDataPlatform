@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import h5py
 import numpy as np
@@ -134,18 +135,57 @@ class RobomimicHDF5DatasetAdapter:
 
     def metadata(self) -> DatasetMetadata:
         episodes = self.list_episodes()
+        robot_type = self._robot_type()
+        features = {
+            "observation.state": {"dtype": "float32"},
+            "action": {"dtype": "float32"},
+        }
+        with h5py.File(self.root, "r") as file:
+            first_demo = file[f"data/{self._demo_keys()[0]}"]
+            if "obs/robot0_joint_pos" in first_demo and "obs/robot0_eef_pos" in first_demo:
+                joint_dim = int(first_demo["obs/robot0_joint_pos"].shape[1])
+                eef_dim = int(first_demo["obs/robot0_eef_pos"].shape[1])
+                features["observation.state"] = {
+                    "dtype": "float32",
+                    "shape": [joint_dim + eef_dim],
+                    "names": {
+                        "motors": [f"panda_joint{index}" for index in range(1, joint_dim + 1)]
+                        + ["eef_x", "eef_y", "eef_z"][:eef_dim]
+                    },
+                    "robomimic_keys": ["obs/robot0_joint_pos", "obs/robot0_eef_pos"],
+                }
+                features["action"] = {
+                    "dtype": "float32",
+                    "shape": [int(first_demo["actions"].shape[1])],
+                }
         return DatasetMetadata(
             path=str(self.root),
             format=self.format_id,
             version="robomimic_hdf5",
-            robot_type="unknown",
+            robot_type=robot_type,
             total_episodes=len(episodes),
             total_frames=sum(episode.length for episode in episodes),
             fps=30.0,
             video_keys=[],
             scalar_keys=["observation.state", "action"],
-            features={"observation.state": {"dtype": "float32"}, "action": {"dtype": "float32"}},
+            features=features,
         )
+
+    def _robot_type(self) -> str:
+        with h5py.File(self.root, "r") as file:
+            raw = file["data"].attrs.get("env_args")
+        if raw is None:
+            return "unknown"
+        try:
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
+        except json.JSONDecodeError:
+            return "unknown"
+        robots = payload.get("env_kwargs", {}).get("robots")
+        if isinstance(robots, list) and robots:
+            return str(robots[0])
+        if isinstance(robots, str):
+            return robots
+        return "unknown"
 
     def list_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
         summaries = []
@@ -178,7 +218,15 @@ class RobomimicHDF5DatasetAdapter:
         with h5py.File(self.root, "r") as file:
             demo = file[episode.data_file]
             actions = np.asarray(demo["actions"])
-            if "obs/qpos" in demo:
+            if "obs/robot0_joint_pos" in demo and "obs/robot0_eef_pos" in demo:
+                states = np.concatenate(
+                    [
+                        np.asarray(demo["obs/robot0_joint_pos"], dtype=np.float64),
+                        np.asarray(demo["obs/robot0_eef_pos"], dtype=np.float64),
+                    ],
+                    axis=1,
+                )
+            elif "obs/qpos" in demo:
                 states = np.asarray(demo["obs/qpos"])
             elif "states" in demo:
                 states = np.asarray(demo["states"])

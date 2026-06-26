@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import h5py
+import numpy as np
+import pinocchio as pin
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
@@ -47,7 +50,10 @@ def test_filter_detail_rejects_unknown_stage(tmp_path: Path) -> None:
     assert response.status_code == 404
 
 
-def test_kinematic_filter_accepts_urdf_upload_and_reports_missing_pinocchio(tmp_path: Path) -> None:
+def test_kinematic_filter_accepts_urdf_upload_and_reports_missing_pinocchio(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
 
@@ -76,9 +82,80 @@ def test_kinematic_filter_accepts_urdf_upload_and_reports_missing_pinocchio(tmp_
     assert config.status_code == 200
     assert config.json()["kinematics"]["urdf_path"].endswith("test_robot.urdf")
 
+    def fake_find_spec(name: str):
+        if name == "pinocchio":
+            return None
+        return None
+
+    monkeypatch.setattr(
+        "packages.robot_data_studio.quality.filter_service.importlib.util.find_spec",
+        fake_find_spec,
+    )
+
     detail = client.get(f"/api/projects/{project['id']}/filters/kinematic_consistency/episodes/0")
 
     assert detail.status_code == 200
     assert detail.json()["status"] == "skipped"
     assert detail.json()["skipped_reason"] == "backend_missing"
     assert "Pinocchio" in detail.json()["findings"][0]["message"]
+
+
+def test_kinematic_filter_autoconfigures_robomimic_panda_dataset(tmp_path: Path) -> None:
+    dataset = _write_robomimic_panda_fk_dataset(tmp_path / "robomimic_panda.hdf5")
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post("/api/projects", json={"path": str(dataset), "format_hint": "robomimic_hdf5"}).json()
+
+    detail = client.get(f"/api/projects/{project['id']}/filters/kinematic_consistency/episodes/0")
+
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["status"] == "passed"
+    assert body["skipped_reason"] is None
+    assert max(body["series"]["position_error"]) < 0.001
+    assert body["parameters"]["end_effector_link"] == "panda_grasptarget"
+    assert body["parameters"]["joint_names"] == [f"panda_joint{index}" for index in range(1, 8)]
+    assert body["parameters"]["joint_state_indices"] == list(range(7))
+    assert body["parameters"]["eef_position_indices"] == [7, 8, 9]
+
+
+def _write_robomimic_panda_fk_dataset(path: Path) -> Path:
+    urdf_path = Path("data/urdf/panda_bullet.urdf").resolve()
+    model = pin.buildModelFromUrdf(str(urdf_path))
+    data = model.createData()
+    frame_id = model.getFrameId("panda_grasptarget")
+    offset = np.asarray([0.55, -0.1, 0.9], dtype=np.float64)
+    joint_rows = []
+    eef_rows = []
+    for index in range(12):
+        q = np.asarray(
+            [
+                0.2 * np.sin(index / 10),
+                -0.4 + 0.05 * np.cos(index / 8),
+                0.15 * np.sin(index / 7),
+                -2.1 + 0.04 * np.cos(index / 6),
+                0.05 * np.sin(index / 5),
+                1.8 + 0.03 * np.cos(index / 4),
+                0.7 + 0.02 * np.sin(index / 3),
+            ],
+            dtype=np.float64,
+        )
+        full_q = np.zeros(model.nq)
+        full_q[:7] = q
+        pin.forwardKinematics(model, data, full_q)
+        pin.updateFramePlacements(model, data)
+        joint_rows.append(q)
+        eef_rows.append(np.asarray(data.oMf[frame_id].translation) + offset)
+    joints = np.asarray(joint_rows, dtype=np.float64)
+    eef = np.asarray(eef_rows, dtype=np.float64)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as file:
+        group = file.create_group("data")
+        group.attrs["total"] = len(joints)
+        group.attrs["env_args"] = '{"env_name":"Lift","env_kwargs":{"robots":["Panda"]}}'
+        demo = group.create_group("demo_0")
+        demo.attrs["num_samples"] = len(joints)
+        demo.create_dataset("actions", data=np.zeros((len(joints), 7), dtype=np.float64))
+        obs = demo.create_group("obs")
+        obs.create_dataset("robot0_joint_pos", data=joints)
+        obs.create_dataset("robot0_eef_pos", data=eef)
+    return path

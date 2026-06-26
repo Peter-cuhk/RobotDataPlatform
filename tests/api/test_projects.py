@@ -4,6 +4,7 @@ import h5py
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
+from robot_data_studio.quality.models import DEFAULT_VLM_PROMPT
 from tests.lerobot.test_reader import write_agibot_v2_episode_fixture
 
 
@@ -144,6 +145,26 @@ def test_export_episode_to_user_selected_output_directory(tmp_path: Path) -> Non
     assert Path(response.json()["report_path"]).parent == output_dir
 
 
+def test_export_episode_normalizes_quoted_output_directory(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    output_dir = tmp_path / "quoted exports"
+
+    response = client.post(
+        f"/api/projects/{project['id']}/exports",
+        json={
+            "episode_indexes": [0],
+            "format": "act_hdf5",
+            "options": {"output_dir": f" '{output_dir}' "},
+        },
+    )
+
+    assert response.status_code == 201
+    output_path = Path(response.json()["output_path"])
+    assert output_path.exists()
+    assert output_path.parent == output_dir
+
+
 def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
@@ -165,17 +186,28 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
         "pass_threshold": 0.85,
         "review_threshold": 0.65,
         "overwrite_manual": False,
+        "enabled_filter_stages": [
+            "sudden_change",
+            "state_action_alignment",
+            "extreme_value",
+            "kinematic_consistency",
+            "orientation_alignment",
+        ],
+        "quality_weights": {
+            "sudden_change": 1.0,
+            "state_action_alignment": 1.0,
+            "extreme_value": 1.0,
+            "kinematic_consistency": 1.0,
+            "orientation_alignment": 1.0,
+            "task_success": 2.0,
+        },
         "vlm": {
             "enabled": False,
             "provider": "OpenAI",
             "model": "gpt-4o-mini",
             "api_base_url": None,
             "api_key_configured": False,
-            "prompt": (
-                "You are an automated robot episode evaluator. Return only JSON with "
-                "success, score, and reason. Judge whether the task was successfully "
-                "completed from the visual evidence."
-            ),
+            "prompt": DEFAULT_VLM_PROMPT,
             "sample_frames": 4,
         },
     }
@@ -189,6 +221,48 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
 
     assert stored.status_code == 200
     assert stored.json()["total"] == 206
+
+
+def test_run_cleaning_accepts_enabled_filters_and_quality_weights(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={
+            "pass_threshold": 0.8,
+            "review_threshold": 0.6,
+            "enabled_filter_stages": ["sudden_change", "state_action_alignment"],
+            "quality_weights": {
+                "sudden_change": 1.0,
+                "state_action_alignment": 2.5,
+                "task_success": 2.0,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    config = response.json()["summary"]["config"]
+    assert config["enabled_filter_stages"] == ["sudden_change", "state_action_alignment"]
+    assert config["quality_weights"]["state_action_alignment"] == 2.5
+    assert config["quality_weights"]["task_success"] == 2.0
+
+
+def test_run_cleaning_can_score_only_selected_episodes(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65, "episode_indexes": [0]},
+    )
+
+    assert response.status_code == 201
+    results = response.json()["summary"]["results"]
+    scored = [result for result in results if result["status"] != "unscored"]
+
+    assert [result["episode_index"] for result in scored] == [0]
+    assert len(results) == 206
 
 
 def test_manual_episode_decision_is_persisted_and_preserved_by_rerun(tmp_path: Path) -> None:

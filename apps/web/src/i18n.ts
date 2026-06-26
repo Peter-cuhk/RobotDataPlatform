@@ -20,7 +20,7 @@ export const translations = {
       scanning: "Scanning...",
       importDataset: "Import dataset",
       emptyTitle: "Open a robot dataset",
-      emptyBody: "LeRobot, HDF5 and UMI/Zarr data stay on this machine.",
+      emptyBody: "Enter a local dataset path to inspect and clean robot episodes.",
     },
     dataset: {
       format: "Format",
@@ -37,6 +37,7 @@ export const translations = {
       inspect: "INSPECT",
       fallbackEpisode: "Episode",
       runCleaning: "Run cleaning Pipeline",
+      runSelected: "Run selected episode",
       cleaning: "Cleaning...",
       replay: "Replay in Rerun",
       buildingReplay: "Building replay...",
@@ -125,6 +126,17 @@ export const translations = {
       sourceSeparator: " · ",
       resizePanel: "Resize quality report panel",
     },
+    cleaningRules: {
+      title: "Cleaning rules",
+      enabledCount: (count: number) => `${count} enabled`,
+      vlmTaskSuccess: "VLM task success",
+    },
+    cleaningSummary: {
+      eyebrow: "PIPELINE RESULT",
+      title: "Cleaning summary",
+      scoreChart: "Episode cleaning scores",
+      lowest: "Lowest score episodes",
+    },
     vlm: {
       enable: "Enable VLM",
       provider: "Provider",
@@ -166,7 +178,7 @@ export const translations = {
       scanning: "扫描中...",
       importDataset: "导入 dataset",
       emptyTitle: "打开 robot dataset",
-      emptyBody: "LeRobot, HDF5 and UMI/Zarr data stay on this machine.",
+      emptyBody: "输入本地 dataset 路径后，即可检查并清洗 robot episodes。",
     },
     dataset: {
       format: "格式",
@@ -183,6 +195,7 @@ export const translations = {
       inspect: "检查",
       fallbackEpisode: "Episode",
       runCleaning: "运行清洗 Pipeline",
+      runSelected: "运行选中 episode",
       cleaning: "清洗中...",
       replay: "Replay in Rerun",
       buildingReplay: "构建 replay 中...",
@@ -270,6 +283,17 @@ export const translations = {
       issues: "issues",
       sourceSeparator: " · ",
       resizePanel: "调整 Quality Report 面板宽度",
+    },
+    cleaningRules: {
+      title: "清洗规则",
+      enabledCount: (count: number) => `已启用 ${count} 项`,
+      vlmTaskSuccess: "VLM 任务成功",
+    },
+    cleaningSummary: {
+      eyebrow: "PIPELINE 结果",
+      title: "Cleaning summary",
+      scoreChart: "Episode 清洗分数",
+      lowest: "Lowest score episodes",
     },
     vlm: {
       enable: "启用 VLM",

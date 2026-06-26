@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 from uuid import uuid4
 
 from robot_data_studio.formats import ExportResult, FormatRegistry
@@ -16,6 +16,7 @@ from robot_data_studio.quality import (
     FilterConfig,
     FilterConfigPatch,
     FilterDetail,
+    FilterKinematicsConfig,
     FilterRun,
     FilterSummary,
     VlmSettings,
@@ -25,6 +26,13 @@ from robot_data_studio.quality.models import utc_now
 from robot_data_studio.quality.store import CleaningStateStore, VlmSettingsStore, build_summary
 
 from .models import Project
+
+
+def _normalize_filesystem_path(path: str) -> str:
+    stripped = path.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        return stripped[1:-1].strip()
+    return stripped
 
 
 class ProjectService:
@@ -63,7 +71,7 @@ class ProjectService:
     ) -> ExportResult:
         output_base = self.artifact_root
         if output_dir and output_dir.strip():
-            output_base = Path(output_dir).expanduser().resolve()
+            output_base = Path(_normalize_filesystem_path(output_dir)).expanduser().resolve()
             if output_base.exists() and not output_base.is_dir():
                 raise ValueError("Export output directory must be a directory")
 
@@ -100,27 +108,38 @@ class ProjectService:
         return self._vlm_settings_store(project_id).save(settings)
 
     def run_cleaning(self, project_id: str, config: CleaningConfig) -> CleaningRun:
+        episode_indexes = getattr(config, "episode_indexes", None)
+        scoring_config = CleaningConfig.model_validate(
+            config.model_dump(exclude={"episode_indexes"})
+        )
         if config.review_threshold > config.pass_threshold:
             raise ValueError("review_threshold must be less than or equal to pass_threshold")
         if "vlm" in config.model_fields_set:
-            config = config.model_copy(update={"vlm": self.update_vlm_settings(project_id, config.vlm)})
+            scoring_config = scoring_config.model_copy(
+                update={"vlm": self.update_vlm_settings(project_id, config.vlm)}
+            )
         else:
-            config = config.model_copy(update={"vlm": self.vlm_settings(project_id)})
+            scoring_config = scoring_config.model_copy(update={"vlm": self.vlm_settings(project_id)})
         reader = self.reader(project_id)
         episodes = reader.list_episodes()
+        if episode_indexes is not None:
+            valid_indexes = {episode.episode_index for episode in episodes}
+            invalid_indexes = sorted(set(episode_indexes) - valid_indexes)
+            if invalid_indexes:
+                raise ValueError(f"Episode indexes not found: {invalid_indexes}")
         previous = self._cleaning_store(project_id).load()
         previous_manual = {
             result.episode_index: result
             for result in (previous.results if previous else [])
             if result.source == "manual"
         }
-        results = self._scorer.score_dataset(reader, config)
+        results = self._scorer.score_dataset(reader, scoring_config, episode_indexes)
         if not config.overwrite_manual:
             results = [
                 previous_manual.get(result.episode_index, result)
                 for result in results
             ]
-        summary = build_summary(episodes, results, config, self._scorer.scorer_version)
+        summary = build_summary(episodes, results, scoring_config, self._scorer.scorer_version)
         self._cleaning_store(project_id).save(summary)
         return CleaningRun(run_id=uuid4().hex[:12], status="succeeded", summary=summary)
 
@@ -187,7 +206,10 @@ class ProjectService:
         store = self._filter_config_store(project_id)
         if store.is_file():
             return FilterConfig.model_validate_json(store.read_text())
-        config = FilterConfig(gripper_indices=infer_gripper_indices(self.reader(project_id)))
+        config = FilterConfig(
+            gripper_indices=infer_gripper_indices(self.reader(project_id)),
+            kinematics=self._infer_kinematics_config(project_id),
+        )
         self._save_filter_config(project_id, config)
         return config
 
@@ -244,6 +266,30 @@ class ProjectService:
 
     def _filter_summary_store(self, project_id: str) -> Path:
         return self.project_artifact_dir(project_id) / "filter_summary.json"
+
+    def _infer_kinematics_config(self, project_id: str) -> FilterKinematicsConfig:
+        metadata = self.project(project_id).dataset
+        state_feature = metadata.features.get("observation.state", {})
+        names = state_feature.get("names", {})
+        motor_names = names.get("motors", []) if isinstance(names, dict) else []
+        if (
+            metadata.format == "robomimic_hdf5"
+            and metadata.robot_type.lower() == "panda"
+            and len(motor_names) >= 10
+            and motor_names[:7] == [f"panda_joint{index}" for index in range(1, 8)]
+        ):
+            urdf_path = Path(__file__).resolve().parents[3] / "data" / "urdf" / "panda_bullet.urdf"
+            if urdf_path.is_file():
+                return FilterKinematicsConfig(
+                    urdf_path=str(urdf_path),
+                    end_effector_link="panda_grasptarget",
+                    joint_names=[f"panda_joint{index}" for index in range(1, 8)],
+                    joint_state_indices=list(range(7)),
+                    eef_position_indices=[7, 8, 9],
+                    position_tolerance=0.02,
+                    resolve_tcp_offset=True,
+                )
+        return FilterKinematicsConfig()
 
     def _save_filter_config(self, project_id: str, config: FilterConfig) -> None:
         path = self._filter_config_store(project_id)

@@ -13,6 +13,7 @@ from .filter_models import (
     FilterConfig,
     FilterConfigPatch,
     FilterDetail,
+    FilterKinematicsConfig,
     FilterRun,
     FilterSummary,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "FilterConfig",
     "FilterConfigPatch",
     "FilterDetail",
+    "FilterKinematicsConfig",
     "FilterRun",
     "FilterSummary",
     "QualityFinding",

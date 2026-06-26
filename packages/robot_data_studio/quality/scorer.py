@@ -80,6 +80,48 @@ def _status_for_score(score: float, config: CleaningConfig) -> str:
     return "excluded"
 
 
+def _status_for_episode(
+    score: float,
+    config: CleaningConfig,
+    vlm_evaluation: VlmEvaluation | None,
+) -> str:
+    status = _status_for_score(score, config)
+    if vlm_evaluation and not vlm_evaluation.success and status == "passed":
+        return "review"
+    return status
+
+
+def _configured_weight(config: CleaningConfig, key: str) -> float:
+    value = config.quality_weights.get(key, 1.0)
+    if not math.isfinite(value):
+        return 1.0
+    return max(0.0, value)
+
+
+def _weighted_score(scores: dict[str, float], config: CleaningConfig) -> float:
+    weighted_total = 0.0
+    weight_total = 0.0
+    for stage_id in config.enabled_filter_stages:
+        if stage_id not in scores:
+            continue
+        weight = _configured_weight(config, stage_id)
+        if weight <= 0:
+            continue
+        weighted_total += scores[stage_id] * weight
+        weight_total += weight
+    if config.vlm.enabled and "task_success" in scores:
+        weight = _configured_weight(config, "task_success")
+        if weight > 0:
+            weighted_total += scores["task_success"] * weight
+            weight_total += weight
+    if weight_total <= 0:
+        fallback_scores = [
+            score for name, score in scores.items() if name != "task_success" or config.vlm.enabled
+        ]
+        return sum(fallback_scores) / len(fallback_scores) if fallback_scores else 0.0
+    return weighted_total / weight_total
+
+
 def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]:
     findings = []
     if not has_video:
@@ -99,6 +141,24 @@ def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]
                     message=f"{name.replace('_', ' ').title()} score is low ({score:.2f}).",
                 )
             )
+    return findings
+
+
+def _deterministic_findings(scores: dict[str, float], config: CleaningConfig) -> list[QualityFinding]:
+    messages = {
+        "sudden_change": ("action_jump", "Sudden motion or action changes require review."),
+        "state_action_alignment": ("time_sync", "State/action alignment score is low."),
+        "extreme_value": ("extreme_value", "Extreme values are outside the expected range."),
+        "kinematic_consistency": ("kinematic_consistency", "Kinematic consistency score is low."),
+        "orientation_alignment": ("orientation_alignment", "Orientation alignment score is low."),
+    }
+    findings: list[QualityFinding] = []
+    for stage_id in config.enabled_filter_stages:
+        score = scores.get(stage_id)
+        if score is None or score >= 0.5:
+            continue
+        code, message = messages[stage_id]
+        findings.append(QualityFinding(code=code, severity="warn", message=message))
     return findings
 
 
@@ -134,8 +194,12 @@ class EpisodeQualityScorer:
         self,
         reader: LeRobotDatasetReader,
         config: CleaningConfig,
+        episode_indexes: list[int] | None = None,
     ) -> list[EpisodeQualityResult]:
         episodes = reader.list_episodes()
+        if episode_indexes is not None:
+            selected = set(episode_indexes)
+            episodes = [episode for episode in episodes if episode.episode_index in selected]
         nominal_duration = median([episode.duration_seconds for episode in episodes]) if episodes else 0.0
         return [
             self.score_episode(reader, episode.episode_index, episode.duration_seconds, nominal_duration, config)
@@ -161,6 +225,18 @@ class EpisodeQualityScorer:
             "runtime": _runtime_score(duration_seconds, nominal_duration),
             "actuator_saturation": _tracking_score(frames),
         }
+        per_attribute_scores.update(
+            {
+                "sudden_change": per_attribute_scores["smoothness"],
+                "state_action_alignment": per_attribute_scores["actuator_saturation"],
+                "extreme_value": min(
+                    per_attribute_scores["smoothness"],
+                    per_attribute_scores["runtime"],
+                ),
+                "kinematic_consistency": per_attribute_scores["path_efficiency"],
+                "orientation_alignment": per_attribute_scores["visual_clarity"],
+            }
+        )
         vlm_evaluation = None
         vlm_error = None
         if config.vlm.enabled:
@@ -169,15 +245,16 @@ class EpisodeQualityScorer:
                 per_attribute_scores["task_success"] = vlm_evaluation.score
             except VlmEvaluationError as error:
                 vlm_error = str(error)
-        score = sum(per_attribute_scores.values()) / len(per_attribute_scores)
+        score = _weighted_score(per_attribute_scores, config)
         return EpisodeQualityResult(
             episode_index=episode_index,
             score=score,
-            status=_status_for_score(score, config),
+            status=_status_for_episode(score, config, vlm_evaluation),
             source="auto",
             per_attribute_scores=per_attribute_scores,
             findings=[
                 *_findings(per_attribute_scores, has_video),
+                *_deterministic_findings(per_attribute_scores, config),
                 *_vlm_findings(vlm_evaluation, vlm_error),
             ],
             updated_at=utc_now(),

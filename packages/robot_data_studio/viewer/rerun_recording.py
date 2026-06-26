@@ -90,6 +90,8 @@ def create_episode_recording(
             camera_name = _camera_name(video_key)
             entity_path = f"observation/videos/{camera_name}"
             video_path = reader.video_path(episode_index, video_key)
+            if not video_path.is_file():
+                continue
             try:
                 video_asset = rr.AssetVideo(path=video_path)
             except FileNotFoundError:

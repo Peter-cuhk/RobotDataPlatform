@@ -10,12 +10,41 @@ CleaningStatus = Literal["passed", "review", "excluded", "unscored"]
 DecisionSource = Literal["auto", "manual"]
 FindingSeverity = Literal["info", "warn", "error"]
 VlmProvider = Literal["OpenAI", "Gemini", "Local"]
+FilterStageId = Literal[
+    "sudden_change",
+    "state_action_alignment",
+    "extreme_value",
+    "kinematic_consistency",
+    "orientation_alignment",
+]
+
+
+DEFAULT_ENABLED_FILTER_STAGES: list[FilterStageId] = [
+    "sudden_change",
+    "state_action_alignment",
+    "extreme_value",
+    "kinematic_consistency",
+    "orientation_alignment",
+]
+
+DEFAULT_QUALITY_WEIGHTS: dict[str, float] = {
+    "sudden_change": 1.0,
+    "state_action_alignment": 1.0,
+    "extreme_value": 1.0,
+    "kinematic_consistency": 1.0,
+    "orientation_alignment": 1.0,
+    "task_success": 2.0,
+}
 
 
 DEFAULT_VLM_PROMPT = (
-    "You are an automated robot episode evaluator. Return only JSON with success, "
-    "score, and reason. Judge whether the task was successfully completed from the "
-    "visual evidence."
+    "You are an automated robot episode evaluator. The images are sampled from the "
+    "main camera at important trajectory moments: the start, gripper open/close "
+    "events, and the final state. Judge whether the task was successfully completed "
+    "from the sequence and final object state. Transparent objects, grayscale video, "
+    "and small buttons can be subtle; inspect the full sequence carefully instead of "
+    "assuming absence from one low-contrast frame. Return only JSON with success, "
+    "score, and reason."
 )
 
 
@@ -45,6 +74,10 @@ class CleaningConfig(BaseModel):
     pass_threshold: float = Field(default=0.8, ge=0, le=1)
     review_threshold: float = Field(default=0.6, ge=0, le=1)
     overwrite_manual: bool = False
+    enabled_filter_stages: list[FilterStageId] = Field(
+        default_factory=lambda: DEFAULT_ENABLED_FILTER_STAGES.copy()
+    )
+    quality_weights: dict[str, float] = Field(default_factory=lambda: DEFAULT_QUALITY_WEIGHTS.copy())
     vlm: VlmSettings = Field(default_factory=VlmSettings)
 
 
