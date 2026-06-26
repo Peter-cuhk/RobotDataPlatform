@@ -396,6 +396,22 @@ button:disabled { cursor: wait; opacity: .55; }
 .summary-counts .passed { color: #9ce3bd; background: #11231b; }
 .summary-counts .review { color: #f3ce8c; background: #251d10; }
 .summary-counts .excluded { color: #ffadb6; background: #2b151a; }
+.score-chart {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 180px;
+}
+.score-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 10px 0 26px;
+  color: #718096;
+  font-size: 9px;
+  font-weight: 750;
+  text-align: right;
+}
 .score-bars {
   display: grid;
   grid-auto-flow: column;
@@ -407,7 +423,9 @@ button:disabled { cursor: wait; opacity: .55; }
   overflow-x: auto;
   border: 1px solid #1f2b37;
   border-radius: 8px;
-  background: linear-gradient(180deg, #0c131b, #080c11);
+  background:
+    repeating-linear-gradient(to bottom, #29384855 0 1px, transparent 1px 25%),
+    linear-gradient(180deg, #0c131b, #080c11);
 }
 .score-bar {
   height: 100%;
@@ -428,6 +446,7 @@ button:disabled { cursor: wait; opacity: .55; }
   background: #f0bf68;
 }
 .score-bar.passed i { background: #68c996; }
+.score-bar.review i { background: #f0bf68; }
 .score-bar.excluded i { background: #e76f7d; }
 .score-bar.unscored i { background: #687789; }
 .score-bar span { font-size: 10px; writing-mode: vertical-rl; justify-self: center; }

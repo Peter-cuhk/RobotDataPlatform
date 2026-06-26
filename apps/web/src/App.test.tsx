@@ -1297,6 +1297,14 @@ test("shows the cleaning summary in the viewer after running the pipeline", asyn
   expect(screen.getByText("Exclude 1")).toBeInTheDocument();
   expect(screen.getByText("Lowest score episodes")).toBeInTheDocument();
   expect(screen.getByLabelText("Episode 000001 score 41 status Exclude")).toBeInTheDocument();
+
+  const scoreBars = within(screen.getByRole("list", { name: "Episode cleaning scores" })).getAllByRole("button");
+  expect(scoreBars.map((bar) => bar.getAttribute("aria-label"))).toEqual([
+    "Episode 000001 score 41 status Exclude",
+    "Episode 000000 score 72 status Review",
+    "Episode 000002 score 96 status Pass",
+  ]);
+  expect(scoreBars[1]).toHaveClass("review");
 });
 
 test("shows only valid manual decisions for passed and excluded episodes", async () => {

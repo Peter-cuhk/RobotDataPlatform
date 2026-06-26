@@ -893,7 +893,11 @@ function CleaningSummaryView({
   const scored = [...summary.results]
     .filter((result) => result.score !== null)
     .sort((left, right) => (left.score ?? 1) - (right.score ?? 1));
-  const chartResults = [...summary.results].sort((left, right) => left.episode_index - right.episode_index);
+  const chartResults = [...summary.results].sort((left, right) => {
+    if (left.score === null) return right.score === null ? left.episode_index - right.episode_index : 1;
+    if (right.score === null) return -1;
+    return left.score - right.score || left.episode_index - right.episode_index;
+  });
   return (
     <div className="cleaning-summary-view">
       <div className="cleaning-summary-header">
@@ -907,23 +911,32 @@ function CleaningSummaryView({
           <span className="excluded">{copy.status.excluded} {summary.excluded_count}</span>
         </div>
       </div>
-      <div className="score-bars" role="list" aria-label={copy.cleaningSummary.scoreChart}>
-        {chartResults.map((result) => {
-          const score = result.score ?? 0;
-          return (
-            <button
-              aria-label={`${episodeLabel(result.episode_index)} score ${Math.round(score * 100)} status ${statusLabel(result.status, copy)}`}
-              className={`score-bar ${result.status}`}
-              key={result.episode_index}
-              onClick={() => onSelect(result.episode_index)}
-              style={{ "--bar-height": `${Math.max(5, Math.round(score * 100))}%` } as CSSProperties}
-              type="button"
-            >
-              <i />
-              <span>{compactEpisodeLabel(result.episode_index)}</span>
-            </button>
-          );
-        })}
+      <div className="score-chart">
+        <div aria-hidden="true" className="score-axis">
+          <span>100</span>
+          <span>75</span>
+          <span>50</span>
+          <span>25</span>
+          <span>0</span>
+        </div>
+        <div className="score-bars" role="list" aria-label={copy.cleaningSummary.scoreChart}>
+          {chartResults.map((result) => {
+            const score = result.score ?? 0;
+            return (
+              <button
+                aria-label={`${episodeLabel(result.episode_index)} score ${Math.round(score * 100)} status ${statusLabel(result.status, copy)}`}
+                className={`score-bar ${result.status}`}
+                key={result.episode_index}
+                onClick={() => onSelect(result.episode_index)}
+                style={{ "--bar-height": `${Math.max(5, Math.round(score * 100))}%` } as CSSProperties}
+                type="button"
+              >
+                <i />
+                <span>{compactEpisodeLabel(result.episode_index)}</span>
+              </button>
+            );
+          })}
+        </div>
       </div>
       <div className="lowest-episodes">
         <h4>{copy.cleaningSummary.lowest}</h4>
