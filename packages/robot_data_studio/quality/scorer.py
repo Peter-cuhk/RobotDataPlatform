@@ -133,6 +133,8 @@ def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]
             )
         )
     for name, score in scores.items():
+        if name == "kinematic_consistency":
+            continue
         if score < 0.5:
             findings.append(
                 QualityFinding(
@@ -145,19 +147,32 @@ def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]
 
 
 def _deterministic_findings(scores: dict[str, float], config: CleaningConfig) -> list[QualityFinding]:
-    messages = {
+    low_score_messages = {
         "sudden_change": ("action_jump", "Sudden motion or action changes require review."),
         "state_action_alignment": ("time_sync", "State/action alignment score is low."),
         "extreme_value": ("extreme_value", "Extreme values are outside the expected range."),
-        "kinematic_consistency": ("kinematic_consistency", "Kinematic consistency score is low."),
         "orientation_alignment": ("orientation_alignment", "Orientation alignment score is low."),
+    }
+    unconfigured_messages = {
+        "kinematic_consistency": (
+            "kinematic_consistency_unconfigured",
+            "Kinematic consistency is not configured. Import a URDF file and configure the end-effector/joint mapping.",
+        ),
+        "orientation_alignment": (
+            "orientation_alignment_unconfigured",
+            "Orientation alignment is not configured. Set up the correction matrix to enable scoring.",
+        ),
     }
     findings: list[QualityFinding] = []
     for stage_id in config.enabled_filter_stages:
+        if stage_id in unconfigured_messages:
+            code, message = unconfigured_messages[stage_id]
+            findings.append(QualityFinding(code=code, severity="warn", message=message))
+            continue
         score = scores.get(stage_id)
         if score is None or score >= 0.5:
             continue
-        code, message = messages[stage_id]
+        code, message = low_score_messages[stage_id]
         findings.append(QualityFinding(code=code, severity="warn", message=message))
     return findings
 
@@ -233,8 +248,6 @@ class EpisodeQualityScorer:
                     per_attribute_scores["smoothness"],
                     per_attribute_scores["runtime"],
                 ),
-                "kinematic_consistency": per_attribute_scores["path_efficiency"],
-                "orientation_alignment": per_attribute_scores["visual_clarity"],
             }
         )
         vlm_evaluation = None

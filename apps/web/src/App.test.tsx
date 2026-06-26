@@ -40,9 +40,37 @@ function renderApp() {
   );
 }
 
+test("episode list fills the remaining sidebar height instead of ending early", async () => {
+  // @ts-ignore Vitest runs in Node; the app tsconfig intentionally does not include Node ambient types.
+  const { readFileSync } = await import("node:fs");
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toContain("contain: size;");
+  expect(stylesCss).toContain("display: grid;");
+  expect(stylesCss).toContain("grid-template-rows: 58px minmax(0, 1fr)");
+  expect(stylesCss).toContain(".episode-list { min-height: 0; overflow: auto;");
+  expect(stylesCss).not.toContain(".episode-list { height: 620px;");
+  expect(stylesCss).toContain("flex-direction: column;");
+  expect(stylesCss).toContain(".viewer-stage { flex: 0 0 530px; min-height: 0; height: 530px;");
+  expect(stylesCss).toContain("margin-top: auto;");
+});
+
 async function importDatasetForTest(user: ReturnType<typeof userEvent.setup>, path = "/tmp/pusht") {
   fireEvent.change(screen.getByLabelText("Dataset path"), { target: { value: path } });
   await user.click(screen.getByRole("button", { name: "Import dataset" }));
+}
+
+async function clearDefaultSidebarFilters(user: ReturnType<typeof userEvent.setup>) {
+  const sidebar = document.querySelector(".sidebar-tools");
+  if (!sidebar) throw new Error("Sidebar filters are not rendered");
+  const filters = within(sidebar as HTMLElement);
+  await user.click(filters.getByLabelText("Blurred frames"));
+  for (const filter of filters.getAllByLabelText("Time sync")) {
+    await user.click(filter);
+  }
+  await user.click(filters.getByLabelText("Action jump"));
+  await user.click(filters.getByLabelText("Sudden change"));
+  await user.click(filters.getByLabelText("Extreme value"));
 }
 
 beforeEach(() => {
@@ -213,6 +241,70 @@ test("sends selected import format hint", async () => {
       body: JSON.stringify({ path: "data/samples/aloha_static_coffee", format_hint: "act_hdf5" }),
     }),
   );
+});
+
+test("selects configured sidebar filters and leaves setup-dependent filters unchecked on import", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+  expect(await filters.findByLabelText("Blurred frames")).toBeChecked();
+  expect(filters.getAllByLabelText("Time sync")).toHaveLength(2);
+  for (const filter of filters.getAllByLabelText("Time sync")) {
+    expect(filter).toBeChecked();
+  }
+  expect(filters.getByLabelText("Action jump")).toBeChecked();
+  expect(filters.getByLabelText("Sudden change")).toBeChecked();
+  expect(filters.getByLabelText("Extreme value")).toBeChecked();
+  expect(filters.getByLabelText("VLM failed")).not.toBeChecked();
+  expect(filters.getByLabelText("Kinematic consistency")).not.toBeChecked();
+  expect(filters.getByLabelText("Orientation alignment")).not.toBeChecked();
+});
+
+test("expands only one sidebar weight slider at a time", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+  expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
+
+  await user.click(filters.getByRole("button", { name: "Expand Sudden change weight" }));
+  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1");
+  expect(filters.getByRole("button", { name: "Collapse Sudden change weight" })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+
+  await user.click(filters.getByRole("button", { name: "Expand Time sync weight" }));
+  expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
+  expect(filters.getByLabelText("Time sync weight")).toHaveValue("1");
+
+  await user.click(filters.getByRole("button", { name: "Collapse Time sync weight" }));
+  expect(filters.queryByLabelText("Time sync weight")).not.toBeInTheDocument();
 });
 
 test("exports selected episode to chosen format and shows report path", async () => {
@@ -406,6 +498,35 @@ test("exports manually checked episodes without changing the inspected episode",
   );
 });
 
+test("shows the checked episode count as the main export count", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(screen.getByLabelText("Add Episode 000000 to export"));
+  await user.click(screen.getByLabelText("Add Episode 000001 to export"));
+  await user.click(screen.getByLabelText("Add Episode 000002 to export"));
+
+  const exportCount = document.querySelector(".export-count");
+  expect(exportCount).toHaveTextContent("Episodes33 checked");
+  expect(screen.getByRole("button", { name: "Export 1 episode" })).toBeInTheDocument();
+});
+
 test("exports the current filtered episode list", async () => {
   const user = userEvent.setup();
   const fetch = vi
@@ -443,6 +564,7 @@ test("exports the current filtered episode list", async () => {
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await clearDefaultSidebarFilters(user);
   await user.click(await screen.findByLabelText("VLM failed"));
   await user.selectOptions(screen.getByLabelText("Export scope"), "filtered");
   await user.click(screen.getByRole("button", { name: "Export 1 episode" }));
@@ -589,6 +711,7 @@ test("data filter checkboxes use filter summary when exporting current filtered 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
   expect((await screen.findAllByText("Review")).length).toBeGreaterThan(0);
+  await clearDefaultSidebarFilters(user);
 
   const episodePanel = document.querySelector(".episode-panel");
   expect(episodePanel).not.toBeNull();
@@ -649,6 +772,120 @@ test("runs cleaning and renders episode status folders", async () => {
   expect(screen.getAllByText("Pass").length).toBeGreaterThan(0);
   expect(screen.getAllByText("#000000").length).toBeGreaterThan(0);
   expect(screen.getAllByText("72 / 100").length).toBeGreaterThan(0);
+});
+
+test("shows passed episodes in the status folder when default issue filters are selected", async () => {
+  const user = userEvent.setup();
+  const allPassedSummary = cleaningSummary();
+  allPassedSummary.passed_count = 3;
+  allPassedSummary.review_count = 0;
+  allPassedSummary.excluded_count = 0;
+  allPassedSummary.results = allPassedSummary.results.map((result) => ({
+    ...result,
+    score: 0.82,
+    status: "passed",
+    findings: [],
+  }));
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => formatsResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => episodesResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          run_id: "run-1",
+          status: "succeeded",
+          summary: allPassedSummary,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => filterRunResponse(),
+      }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  const episodePanel = document.querySelector(".episode-panel");
+  expect(episodePanel).not.toBeNull();
+  const panel = within(episodePanel as HTMLElement);
+  expect(panel.getByRole("button", { name: "Collapse Pass folder" })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000000/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000001/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000002/ })).toBeInTheDocument();
+});
+
+test("collapses and expands cleaning status folders independently", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => formatsResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => episodesResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          run_id: "run-1",
+          status: "succeeded",
+          summary: cleaningSummary(),
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => filterRunResponse(),
+      }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await clearDefaultSidebarFilters(user);
+
+  const episodePanel = document.querySelector(".episode-panel");
+  expect(episodePanel).not.toBeNull();
+  const panel = within(episodePanel as HTMLElement);
+  expect(panel.getByRole("button", { name: /#000000/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000001/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000002/ })).toBeInTheDocument();
+
+  await user.click(panel.getByRole("button", { name: "Collapse Review folder" }));
+  expect(panel.queryByRole("button", { name: /#000000/ })).not.toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000001/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000002/ })).toBeInTheDocument();
+  expect(panel.getByRole("button", { name: "Expand Review folder" })).toHaveAttribute("aria-expanded", "false");
+
+  await user.click(panel.getByRole("button", { name: "Collapse Exclude folder" }));
+  expect(panel.queryByRole("button", { name: /#000001/ })).not.toBeInTheDocument();
+  expect(panel.getByRole("button", { name: /#000002/ })).toBeInTheDocument();
+
+  await user.click(panel.getByRole("button", { name: "Expand Review folder" }));
+  expect(panel.getByRole("button", { name: /#000000/ })).toBeInTheDocument();
+  expect(panel.queryByRole("button", { name: /#000001/ })).not.toBeInTheDocument();
 });
 
 test("marks a review episode as passed", async () => {
@@ -802,6 +1039,7 @@ test("filters cleaning results by search and finding type", async () => {
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await clearDefaultSidebarFilters(user);
   await user.type(await screen.findByLabelText("Search / filter"), "000001");
 
   const episodePanel = document.querySelector(".episode-panel");
@@ -873,7 +1111,7 @@ test("opens the extreme value detail view from the filter label", async () => {
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Extreme value" }));
 
-  expect(await screen.findByRole("heading", { name: "极值检测" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Extreme value" })).toBeInTheDocument();
   expect(screen.getAllByText("q01").length).toBeGreaterThan(0);
   expect(screen.getAllByText("q99").length).toBeGreaterThan(0);
   expect(screen.getByText("frame 12")).toBeInTheDocument();
@@ -911,7 +1149,7 @@ test("opens the kinematic consistency view with URDF configuration controls", as
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Kinematic consistency" }));
 
-  expect(await screen.findByRole("heading", { name: "运动学一致性" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Kinematic consistency" })).toBeInTheDocument();
   expect(screen.getByLabelText("Import URDF")).toBeInTheDocument();
   expect(screen.getByLabelText("End-effector link")).toBeInTheDocument();
   expect(screen.getByLabelText("Joint names")).toBeInTheDocument();
@@ -1030,9 +1268,15 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
   renderApp();
 
   await importDatasetForTest(user);
-  expect(await screen.findByLabelText("Sudden change weight")).toHaveValue("1");
-  await user.click(screen.getByLabelText("Extreme value rule"));
-  fireEvent.change(screen.getByLabelText("Time sync weight"), { target: { value: "2.5" } });
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+  expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
+  await user.click(filters.getByRole("button", { name: "Expand Sudden change weight" }));
+  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1");
+  expect(screen.queryByText("Cleaning rules")).not.toBeInTheDocument();
+  await user.click(filters.getByRole("button", { name: "Expand Time sync weight" }));
+  fireEvent.change(filters.getByLabelText("Time sync weight"), { target: { value: "2.5" } });
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
   expect(fetch).toHaveBeenCalledWith(
@@ -1045,6 +1289,7 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
         enabled_filter_stages: [
           "sudden_change",
           "state_action_alignment",
+          "extreme_value",
           "kinematic_consistency",
           "orientation_alignment",
         ],
@@ -1305,6 +1550,14 @@ test("shows the cleaning summary in the viewer after running the pipeline", asyn
     "Episode 000002 score 96 status Pass",
   ]);
   expect(scoreBars[1]).toHaveClass("review");
+
+  const scoreChart = document.querySelector(".score-chart");
+  expect(scoreChart).not.toBeNull();
+  expect(within(scoreChart as HTMLElement).queryByText("#000001")).not.toBeInTheDocument();
+
+  const viewerStage = document.querySelector(".viewer-stage");
+  expect(viewerStage).not.toBeNull();
+  expect(viewerStage).toHaveClass("viewer-stage-scroll");
 });
 
 test("shows only valid manual decisions for passed and excluded episodes", async () => {
@@ -1620,7 +1873,7 @@ function filterDetailResponse(stageId: "extreme_value" | "kinematic_consistency"
     return {
       stage_id: "kinematic_consistency",
       episode_index: 0,
-      title: "运动学一致性",
+      title: "Kinematic consistency",
       status: "skipped",
       series: {},
       thresholds: {},
@@ -1632,14 +1885,14 @@ function filterDetailResponse(stageId: "extreme_value" | "kinematic_consistency"
         joint_state_indices: [],
         eef_position_indices: [],
       },
-      findings: [{ code: "backend_missing", severity: "warn", message: "Pinocchio 未安装，运动学一致性暂不可运行。" }],
+      findings: [{ code: "backend_missing", severity: "warn", message: "Pinocchio not installed; kinematic consistency unavailable." }],
       skipped_reason: "backend_missing",
     };
   }
   return {
     stage_id: "extreme_value",
     episode_index: 0,
-    title: "极值检测",
+    title: "Extreme value",
     status: "review",
     series: {
       "state[0]": [0, 0.2, 0.4, 1.2],
@@ -1650,7 +1903,7 @@ function filterDetailResponse(stageId: "extreme_value" | "kinematic_consistency"
     },
     table_rows: [{ frame: 12, dimension: "state[0]", value: 1.5, low: -0.5, high: 1.3, gripper_exempt: false }],
     parameters: { alpha: 0.5, q01: 0.01, q99: 0.99, gripper_exempt: [6, 13] },
-    findings: [{ code: "extreme_value", severity: "warn", message: "检测到越界帧。数量：1" }],
+    findings: [{ code: "extreme_value", severity: "warn", message: "Detected out-of-bounds frames. Count: 1" }],
     skipped_reason: null,
   };
 }

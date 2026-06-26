@@ -58,6 +58,32 @@ class FakeVlmEvaluator:
         return VlmEvaluation(success=False, score=0.2, reason="The block never reached the target.")
 
 
+class InefficientPathReader(FakeReader):
+    def read_episode_frames(self, episode_index: int) -> list[EpisodeFrame]:
+        return [
+            EpisodeFrame(frame_index=0, timestamp=0.0, observation_state=[0.0, 0.0], action=[0.0, 0.0]),
+            EpisodeFrame(frame_index=1, timestamp=0.1, observation_state=[1.0, 0.0], action=[1.0, 0.0]),
+            EpisodeFrame(frame_index=2, timestamp=0.2, observation_state=[0.0, 0.0], action=[0.0, 0.0]),
+        ]
+
+
+def test_unconfigured_kinematic_consistency_finding_is_not_reported_as_low_score() -> None:
+    scorer = EpisodeQualityScorer()
+
+    result = scorer.score_episode(InefficientPathReader(), 0, 0.3, 0.3, CleaningConfig())
+
+    assert "kinematic_consistency" not in result.per_attribute_scores
+    assert "orientation_alignment" not in result.per_attribute_scores
+    messages = [finding.message for finding in result.findings]
+    assert "Kinematic consistency score is low." not in messages
+    assert "Kinematic Consistency score is low (0.00)." not in messages
+    assert any(
+        finding.code == "kinematic_consistency_unconfigured"
+        and "Kinematic consistency is not configured" in finding.message
+        for finding in result.findings
+    )
+
+
 def test_vlm_task_success_is_included_as_a_quality_dimension() -> None:
     scorer = EpisodeQualityScorer(vlm_evaluator=FakeVlmEvaluator())
     config = CleaningConfig(vlm=VlmSettings(enabled=True, prompt="Judge task: {task}"))
@@ -80,7 +106,7 @@ def test_vlm_task_failure_is_weighted_and_prevents_auto_pass() -> None:
 
     result = scorer.score_episode(FakeReader(), 0, 0.3, 0.3, config)
 
-    assert result.score == pytest.approx(0.7)
+    assert result.score == pytest.approx(0.6)
     assert result.status == "review"
     assert any(finding.code == "vlm_failed" for finding in result.findings)
 

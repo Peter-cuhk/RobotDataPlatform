@@ -30,11 +30,11 @@ from robot_data_studio.quality.qwen_filters import (
 
 
 STAGE_LABELS: dict[FilterStageId, str] = {
-    "sudden_change": "突变检测",
-    "state_action_alignment": "时间不同步",
-    "extreme_value": "极值检测",
-    "kinematic_consistency": "运动学一致性",
-    "orientation_alignment": "姿态对齐",
+    "sudden_change": "Sudden change",
+    "state_action_alignment": "Time sync",
+    "extreme_value": "Extreme value",
+    "kinematic_consistency": "Kinematic consistency",
+    "orientation_alignment": "Orientation alignment",
 }
 
 
@@ -195,7 +195,7 @@ class DatasetFilterService:
                 "savgol_window": self._sudden_config().savgol_window,
                 "residual_scale": self._sudden_config().residual_scale,
             },
-            findings=self._finding_list(len(rows), "sudden_change", "检测到突变帧。"),
+            findings=self._finding_list(len(rows), "sudden_change", "Detected sudden change frames."),
         )
 
     def _state_action_alignment_detail(self, episode_index: int, states: np.ndarray, actions: np.ndarray) -> FilterDetail:
@@ -225,7 +225,7 @@ class DatasetFilterService:
             findings=self._finding_list(
                 len(result.flagged_dimensions),
                 "state_action_alignment",
-                "检测到 state/action 趋势不同步维度。",
+                "Detected state/action trend desync dimension(s).",
             ),
         )
 
@@ -279,7 +279,7 @@ class DatasetFilterService:
                 "q99": self._extreme_config().upper_quantile,
                 "gripper_exempt": self._extreme_config().gripper_indices,
             },
-            findings=self._finding_list(len(result.flagged_frames), "extreme_value", "检测到越界帧。"),
+            findings=self._finding_list(len(result.flagged_frames), "extreme_value", "Detected out-of-bounds frames."),
         )
 
     def _kinematic_detail(self, episode_index: int) -> FilterDetail:
@@ -288,14 +288,14 @@ class DatasetFilterService:
                 "kinematic_consistency",
                 episode_index,
                 "backend_missing",
-                "Pinocchio 未安装，运动学一致性暂不可运行。",
+                "Pinocchio not installed; kinematic consistency unavailable.",
             )
         if not self.config.kinematics.urdf_path:
             return self._skipped_detail(
                 "kinematic_consistency",
                 episode_index,
                 "urdf_missing",
-                "请先导入 URDF 文件。",
+                "Please import a URDF file first.",
             )
         config = self.config.kinematics
         if not (
@@ -307,7 +307,7 @@ class DatasetFilterService:
                 "kinematic_consistency",
                 episode_index,
                 "eef_pose_missing",
-                "当前数据未配置 logged EEF pose 索引。",
+                "Logged EEF pose indices not configured.",
             )
         frames = self.reader.read_episode_frames(episode_index)
         states = np.asarray([frame.observation_state for frame in frames], dtype=np.float64)
@@ -318,7 +318,7 @@ class DatasetFilterService:
                 "kinematic_consistency",
                 episode_index,
                 "fk_failed",
-                f"Pinocchio FK 计算失败：{error}",
+                f"Pinocchio FK failed: {error}",
             )
         rows = [
             {
@@ -344,7 +344,7 @@ class DatasetFilterService:
                 "max_error": round(float(np.max(result["errors"])), 6) if len(result["errors"]) else 0.0,
                 "mean_error": round(float(np.mean(result["errors"])), 6) if len(result["errors"]) else 0.0,
             },
-            findings=self._finding_list(len(rows), "kinematic_consistency", "检测到 FK 与 logged EEF 不一致帧。"),
+            findings=self._finding_list(len(rows), "kinematic_consistency", "Detected FK vs logged EEF mismatch frames."),
         )
 
     def _orientation_detail(self, episode_index: int, states: np.ndarray) -> FilterDetail:
@@ -364,7 +364,7 @@ class DatasetFilterService:
                 FilterFinding(
                     code="not_configured",
                     severity="info",
-                    message="尚未配置姿态对齐修正矩阵。",
+                    message="Orientation alignment correction matrix not configured.",
                 )
             ],
         )
@@ -422,7 +422,7 @@ class DatasetFilterService:
     def _finding_list(self, count: int, code: str, message: str) -> list[FilterFinding]:
         if not count:
             return []
-        return [FilterFinding(code=code, severity="warn", message=f"{message} 数量：{count}")]
+        return [FilterFinding(code=code, severity="warn", message=f"{message} Count: {count}")]
 
     def _sample(self, values: np.ndarray, max_points: int = 240) -> list[float]:
         if len(values) <= max_points:

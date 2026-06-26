@@ -59,6 +59,22 @@ const filterStageIds: FilterStageId[] = [
   "orientation_alignment",
 ];
 
+const defaultSidebarFilterCodes = [
+  "blur",
+  "time_sync",
+  "action_jump",
+  "sudden_change",
+  "state_action_alignment",
+  "extreme_value",
+];
+
+function hasOnlyDefaultSidebarFilters(filters: string[]) {
+  return (
+    filters.length === defaultSidebarFilterCodes.length &&
+    defaultSidebarFilterCodes.every((filter) => filters.includes(filter))
+  );
+}
+
 const defaultQualityWeights: Record<string, number> = {
   sudden_change: 1,
   state_action_alignment: 1,
@@ -93,10 +109,6 @@ function dataFilters(copy: Translation): Array<{ id: FilterStageId; label: strin
     { id: "kinematic_consistency", label: copy.filters.kinematicConsistency, code: "kinematic_consistency" },
     { id: "orientation_alignment", label: copy.filters.orientationAlignment, code: "orientation_alignment" },
   ];
-}
-
-function cleaningRules(copy: Translation): Array<{ id: FilterStageId; label: string }> {
-  return dataFilters(copy).map((filter) => ({ id: filter.id, label: filter.label }));
 }
 
 function episodeLabel(index: number) {
@@ -226,6 +238,7 @@ export default function App() {
       setCleaningSummary(null);
       setFilterSummary(null);
       setActiveFilterStage(null);
+      setActiveFindingFilters([...defaultSidebarFilterCodes]);
       setEnabledFilterStages([...filterStageIds]);
       setQualityWeights({ ...defaultQualityWeights });
     },
@@ -365,13 +378,6 @@ export default function App() {
   }, [vlmSettingsQuery.data]);
   const updateRuleWeight = (key: string, value: number) => {
     setQualityWeights((current) => ({ ...current, [key]: value }));
-  };
-  const toggleFilterStage = (stageId: FilterStageId) => {
-    setEnabledFilterStages((current) =>
-      current.includes(stageId)
-        ? current.filter((item) => item !== stageId)
-        : [...current, stageId],
-    );
   };
   const toggleCheckedEpisode = (episodeIndex: number) => {
     setCheckedEpisodeIndexes((current) => {
@@ -535,6 +541,8 @@ export default function App() {
                   activeFindingFilters={activeFindingFilters}
                   filterSummary={filterSummary}
                   activeFilterStage={activeFilterStage}
+                  enabledFilterStages={enabledFilterStages}
+                  weights={qualityWeights}
                   onSearchChange={setSearchQuery}
                   onToggleFindingFilter={(code) =>
                     setActiveFindingFilters((filters) =>
@@ -548,6 +556,7 @@ export default function App() {
                     setRecordingUrl(null);
                     setExportedResult(null);
                   }}
+                  onWeightChange={updateRuleWeight}
                   onToggleChecked={toggleCheckedEpisode}
                   onSelect={(episodeIndex) => {
                     setSelected(episodeIndex);
@@ -606,17 +615,7 @@ export default function App() {
                 onExport={() => exportMutation.mutate()}
               />
 
-              <CleaningRulesPanel
-                copy={copy}
-                rules={cleaningRules(copy)}
-                enabledFilterStages={enabledFilterStages}
-                weights={qualityWeights}
-                vlmEnabled={vlmSettings.enabled}
-                onToggleRule={toggleFilterStage}
-                onWeightChange={updateRuleWeight}
-              />
-
-              <div className="viewer-stage">
+              <div className="viewer-stage viewer-stage-scroll">
                 {activeFilterStage ? (
                   <FilterDetailView
                     copy={copy}
@@ -796,87 +795,12 @@ function ExportPanel({
       </label>
       <div className="export-count" aria-live="polite">
         <span>{copy.exportPanel.exportingCount}</span>
-        <strong>{exportCount}</strong>
+        <strong>{checkedCount}</strong>
         <small>{copy.exportPanel.checkedCount(checkedCount)}</small>
       </div>
       <button type="button" disabled={disabled} onClick={onExport}>
         {pending ? copy.viewer.exporting : copy.exportPanel.exportCount(exportCount)}
       </button>
-    </div>
-  );
-}
-
-function CleaningRulesPanel({
-  copy,
-  rules,
-  enabledFilterStages,
-  weights,
-  vlmEnabled,
-  onToggleRule,
-  onWeightChange,
-}: {
-  copy: Translation;
-  rules: Array<{ id: FilterStageId; label: string }>;
-  enabledFilterStages: FilterStageId[];
-  weights: Record<string, number>;
-  vlmEnabled: boolean;
-  onToggleRule: (stageId: FilterStageId) => void;
-  onWeightChange: (key: string, value: number) => void;
-}) {
-  return (
-    <div className="cleaning-rules-panel">
-      <div className="cleaning-rules-heading">
-        <span>{copy.cleaningRules.title}</span>
-        <small>{copy.cleaningRules.enabledCount(enabledFilterStages.length)}</small>
-      </div>
-      <div className="rule-slider-grid">
-        {rules.map((rule) => {
-          const checked = enabledFilterStages.includes(rule.id);
-          const value = weights[rule.id] ?? 1;
-          return (
-            <div className={`rule-slider ${checked ? "enabled" : ""}`} key={rule.id}>
-              <label className="rule-toggle">
-                <input
-                  aria-label={`${rule.label} rule`}
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => onToggleRule(rule.id)}
-                />
-                <span>{rule.label}</span>
-              </label>
-              <input
-                aria-label={`${rule.label} weight`}
-                type="range"
-                min="0.25"
-                max="3"
-                step="0.25"
-                value={value}
-                disabled={!checked}
-                onChange={(event) => onWeightChange(rule.id, Number(event.target.value))}
-              />
-              <strong>{value.toFixed(2)}x</strong>
-            </div>
-          );
-        })}
-        {vlmEnabled && (
-          <div className="rule-slider enabled">
-            <label className="rule-toggle">
-              <input type="checkbox" checked readOnly aria-label={`${copy.cleaningRules.vlmTaskSuccess} rule`} />
-              <span>{copy.cleaningRules.vlmTaskSuccess}</span>
-            </label>
-            <input
-              aria-label={`${copy.cleaningRules.vlmTaskSuccess} weight`}
-              type="range"
-              min="0.25"
-              max="3"
-              step="0.25"
-              value={weights.task_success ?? 2}
-              onChange={(event) => onWeightChange("task_success", Number(event.target.value))}
-            />
-            <strong>{(weights.task_success ?? 2).toFixed(2)}x</strong>
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -932,7 +856,6 @@ function CleaningSummaryView({
                 type="button"
               >
                 <i />
-                <span>{compactEpisodeLabel(result.episode_index)}</span>
               </button>
             );
           })}
@@ -973,9 +896,12 @@ function EpisodeNavigation({
   activeFindingFilters,
   filterSummary,
   activeFilterStage,
+  enabledFilterStages,
+  weights,
   onSearchChange,
   onToggleFindingFilter,
   onOpenFilter,
+  onWeightChange,
   onToggleChecked,
   onSelect,
 }: {
@@ -989,12 +915,16 @@ function EpisodeNavigation({
   activeFindingFilters: string[];
   filterSummary: FilterSummary | null;
   activeFilterStage: FilterStageId | null;
+  enabledFilterStages: FilterStageId[];
+  weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
   onOpenFilter: (stageId: FilterStageId) => void;
+  onWeightChange: (key: string, value: number) => void;
   onToggleChecked: (episodeIndex: number) => void;
   onSelect: (episodeIndex: number) => void;
 }) {
+  const [collapsedStatusFolders, setCollapsedStatusFolders] = useState<CleaningStatus[]>([]);
   if (qualityByEpisode.size === 0) {
     return (
       <>
@@ -1004,9 +934,12 @@ function EpisodeNavigation({
           activeFindingFilters={activeFindingFilters}
           filterSummary={filterSummary}
           activeFilterStage={activeFilterStage}
+          enabledFilterStages={enabledFilterStages}
+          weights={weights}
           onSearchChange={onSearchChange}
           onToggleFindingFilter={onToggleFindingFilter}
           onOpenFilter={onOpenFilter}
+          onWeightChange={onWeightChange}
         />
         {visibleEpisodes.map((episode) => (
           <EpisodeRow
@@ -1028,8 +961,10 @@ function EpisodeNavigation({
     { status: "excluded", label: copy.status.excluded, episodes: [] },
     { status: "passed", label: copy.status.passed, episodes: [] },
   ];
-  for (const episode of episodes) {
-    if (!visibleEpisodes.includes(episode)) continue;
+  const folderEpisodes = hasOnlyDefaultSidebarFilters(activeFindingFilters)
+    ? episodes.filter((episode) => episodeMatchesSearchQuery(episode, searchQuery))
+    : visibleEpisodes;
+  for (const episode of folderEpisodes) {
     const quality = qualityByEpisode.get(episode.episode_index);
     const group = groups.find((item) => item.status === quality?.status);
     if (group) group.episodes.push(episode);
@@ -1042,17 +977,76 @@ function EpisodeNavigation({
         activeFindingFilters={activeFindingFilters}
         filterSummary={filterSummary}
         activeFilterStage={activeFilterStage}
+        enabledFilterStages={enabledFilterStages}
+        weights={weights}
         onSearchChange={onSearchChange}
         onToggleFindingFilter={onToggleFindingFilter}
         onOpenFilter={onOpenFilter}
+        onWeightChange={onWeightChange}
       />
       {groups.map((group) => (
-        <section className="episode-folder" key={group.status}>
-          <div className="folder-heading">
-            <span>{group.label}</span>
-            <small>{group.episodes.length}</small>
-          </div>
-          {group.episodes.map((episode) => (
+        <StatusEpisodeFolder
+          key={group.status}
+          group={group}
+          copy={copy}
+          qualityByEpisode={qualityByEpisode}
+          selected={selected}
+          checkedEpisodeIndexes={checkedEpisodeIndexes}
+          collapsed={collapsedStatusFolders.includes(group.status)}
+          onToggleCollapsed={() =>
+            setCollapsedStatusFolders((current) =>
+              current.includes(group.status)
+                ? current.filter((status) => status !== group.status)
+                : [...current, group.status],
+            )
+          }
+          onToggleChecked={onToggleChecked}
+          onSelect={onSelect}
+        />
+      ))}
+    </>
+  );
+}
+
+function StatusEpisodeFolder({
+  group,
+  copy,
+  qualityByEpisode,
+  selected,
+  checkedEpisodeIndexes,
+  collapsed,
+  onToggleCollapsed,
+  onToggleChecked,
+  onSelect,
+}: {
+  group: { status: CleaningStatus; label: string; episodes: Episode[] };
+  copy: Translation;
+  qualityByEpisode: Map<number, EpisodeQualityResult>;
+  selected: number | null;
+  checkedEpisodeIndexes: Set<number>;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+  onToggleChecked: (episodeIndex: number) => void;
+  onSelect: (episodeIndex: number) => void;
+}) {
+  return (
+    <section className="episode-folder">
+      <div className="folder-heading">
+        <button
+          type="button"
+          className={`folder-toggle ${collapsed ? "" : "expanded"}`}
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${group.label} folder`}
+          onClick={onToggleCollapsed}
+        >
+          <span aria-hidden="true">▸</span>
+          <strong>{group.label}</strong>
+        </button>
+        <small>{group.episodes.length}</small>
+      </div>
+      {collapsed
+        ? null
+        : group.episodes.map((episode) => (
             <EpisodeRow
               key={episode.episode_index}
               episode={episode}
@@ -1064,9 +1058,7 @@ function EpisodeNavigation({
               onSelect={() => onSelect(episode.episode_index)}
             />
           ))}
-        </section>
-      ))}
-    </>
+    </section>
   );
 }
 
@@ -1077,15 +1069,8 @@ function episodeMatchesFilters(
   activeFilters: string[],
   filterSummary: FilterSummary | null,
 ) {
-  const normalizedQuery = query.trim().toLowerCase();
-  const text = [
-    compactEpisodeLabel(episode.episode_index),
-    episodeLabel(episode.episode_index),
-    episode.tasks.join(" "),
-    ...(episode.subtasks ?? []).flatMap((subtask) => [subtask.prompt, subtask.skill ?? ""]),
-  ].join(" ").toLowerCase();
-  if (normalizedQuery && !text.includes(normalizedQuery)) return false;
-  if (activeFilters.length === 0) return true;
+  if (!episodeMatchesSearchQuery(episode, query)) return false;
+  if (activeFilters.length === 0 || (!quality && !filterSummary)) return true;
   return activeFilters.every((filter) => {
     if (isFilterStageId(filter)) {
       const stage = filterSummary?.episodes
@@ -1097,26 +1082,45 @@ function episodeMatchesFilters(
   });
 }
 
+function episodeMatchesSearchQuery(episode: Episode, query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  const text = [
+    compactEpisodeLabel(episode.episode_index),
+    episodeLabel(episode.episode_index),
+    episode.tasks.join(" "),
+    ...(episode.subtasks ?? []).flatMap((subtask) => [subtask.prompt, subtask.skill ?? ""]),
+  ].join(" ").toLowerCase();
+  if (normalizedQuery && !text.includes(normalizedQuery)) return false;
+  return true;
+}
+
 function SidebarFilters({
   copy,
   searchQuery,
   activeFindingFilters,
   filterSummary,
   activeFilterStage,
+  enabledFilterStages,
+  weights,
   onSearchChange,
   onToggleFindingFilter,
   onOpenFilter,
+  onWeightChange,
 }: {
   copy: Translation;
   searchQuery: string;
   activeFindingFilters: string[];
   filterSummary: FilterSummary | null;
   activeFilterStage: FilterStageId | null;
+  enabledFilterStages: FilterStageId[];
+  weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
   onOpenFilter: (stageId: FilterStageId) => void;
+  onWeightChange: (key: string, value: number) => void;
 }) {
   const counts = new Map((filterSummary?.stages ?? []).map((stage) => [stage.id, stage]));
+  const [expandedWeightStage, setExpandedWeightStage] = useState<FilterStageId | null>(null);
   return (
     <div className="sidebar-tools">
       <label className="search-box">
@@ -1143,20 +1147,49 @@ function SidebarFilters({
         {dataFilters(copy).map((filter) => {
           const stage = counts.get(filter.id);
           const badge = stage?.skipped_reason ? copy.filters.notConfigured : String(stage?.count ?? 0);
+          const weight = weights[filter.id] ?? 1;
+          const weightEnabled = enabledFilterStages.includes(filter.id);
+          const expanded = expandedWeightStage === filter.id;
           return (
             <div className={`filter-row ${activeFilterStage === filter.id ? "active" : ""}`} key={filter.id}>
-              <label>
-                <input
-                  type="checkbox"
-                  aria-label={filter.label}
-                  checked={activeFindingFilters.includes(filter.code)}
-                  onChange={() => onToggleFindingFilter(filter.code)}
-                />
-                <button type="button" className="filter-link" onClick={() => onOpenFilter(filter.id)}>
-                  {filter.label}
+              <div className="filter-row-main">
+                <label>
+                  <input
+                    type="checkbox"
+                    aria-label={filter.label}
+                    checked={activeFindingFilters.includes(filter.code)}
+                    onChange={() => onToggleFindingFilter(filter.code)}
+                  />
+                  <button type="button" className="filter-link" onClick={() => onOpenFilter(filter.id)}>
+                    {filter.label}
+                  </button>
+                </label>
+                <button
+                  type="button"
+                  className={`filter-expand-toggle ${expanded ? "expanded" : ""}`}
+                  aria-label={`${expanded ? "Collapse" : "Expand"} ${filter.label} weight`}
+                  aria-expanded={expanded}
+                  onClick={() => setExpandedWeightStage((current) => (current === filter.id ? null : filter.id))}
+                >
+                  <span aria-hidden="true">▸</span>
                 </button>
-              </label>
-              <small>{badge}</small>
+                <small>{badge}</small>
+              </div>
+              {expanded ? (
+                <div className="filter-weight-panel">
+                  <input
+                    aria-label={`${filter.label} weight`}
+                    type="range"
+                    min="0.25"
+                    max="3"
+                    step="0.25"
+                    value={weight}
+                    disabled={!weightEnabled}
+                    onChange={(event) => onWeightChange(filter.id, Number(event.target.value))}
+                  />
+                  <strong>{weight.toFixed(2)}x</strong>
+                </div>
+              ) : null}
             </div>
           );
         })}
