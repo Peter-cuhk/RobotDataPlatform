@@ -2,10 +2,13 @@ from pathlib import Path
 import json
 import tarfile
 
+import scripts.download_hf_dataset as downloader
 from scripts.download_hf_dataset import (
+    RepoFile,
     destination_for_repo,
     episode_member_filter,
     extract_episode_archive,
+    fetch_tree,
     files_from_tree,
     prune_episode_metadata,
     resolve_url,
@@ -30,6 +33,69 @@ def test_files_from_tree_skips_directories_and_keeps_paths() -> None:
         "data/chunk-000/file-000.parquet",
     ]
     assert files[1].size == 456
+
+
+def test_fetch_tree_follows_hugging_face_pagination(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, payload: list[dict], link: str | None = None) -> None:
+            self.payload = payload
+            self.headers = {"Link": link} if link else {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+    responses = iter(
+        [
+            FakeResponse(
+                [{"type": "file", "path": "meta/info.json", "size": 10}],
+                '<https://example.test/page-2>; rel="next"',
+            ),
+            FakeResponse(
+                [{"type": "file", "path": "data/episode.parquet", "size": 20}]
+            ),
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_urlopen(url, timeout):
+        calls.append(url)
+        return next(responses)
+
+    monkeypatch.setattr("scripts.download_hf_dataset.urlopen", fake_urlopen)
+
+    files = fetch_tree("owner/dataset")
+
+    assert [item.path for item in files] == [
+        "meta/info.json",
+        "data/episode.parquet",
+    ]
+    assert calls[1] == "https://example.test/page-2"
+
+
+def test_select_repo_files_strips_prefix_and_excludes_video() -> None:
+    files = [
+        RepoFile("BotFails/test/task/meta/info.json", 10),
+        RepoFile("BotFails/test/task/data/episode.parquet", 20),
+        RepoFile("BotFails/test/task/videos/camera/episode.mp4", 30),
+        RepoFile("BotFails/other/meta/info.json", 40),
+    ]
+
+    selected = downloader.select_repo_files(
+        files,
+        source_prefix="BotFails/test/task",
+        data_only=True,
+    )
+
+    assert [(item.path, item.local_path) for item in selected] == [
+        ("BotFails/test/task/meta/info.json", "meta/info.json"),
+        ("BotFails/test/task/data/episode.parquet", "data/episode.parquet"),
+    ]
 
 
 def test_resolve_url_points_at_main_dataset_file() -> None:

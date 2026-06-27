@@ -103,6 +103,19 @@ def test_probe_recognizes_agibot_lerobot_v2_dataset(tmp_path: Path) -> None:
     assert probe.confidence == 1.0
 
 
+def test_reader_accepts_legacy_v2_metadata_at_dataset_root(tmp_path: Path) -> None:
+    fixture = write_agibot_v2_episode_fixture(tmp_path / "root-meta-v2")
+    meta = fixture / "meta"
+    for path in list(meta.iterdir()):
+        path.rename(fixture / path.name)
+    meta.rmdir()
+
+    reader = LeRobotDatasetReader(fixture)
+
+    assert reader.metadata().version == "v2.1"
+    assert reader.list_episodes()[0].length == 4
+
+
 def test_probe_rejects_directory_without_info_file(tmp_path: Path) -> None:
     with pytest.raises(NotLeRobotDataset):
         LeRobotDatasetReader.probe(tmp_path)

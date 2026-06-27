@@ -52,13 +52,15 @@ export type CleaningStatus = "passed" | "review" | "excluded" | "unscored";
 
 export type QualityFinding = {
   code: string;
-  severity: "info" | "warn" | "error";
+  severity: "info" | "warn" | "error" | "critical";
   message: string;
 };
 
 export type EpisodeQualityResult = {
   episode_index: number;
   score: number | null;
+  data_quality_score: number | null;
+  task_success_score: number | null;
   status: CleaningStatus;
   source: "auto" | "manual";
   per_attribute_scores: Record<string, number>;
@@ -82,6 +84,8 @@ export type CleaningSummary = {
     quality_weights: Record<string, number>;
   };
   scorer_version: string;
+  requires_rerun: boolean;
+  previous_scorer_version: string | null;
 };
 
 export type CleaningRun = {
@@ -149,7 +153,17 @@ export type FilterSummary = {
   }>;
   episodes: Array<{
     episode_index: number;
-    stage_status: Record<FilterStageId, { count: number; status: FilterStatus; skipped_reason: string | null }>;
+    stage_status: Record<
+      FilterStageId,
+      {
+        count: number;
+        status: FilterStatus;
+        score: number | null;
+        severity: "none" | "warning" | "critical";
+        skipped_reason: string | null;
+      }
+    >;
+    critical_findings: FilterFinding[];
   }>;
 };
 
@@ -279,6 +293,101 @@ export function updateEpisodeDecision(
 
 export function runFilters(projectId: string) {
   return request<FilterRun>(`/api/projects/${projectId}/filters/runs`, { method: "POST" });
+}
+
+export type PipelineProgress = {
+  phase: "cleaning" | "filters";
+  completed: number;
+  total: number;
+};
+
+export type PipelineRunResult = {
+  cleaning: CleaningRun;
+  filters: FilterRun;
+};
+
+export async function runPipelineStream(
+  projectId: string,
+  vlm: VlmSettings | undefined,
+  episodeIndexes: number[] | undefined,
+  ruleConfig: CleaningRuleConfig | undefined,
+  onProgress: (progress: PipelineProgress) => void,
+): Promise<PipelineRunResult> {
+  const response = await fetch(`/api/projects/${projectId}/pipeline/runs/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pass_threshold: 0.8,
+      review_threshold: 0.6,
+      ...(ruleConfig ?? {}),
+      ...(vlm ? { vlm: writableVlmSettings(vlm) } : {}),
+      ...(episodeIndexes ? { episode_indexes: episodeIndexes } : {}),
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(body.detail ?? "Pipeline stream failed");
+  }
+  if (!response.body) {
+    return (await response.json()) as PipelineRunResult;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: PipelineRunResult | null = null;
+  let errorMessage: string | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let frameEnd = buffer.indexOf("\n\n");
+    while (frameEnd !== -1) {
+      const frame = buffer.slice(0, frameEnd);
+      buffer = buffer.slice(frameEnd + 2);
+      const event = parseSseFrame(frame);
+      if (event) {
+        if (event.name === "progress") {
+          onProgress({
+            phase: event.data.phase as "cleaning" | "filters",
+            completed: Number(event.data.completed),
+            total: Number(event.data.total),
+          });
+        } else if (event.name === "done") {
+          result = {
+            cleaning: event.data.cleaning as CleaningRun,
+            filters: event.data.filters as FilterRun,
+          };
+        } else if (event.name === "error") {
+          errorMessage = String(event.data.message ?? "Pipeline failed");
+        }
+      }
+      frameEnd = buffer.indexOf("\n\n");
+    }
+  }
+
+  if (errorMessage) throw new Error(errorMessage);
+  if (!result) throw new Error("Pipeline stream ended without result");
+  return result;
+}
+
+function parseSseFrame(frame: string): { name: string; data: Record<string, unknown> } | null {
+  let name = "message";
+  let dataLine = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) {
+      name = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataLine += line.slice(5).trim();
+    }
+  }
+  if (!dataLine) return null;
+  try {
+    return { name, data: JSON.parse(dataLine) as Record<string, unknown> };
+  } catch {
+    return null;
+  }
 }
 
 export function getFilterDetail(projectId: string, stageId: FilterStageId, episodeIndex: number) {

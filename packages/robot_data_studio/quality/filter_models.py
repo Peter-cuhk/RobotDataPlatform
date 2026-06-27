@@ -13,11 +13,12 @@ FilterStageId = Literal[
     "orientation_alignment",
 ]
 FilterStatus = Literal["passed", "review", "skipped"]
+FilterSeverity = Literal["none", "warning", "critical"]
 
 
 class FilterFinding(BaseModel):
     code: str
-    severity: Literal["info", "warn", "error"]
+    severity: Literal["info", "warn", "error", "critical"]
     message: str
 
 
@@ -32,12 +33,15 @@ class FilterStageSummary(BaseModel):
 class EpisodeFilterStageStatus(BaseModel):
     count: int
     status: FilterStatus
+    score: float | None = Field(default=None, ge=0, le=1)
+    severity: FilterSeverity = "none"
     skipped_reason: str | None = None
 
 
 class EpisodeFilterSummary(BaseModel):
     episode_index: int
     stage_status: dict[FilterStageId, EpisodeFilterStageStatus]
+    critical_findings: list[FilterFinding] = Field(default_factory=list)
 
 
 class FilterSummary(BaseModel):

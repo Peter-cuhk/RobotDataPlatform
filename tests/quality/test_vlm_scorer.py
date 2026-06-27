@@ -7,6 +7,7 @@ import pytest
 
 from robot_data_studio.lerobot.models import DatasetMetadata, EpisodeFrame, EpisodeSummary
 from robot_data_studio.quality.models import CleaningConfig, VlmEvaluation, VlmSettings
+from robot_data_studio.quality.models import EpisodeQualityResult
 from robot_data_studio.quality.scorer import EpisodeQualityScorer
 from robot_data_studio.quality.vlm import VlmTaskSuccessEvaluator
 
@@ -67,6 +68,23 @@ class InefficientPathReader(FakeReader):
         ]
 
 
+def test_legacy_quality_result_uses_score_as_data_quality_score() -> None:
+    result = EpisodeQualityResult.model_validate(
+        {
+            "episode_index": 7,
+            "score": 0.72,
+            "status": "review",
+            "source": "auto",
+            "per_attribute_scores": {"sudden_change": 0.72},
+            "findings": [],
+            "updated_at": "2026-06-27T00:00:00Z",
+        }
+    )
+
+    assert result.data_quality_score == 0.72
+    assert result.task_success_score is None
+
+
 def test_unconfigured_kinematic_consistency_finding_is_not_reported_as_low_score() -> None:
     scorer = EpisodeQualityScorer()
 
@@ -84,18 +102,19 @@ def test_unconfigured_kinematic_consistency_finding_is_not_reported_as_low_score
     )
 
 
-def test_vlm_task_success_is_included_as_a_quality_dimension() -> None:
+def test_vlm_task_success_is_kept_separate_from_data_quality_dimensions() -> None:
     scorer = EpisodeQualityScorer(vlm_evaluator=FakeVlmEvaluator())
     config = CleaningConfig(vlm=VlmSettings(enabled=True, prompt="Judge task: {task}"))
 
     result = scorer.score_episode(FakeReader(), 0, 0.3, 0.3, config)
 
-    assert result.per_attribute_scores["task_success"] == 0.2
+    assert "task_success" not in result.per_attribute_scores
+    assert result.task_success_score == 0.2
     assert any(finding.code == "vlm_failed" for finding in result.findings)
     assert any("never reached" in finding.message for finding in result.findings)
 
 
-def test_vlm_task_failure_is_weighted_and_prevents_auto_pass() -> None:
+def test_vlm_task_failure_is_separate_and_prevents_auto_pass() -> None:
     scorer = EpisodeQualityScorer(vlm_evaluator=FakeVlmEvaluator())
     config = CleaningConfig(
         pass_threshold=0.8,
@@ -106,7 +125,9 @@ def test_vlm_task_failure_is_weighted_and_prevents_auto_pass() -> None:
 
     result = scorer.score_episode(FakeReader(), 0, 0.3, 0.3, config)
 
-    assert result.score == pytest.approx(0.6)
+    assert result.data_quality_score == pytest.approx(1.0)
+    assert result.score == result.data_quality_score
+    assert result.task_success_score == pytest.approx(0.2)
     assert result.status == "review"
     assert any(finding.code == "vlm_failed" for finding in result.findings)
 

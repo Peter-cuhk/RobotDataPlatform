@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+from collections import Counter
+from collections.abc import Callable
 from uuid import uuid4
 
 import numpy as np
@@ -37,11 +39,13 @@ STAGE_LABELS: dict[FilterStageId, str] = {
     "orientation_alignment": "Orientation alignment",
 }
 
+ProgressCallback = Callable[[int, int], None]
+
 
 def infer_gripper_indices(reader: DatasetAdapter) -> list[int]:
     features = reader.metadata().features
     names = features.get("observation.state", {}).get("names")
-    motors = names.get("motors") if isinstance(names, dict) else None
+    motors = names.get("motors") if isinstance(names, dict) else names
     if not isinstance(motors, list):
         return []
     return [index for index, name in enumerate(motors) if "gripper" in str(name).lower()]
@@ -52,25 +56,44 @@ class DatasetFilterService:
         self.reader = reader
         self.config = config
 
-    def run(self) -> FilterRun:
-        summary = self.summary()
+    def run(self, on_progress: ProgressCallback | None = None) -> FilterRun:
+        summary = self.summary(on_progress=on_progress)
         return FilterRun(run_id=uuid4().hex[:12], status="succeeded", summary=summary)
 
-    def summary(self) -> FilterSummary:
+    def summary(self, on_progress: ProgressCallback | None = None) -> FilterSummary:
         episodes = self.reader.list_episodes()
-        states_by_episode, actions_by_episode = self._episode_arrays()
+        total_episodes = len(episodes)
+        total_units = total_episodes * 2
+        load_progress: ProgressCallback | None = None
+        if on_progress is not None:
+            def load_progress(completed: int, _total: int) -> None:
+                on_progress(completed, total_units)
+        states_by_episode, actions_by_episode, integrity_by_episode = self._episode_arrays(
+            on_progress=load_progress
+        )
         reference = self._reference_arrays(states_by_episode, actions_by_episode)
         episode_summaries = []
         totals = {stage_id: 0 for stage_id in STAGE_LABELS}
-        for episode in episodes:
+        for index, episode in enumerate(episodes, start=1):
             states = states_by_episode[episode.episode_index]
             actions = actions_by_episode[episode.episode_index]
-            status = self._stage_statuses(states, actions, reference)
+            integrity_findings = integrity_by_episode[episode.episode_index]
+            status = (
+                self._integrity_failed_statuses()
+                if integrity_findings
+                else self._stage_statuses(states, actions, reference)
+            )
             for stage_id, item in status.items():
                 totals[stage_id] += item.count
             episode_summaries.append(
-                EpisodeFilterSummary(episode_index=episode.episode_index, stage_status=status)
+                EpisodeFilterSummary(
+                    episode_index=episode.episode_index,
+                    stage_status=status,
+                    critical_findings=integrity_findings,
+                )
             )
+            if on_progress is not None:
+                on_progress(total_episodes + index, total_units)
         stages = [
             FilterStageSummary(
                 id=stage_id,
@@ -93,12 +116,26 @@ class DatasetFilterService:
         frames = self.reader.read_episode_frames(episode_index)
         states = np.asarray([frame.observation_state for frame in frames], dtype=np.float64)
         actions = np.asarray([frame.action for frame in frames], dtype=np.float64)
-        states_by_episode, actions_by_episode = self._episode_arrays()
+        states_by_episode, actions_by_episode, _integrity_by_episode = self._episode_arrays()
         reference = self._reference_arrays(states_by_episode, actions_by_episode)
+        normalized_states = self._normalize(states, reference["state"])
+        normalized_actions = self._normalize(actions, reference["action"])
         if stage_id == "sudden_change":
-            return self._sudden_change_detail(episode_index, states, actions)
+            return self._sudden_change_detail(
+                episode_index,
+                states,
+                actions,
+                normalized_states,
+                normalized_actions,
+            )
         if stage_id == "state_action_alignment":
-            return self._state_action_alignment_detail(episode_index, states, actions)
+            return self._state_action_alignment_detail(
+                episode_index,
+                states,
+                actions,
+                normalized_states,
+                normalized_actions,
+            )
         if stage_id == "extreme_value":
             return self._extreme_value_detail(episode_index, states, actions, reference)
         if stage_id == "kinematic_consistency":
@@ -107,18 +144,139 @@ class DatasetFilterService:
             return self._orientation_detail(episode_index, states)
         raise ValueError(f"Unsupported filter stage: {stage_id}")
 
-    def _episode_arrays(self) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    def _episode_arrays(
+        self, on_progress: ProgressCallback | None = None
+    ) -> tuple[
+        dict[int, np.ndarray],
+        dict[int, np.ndarray],
+        dict[int, list[FilterFinding]],
+    ]:
         states_by_episode = {}
         actions_by_episode = {}
-        for episode in self.reader.list_episodes():
+        integrity_by_episode = {}
+        episodes = self.reader.list_episodes()
+        total = len(episodes)
+        for completed, episode in enumerate(episodes, start=1):
             frames = self.reader.read_episode_frames(episode.episode_index)
-            states_by_episode[episode.episode_index] = np.asarray(
-                [frame.observation_state for frame in frames], dtype=np.float64
+            integrity_by_episode[episode.episode_index] = self._integrity_findings(frames)
+            state_rows = [frame.observation_state for frame in frames]
+            action_rows = [frame.action for frame in frames]
+            states_by_episode[episode.episode_index] = (
+                np.asarray(state_rows, dtype=np.float64)
+                if len({len(row) for row in state_rows}) <= 1
+                else np.empty((0, 0), dtype=np.float64)
             )
-            actions_by_episode[episode.episode_index] = np.asarray(
-                [frame.action for frame in frames], dtype=np.float64
+            actions_by_episode[episode.episode_index] = (
+                np.asarray(action_rows, dtype=np.float64)
+                if len({len(row) for row in action_rows}) <= 1
+                else np.empty((0, 0), dtype=np.float64)
             )
-        return states_by_episode, actions_by_episode
+            if on_progress is not None:
+                on_progress(completed, total)
+        self._mark_cross_episode_dimension_mismatches(
+            states_by_episode,
+            actions_by_episode,
+            integrity_by_episode,
+        )
+        return states_by_episode, actions_by_episode, integrity_by_episode
+
+    @staticmethod
+    def _mark_cross_episode_dimension_mismatches(
+        states_by_episode: dict[int, np.ndarray],
+        actions_by_episode: dict[int, np.ndarray],
+        integrity_by_episode: dict[int, list[FilterFinding]],
+    ) -> None:
+        for stream_name, arrays in (
+            ("state", states_by_episode),
+            ("action", actions_by_episode),
+        ):
+            widths = {
+                episode_index: array.shape[1]
+                for episode_index, array in arrays.items()
+                if array.ndim == 2 and array.shape[1] > 0
+            }
+            if not widths:
+                continue
+            canonical_width = Counter(widths.values()).most_common(1)[0][0]
+            for episode_index, width in widths.items():
+                if width == canonical_width or any(
+                    finding.code == "dimension_mismatch"
+                    for finding in integrity_by_episode[episode_index]
+                ):
+                    continue
+                integrity_by_episode[episode_index].append(
+                    FilterFinding(
+                        code="dimension_mismatch",
+                        severity="critical",
+                        message=(
+                            f"Episode {stream_name} width {width} differs from "
+                            f"dataset width {canonical_width}."
+                        ),
+                    )
+                )
+
+    @staticmethod
+    def _integrity_findings(frames: list) -> list[FilterFinding]:
+        findings: list[FilterFinding] = []
+        if not frames:
+            return [
+                FilterFinding(
+                    code="empty_episode",
+                    severity="critical",
+                    message="Episode contains no frames.",
+                )
+            ]
+        state_dimensions = {len(frame.observation_state) for frame in frames}
+        action_dimensions = {len(frame.action) for frame in frames}
+        if (
+            len(state_dimensions) != 1
+            or len(action_dimensions) != 1
+            or next(iter(state_dimensions), 0) <= 0
+            or next(iter(action_dimensions), 0) <= 0
+        ):
+            findings.append(
+                FilterFinding(
+                    code="dimension_mismatch",
+                    severity="critical",
+                    message="State/action dimensions are inconsistent.",
+                )
+            )
+        numeric_values = [
+            value
+            for frame in frames
+            for value in [*frame.observation_state, *frame.action]
+        ]
+        if numeric_values and not np.all(np.isfinite(numeric_values)):
+            findings.append(
+                FilterFinding(
+                    code="non_finite_signal",
+                    severity="critical",
+                    message="State/action contains NaN or infinite values.",
+                )
+            )
+        timestamps = np.asarray([frame.timestamp for frame in frames], dtype=np.float64)
+        if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) < 0):
+            findings.append(
+                FilterFinding(
+                    code="non_monotonic_timestamp",
+                    severity="critical",
+                    message="Episode timestamps must be finite and must not move backward.",
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _integrity_failed_statuses() -> dict[FilterStageId, EpisodeFilterStageStatus]:
+        return {
+            stage_id: EpisodeFilterStageStatus(
+                count=0,
+                status="skipped",
+                score=None,
+                severity="none",
+                skipped_reason="integrity_failure",
+            )
+            for stage_id in STAGE_LABELS
+        }
 
     def _reference_arrays(
         self,
@@ -126,9 +284,22 @@ class DatasetFilterService:
         actions_by_episode: dict[int, np.ndarray],
     ) -> dict[str, np.ndarray]:
         return {
-            "state": np.vstack(list(states_by_episode.values())) if states_by_episode else np.empty((0, 0)),
-            "action": np.vstack(list(actions_by_episode.values())) if actions_by_episode else np.empty((0, 0)),
+            "state": self._stack_finite_arrays(states_by_episode.values()),
+            "action": self._stack_finite_arrays(actions_by_episode.values()),
         }
+
+    @staticmethod
+    def _stack_finite_arrays(values) -> np.ndarray:
+        arrays = [
+            array
+            for array in values
+            if array.ndim == 2 and array.shape[1] > 0 and np.all(np.isfinite(array))
+        ]
+        if not arrays:
+            return np.empty((0, 0), dtype=np.float64)
+        width = arrays[0].shape[1]
+        compatible = [array for array in arrays if array.shape[1] == width]
+        return np.vstack(compatible) if compatible else np.empty((0, 0), dtype=np.float64)
 
     def _stage_statuses(
         self,
@@ -136,35 +307,143 @@ class DatasetFilterService:
         actions: np.ndarray,
         reference: dict[str, np.ndarray],
     ) -> dict[FilterStageId, EpisodeFilterStageStatus]:
-        sudden = sorted(
-            set(detect_sudden_changes(states, self._sudden_config()).flagged_frames)
-            | set(detect_sudden_changes(actions, self._sudden_config()).flagged_frames)
+        normalized_states = self._normalize(states, reference["state"])
+        normalized_actions = self._normalize(actions, reference["action"])
+        sudden_states = self._without_indices(
+            normalized_states,
+            self.config.gripper_indices,
         )
-        alignment = detect_state_action_trend_alignment(states, actions, self._alignment_config())
+        sudden_actions = self._without_indices(
+            normalized_actions,
+            self.config.gripper_indices,
+        )
+        sudden = sorted(
+            set(
+                detect_sudden_changes(
+                    sudden_states, self._sudden_config()
+                ).flagged_frames
+            )
+            | set(
+                detect_sudden_changes(
+                    sudden_actions, self._sudden_config()
+                ).flagged_frames
+            )
+        )
+        alignment = detect_state_action_trend_alignment(
+            normalized_states,
+            normalized_actions,
+            self._alignment_config(),
+        )
         extreme = detect_extreme_values(
             {"state": states, "action": actions},
             self._extreme_config(),
             reference_values_by_key=reference,
         )
+        active_dimensions = max(
+            0,
+            min(states.shape[1], actions.shape[1]) - len(self.config.gripper_indices),
+        )
         return {
-            "sudden_change": self._count_status(len(sudden)),
-            "state_action_alignment": self._count_status(len(alignment.flagged_dimensions)),
-            "extreme_value": self._count_status(len(extreme.flagged_frames)),
-            "kinematic_consistency": EpisodeFilterStageStatus(
-                count=0,
-                status=self._default_stage_status("kinematic_consistency"),
-                skipped_reason=self._default_skipped_reason("kinematic_consistency"),
+            "sudden_change": self._count_status(
+                len(sudden),
+                len(states),
+                critical_rate=0.02,
+                critical=False,
             ),
+            "state_action_alignment": self._count_status(
+                len(alignment.flagged_dimensions),
+                active_dimensions,
+                critical_rate=0.5,
+                critical=False,
+            ),
+            "extreme_value": self._count_status(
+                len(extreme.flagged_frames),
+                len(states),
+                critical_rate=0.01,
+                critical=True,
+            ),
+            "kinematic_consistency": self._kinematic_status(states),
             "orientation_alignment": EpisodeFilterStageStatus(
                 count=0,
                 status="skipped",
+                score=None,
                 skipped_reason="not_configured",
             ),
         }
 
-    def _sudden_change_detail(self, episode_index: int, states: np.ndarray, actions: np.ndarray) -> FilterDetail:
-        state_result = detect_sudden_changes(states, self._sudden_config())
-        action_result = detect_sudden_changes(actions, self._sudden_config())
+    def _kinematic_status(self, states: np.ndarray) -> EpisodeFilterStageStatus:
+        skipped_reason = self._default_skipped_reason("kinematic_consistency")
+        if skipped_reason:
+            return EpisodeFilterStageStatus(
+                count=0,
+                status="skipped",
+                score=None,
+                skipped_reason=skipped_reason,
+            )
+        config = self.config.kinematics
+        if not (
+            config.end_effector_link
+            and config.joint_names
+            and config.eef_position_indices
+        ):
+            return EpisodeFilterStageStatus(
+                count=0,
+                status="skipped",
+                score=None,
+                skipped_reason="eef_pose_missing",
+            )
+        try:
+            result = _pinocchio_fk_detail(states, config)
+        except Exception:
+            return EpisodeFilterStageStatus(
+                count=0,
+                status="skipped",
+                score=None,
+                skipped_reason="fk_failed",
+            )
+        count = int(np.sum(result["errors"] > config.position_tolerance))
+        return self._count_status(
+            count,
+            len(states),
+            critical_rate=0.05,
+            critical=True,
+        )
+
+    @staticmethod
+    def _normalize(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
+        if values.size == 0 or reference.size == 0:
+            return values.astype(np.float64, copy=True)
+        center = np.median(reference, axis=0)
+        low = np.quantile(reference, 0.01, axis=0)
+        high = np.quantile(reference, 0.99, axis=0)
+        robust_span = high - low
+        full_span = np.max(reference, axis=0) - np.min(reference, axis=0)
+        scale = np.where(robust_span > 1e-9, robust_span, full_span)
+        scale = np.where(scale > 1e-9, scale, 1.0)
+        return (values - center) / scale
+
+    @staticmethod
+    def _without_indices(values: np.ndarray, ignored_indices: list[int]) -> np.ndarray:
+        ignored = set(ignored_indices)
+        columns = [index for index in range(values.shape[1]) if index not in ignored]
+        return values[:, columns]
+
+    def _sudden_change_detail(
+        self,
+        episode_index: int,
+        states: np.ndarray,
+        actions: np.ndarray,
+        normalized_states: np.ndarray,
+        normalized_actions: np.ndarray,
+    ) -> FilterDetail:
+        state_result = detect_sudden_changes(
+            self._without_indices(normalized_states, self.config.gripper_indices),
+            self._sudden_config(),
+        )
+        action_result = detect_sudden_changes(
+            self._without_indices(normalized_actions, self.config.gripper_indices),
+            self._sudden_config(),
+        )
         rows = []
         for source, result in [("state", state_result), ("action", action_result)]:
             for frame in result.flagged_frames[:200]:
@@ -194,12 +473,24 @@ class DatasetFilterService:
                 "median_windows": list(self._sudden_config().median_windows),
                 "savgol_window": self._sudden_config().savgol_window,
                 "residual_scale": self._sudden_config().residual_scale,
+                "normalized_by": "dataset_q01_q99",
             },
             findings=self._finding_list(len(rows), "sudden_change", "Detected sudden change frames."),
         )
 
-    def _state_action_alignment_detail(self, episode_index: int, states: np.ndarray, actions: np.ndarray) -> FilterDetail:
-        result = detect_state_action_trend_alignment(states, actions, self._alignment_config())
+    def _state_action_alignment_detail(
+        self,
+        episode_index: int,
+        states: np.ndarray,
+        actions: np.ndarray,
+        normalized_states: np.ndarray,
+        normalized_actions: np.ndarray,
+    ) -> FilterDetail:
+        result = detect_state_action_trend_alignment(
+            normalized_states,
+            normalized_actions,
+            self._alignment_config(),
+        )
         rows = [
             {
                 "dimension": item.dimension,
@@ -221,6 +512,7 @@ class DatasetFilterService:
                 "max_lag": self._alignment_config().max_lag,
                 "directional_agreement_threshold": self._alignment_config().directional_agreement_threshold,
                 "ignored_indices": self._alignment_config().ignored_indices,
+                "normalized_by": "dataset_q01_q99",
             },
             findings=self._finding_list(
                 len(result.flagged_dimensions),
@@ -403,8 +695,28 @@ class DatasetFilterService:
             return "not_configured"
         return None
 
-    def _count_status(self, count: int) -> EpisodeFilterStageStatus:
-        return EpisodeFilterStageStatus(count=count, status="review" if count else "passed")
+    def _count_status(
+        self,
+        count: int,
+        total: int,
+        critical_rate: float,
+        critical: bool,
+    ) -> EpisodeFilterStageStatus:
+        rate = count / total if total > 0 else 1.0
+        score = max(0.0, min(1.0, 1.0 - rate / critical_rate))
+        severity = (
+            "critical"
+            if critical and count and rate >= critical_rate
+            else "warning"
+            if count
+            else "none"
+        )
+        return EpisodeFilterStageStatus(
+            count=count,
+            status="review" if count else "passed",
+            score=score,
+            severity=severity,
+        )
 
     def _sudden_config(self) -> SuddenChangeConfig:
         return SuddenChangeConfig(

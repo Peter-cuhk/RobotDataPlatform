@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
 CleaningStatus = Literal["passed", "review", "excluded", "unscored"]
 DecisionSource = Literal["auto", "manual"]
-FindingSeverity = Literal["info", "warn", "error"]
+FindingSeverity = Literal["info", "warn", "error", "critical"]
 VlmProvider = Literal["OpenAI", "Gemini", "Local"]
 FilterStageId = Literal[
     "sudden_change",
@@ -28,10 +28,10 @@ DEFAULT_ENABLED_FILTER_STAGES: list[FilterStageId] = [
 ]
 
 DEFAULT_QUALITY_WEIGHTS: dict[str, float] = {
-    "sudden_change": 1.0,
-    "state_action_alignment": 1.0,
-    "extreme_value": 1.0,
-    "kinematic_consistency": 1.0,
+    "sudden_change": 1.5,
+    "state_action_alignment": 1.5,
+    "extreme_value": 2.0,
+    "kinematic_consistency": 2.0,
     "orientation_alignment": 1.0,
     "task_success": 2.0,
 }
@@ -80,6 +80,18 @@ class CleaningConfig(BaseModel):
     quality_weights: dict[str, float] = Field(default_factory=lambda: DEFAULT_QUALITY_WEIGHTS.copy())
     vlm: VlmSettings = Field(default_factory=VlmSettings)
 
+    @field_validator("quality_weights")
+    @classmethod
+    def validate_quality_weights(cls, weights: dict[str, float]) -> dict[str, float]:
+        invalid = {
+            name: value
+            for name, value in weights.items()
+            if not 0.25 <= value <= 3.0
+        }
+        if invalid:
+            raise ValueError("quality weights must be between 0.25 and 3.0")
+        return weights
+
 
 class QualityFinding(BaseModel):
     code: str
@@ -90,12 +102,22 @@ class QualityFinding(BaseModel):
 class EpisodeQualityResult(BaseModel):
     episode_index: int
     score: float | None
+    data_quality_score: float | None = None
+    task_success_score: float | None = None
     status: CleaningStatus
     source: DecisionSource
     per_attribute_scores: dict[str, float]
     findings: list[QualityFinding]
     review_note: str | None = None
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def populate_compatible_scores(self) -> EpisodeQualityResult:
+        if self.data_quality_score is None and self.score is not None:
+            self.data_quality_score = self.score
+        elif self.score is None and self.data_quality_score is not None:
+            self.score = self.data_quality_score
+        return self
 
 
 class CleaningSummary(BaseModel):
@@ -107,6 +129,8 @@ class CleaningSummary(BaseModel):
     results: list[EpisodeQualityResult]
     config: CleaningConfig
     scorer_version: str
+    requires_rerun: bool = False
+    previous_scorer_version: str | None = None
 
 
 class CleaningRun(BaseModel):

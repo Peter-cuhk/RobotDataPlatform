@@ -9,8 +9,7 @@ import {
   importDataset,
   listFormats,
   listEpisodes,
-  runCleaning,
-  runFilters,
+  runPipelineStream,
   saveFilterConfig,
   saveVlmSettings,
   updateEpisodeDecision,
@@ -145,13 +144,17 @@ function pickEpisodeAfterCleaning(summary: CleaningSummary) {
   return scored[0]?.episode_index ?? summary.results[0]?.episode_index ?? null;
 }
 
-function pickNextReviewEpisode(summary: CleaningSummary, currentEpisodeIndex: number) {
-  const reviews = summary.results
-    .filter((result) => result.status === "review")
+function pickNextEpisodeInStatus(
+  summary: CleaningSummary,
+  currentEpisodeIndex: number,
+  status: CleaningStatus,
+) {
+  const inStatus = summary.results
+    .filter((result) => result.status === status)
     .sort((left, right) => left.episode_index - right.episode_index);
   return (
-    reviews.find((result) => result.episode_index > currentEpisodeIndex)?.episode_index ??
-    reviews[0]?.episode_index ??
+    inStatus.find((result) => result.episode_index > currentEpisodeIndex)?.episode_index ??
+    inStatus[0]?.episode_index ??
     null
   );
 }
@@ -197,8 +200,10 @@ export default function App() {
   const [selected, setSelected] = useState<number | null>(null);
   const [checkedEpisodeIndexes, setCheckedEpisodeIndexes] = useState<Set<number>>(() => new Set());
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const [replayReady, setReplayReady] = useState(false);
   const [exportedResult, setExportedResult] = useState<ExportResult | null>(null);
   const [cleaningSummary, setCleaningSummary] = useState<CleaningSummary | null>(null);
+  const [cleaningProgress, setCleaningProgress] = useState(0);
   const [filterSummary, setFilterSummary] = useState<FilterSummary | null>(null);
   const [activeFilterStage, setActiveFilterStage] = useState<FilterStageId | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -234,6 +239,7 @@ export default function App() {
       setSelected(0);
       setCheckedEpisodeIndexes(new Set());
       setRecordingUrl(null);
+      setReplayReady(false);
       setExportedResult(null);
       setCleaningSummary(null);
       setFilterSummary(null);
@@ -260,17 +266,23 @@ export default function App() {
         enabled_filter_stages: enabledFilterStages,
         quality_weights: activeQualityWeights,
       };
-      const cleaning = await runCleaning(project!.id, vlmSettings, episodeIndexes, ruleConfig);
-      const filters = await runFilters(project!.id);
-      return { cleaning, filters };
+      return runPipelineStream(project!.id, vlmSettings, episodeIndexes, ruleConfig, (progress) => {
+        const ratio = progress.total > 0 ? progress.completed / progress.total : 0;
+        const pct = progress.phase === "cleaning" ? 50 * ratio : 50 + 50 * ratio;
+        setCleaningProgress(Math.min(100, Math.max(0, Math.round(pct))));
+      });
     },
+    onMutate: () => setCleaningProgress(0),
     onSuccess: ({ cleaning, filters }) => {
       setCleaningSummary(cleaning.summary);
       setFilterSummary(filters.summary);
       setSelected(pickEpisodeAfterCleaning(cleaning.summary));
       setRecordingUrl(null);
+      setReplayReady(false);
       setExportedResult(null);
+      setCleaningProgress(0);
     },
+    onError: () => setCleaningProgress(0),
   });
   const vlmSettingsMutation = useMutation({
     mutationFn: (settings: VlmSettings) => saveVlmSettings(project!.id, settings),
@@ -329,10 +341,6 @@ export default function App() {
   );
   const selectedEpisode = useMemo(
     () => episodesQuery.data?.find((episode) => episode.episode_index === selected) ?? null,
-    [episodesQuery.data, selected],
-  );
-  const selectedEpisodePosition = useMemo(
-    () => (selected === null ? -1 : (episodesQuery.data ?? []).findIndex((episode) => episode.episode_index === selected)),
     [episodesQuery.data, selected],
   );
   const selectedQuality = selected === null ? null : qualityByEpisode.get(selected) ?? null;
@@ -398,24 +406,27 @@ export default function App() {
       vlmSettingsMutation.mutate(nextSettings);
     }
   };
-  const replayEpisode = (episodeIndex: number) => {
+  const selectEpisode = (episodeIndex: number) => {
     setSelected(episodeIndex);
     setActiveFilterStage(null);
     setRecordingUrl(null);
     setExportedResult(null);
+    setReplayReady(true);
+  };
+  const buildReplay = (episodeIndex: number) => {
+    setReplayReady(false);
     recordingMutation.mutate(episodeIndex);
   };
-  const replayAdjacentEpisode = (offset: -1 | 1) => {
-    const episodes = episodesQuery.data ?? [];
-    if (selectedEpisodePosition < 0) return;
-    const nextEpisode = episodes[selectedEpisodePosition + offset];
-    if (!nextEpisode) return;
-    replayEpisode(nextEpisode.episode_index);
+  const replayEpisode = (episodeIndex: number) => {
+    selectEpisode(episodeIndex);
+    buildReplay(episodeIndex);
   };
   const decisionMutation = useMutation({
     mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
       updateEpisodeDecision(project!.id, episodeIndex, status),
     onSuccess: (updated) => {
+      const originalStatus =
+        cleaningSummary?.results.find((result) => result.episode_index === updated.episode_index)?.status ?? null;
       const updatedSummary = cleaningSummary
         ? summarizeCleaning({
             ...cleaningSummary,
@@ -425,16 +436,10 @@ export default function App() {
           })
         : null;
       setCleaningSummary(updatedSummary);
-      const nextReviewEpisode = updatedSummary ? pickNextReviewEpisode(updatedSummary, updated.episode_index) : null;
-      if (nextReviewEpisode === null) return;
-      setActiveFilterStage(null);
-      if (recordingUrl && !activeFilterStage) {
-        replayEpisode(nextReviewEpisode);
-      } else {
-        setSelected(nextReviewEpisode);
-        setRecordingUrl(null);
-        setExportedResult(null);
-      }
+      if (!updatedSummary || !originalStatus) return;
+      const nextEpisode = pickNextEpisodeInStatus(updatedSummary, updated.episode_index, originalStatus);
+      if (nextEpisode === null) return;
+      replayEpisode(nextEpisode);
     },
   });
 
@@ -558,11 +563,7 @@ export default function App() {
                   }}
                   onWeightChange={updateRuleWeight}
                   onToggleChecked={toggleCheckedEpisode}
-                  onSelect={(episodeIndex) => {
-                    setSelected(episodeIndex);
-                    setRecordingUrl(null);
-                    setExportedResult(null);
-                  }}
+                  onSelect={(episodeIndex) => selectEpisode(episodeIndex)}
                 />
               </div>
             </aside>
@@ -575,11 +576,14 @@ export default function App() {
                 </div>
                 <div className="actions">
                   <button
-                    className="secondary"
+                    className="secondary has-progress"
                     disabled={cleaningMutation.isPending}
                     onClick={() => cleaningMutation.mutate(undefined)}
                   >
                     {cleaningMutation.isPending ? copy.viewer.cleaning : copy.viewer.runCleaning}
+                    {cleaningMutation.isPending && (
+                      <i className="button-progress-line" style={{ left: `${cleaningProgress}%` }} />
+                    )}
                   </button>
                   <button
                     className="secondary"
@@ -591,10 +595,23 @@ export default function App() {
                   <button
                     className="secondary"
                     disabled={selected === null || recordingMutation.isPending}
-                    onClick={() => selected !== null && replayEpisode(selected)}
+                    onClick={() => selected !== null && buildReplay(selected)}
                   >
                     {recordingMutation.isPending ? copy.viewer.buildingReplay : copy.viewer.replay}
                   </button>
+                  {recordingUrl && (
+                    <button
+                      className="secondary"
+                      disabled={recordingMutation.isPending}
+                      onClick={() => {
+                        setRecordingUrl(null);
+                        setExportedResult(null);
+                        setReplayReady(false);
+                      }}
+                    >
+                      {copy.viewer.report}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -627,27 +644,20 @@ export default function App() {
                     configSaving={filterConfigMutation.isPending}
                   />
                 ) : recordingUrl ? (
-                  <RerunViewer
-                    labels={copy.rerun}
-                    recordingUrl={recordingUrl}
-                    canGoPrevious={selectedEpisodePosition > 0 && !recordingMutation.isPending}
-                    canGoNext={
-                      selectedEpisodePosition >= 0 &&
-                      selectedEpisodePosition < (episodesQuery.data?.length ?? 0) - 1 &&
-                      !recordingMutation.isPending
-                    }
-                    onPreviousEpisode={() => replayAdjacentEpisode(-1)}
-                    onNextEpisode={() => replayAdjacentEpisode(1)}
-                  />
+                  <RerunViewer recordingUrl={recordingUrl} />
+                ) : replayReady && selected !== null ? (
+                  <div className="viewer-placeholder">
+                    <div className="signal-preview">
+                      <i /><i /><i /><i /><i /><i /><i /><i />
+                    </div>
+                    <h3>{copy.viewer.placeholderTitle}</h3>
+                    <p>{copy.viewer.placeholderBody}</p>
+                  </div>
                 ) : cleaningSummary ? (
                   <CleaningSummaryView
                     copy={copy}
                     summary={cleaningSummary}
-                    onSelect={(episodeIndex) => {
-                      setSelected(episodeIndex);
-                      setRecordingUrl(null);
-                      setExportedResult(null);
-                    }}
+                    onSelect={(episodeIndex) => selectEpisode(episodeIndex)}
                   />
                 ) : (
                   <div className="viewer-placeholder">

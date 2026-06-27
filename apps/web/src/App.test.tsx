@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 
@@ -293,7 +293,7 @@ test("expands only one sidebar weight slider at a time", async () => {
   expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
 
   await user.click(filters.getByRole("button", { name: "Expand Sudden change weight" }));
-  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1");
+  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1.5");
   expect(filters.getByRole("button", { name: "Collapse Sudden change weight" })).toHaveAttribute(
     "aria-expanded",
     "true",
@@ -301,7 +301,7 @@ test("expands only one sidebar weight slider at a time", async () => {
 
   await user.click(filters.getByRole("button", { name: "Expand Time sync weight" }));
   expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
-  expect(filters.getByLabelText("Time sync weight")).toHaveValue("1");
+  expect(filters.getByLabelText("Time sync weight")).toHaveValue("1.5");
 
   await user.click(filters.getByRole("button", { name: "Collapse Time sync weight" }));
   expect(filters.queryByLabelText("Time sync weight")).not.toBeInTheDocument();
@@ -543,18 +543,7 @@ test("exports the current filtered episode list", async () => {
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
     .mockResolvedValueOnce({
       ok: true,
       json: async () => exportResult(1),
@@ -594,18 +583,7 @@ test("exports passed review and excluded cleaning status scopes", async () => {
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
     .mockResolvedValueOnce({
       ok: true,
       json: async () => exportResult(1),
@@ -689,18 +667,7 @@ test("data filter checkboxes use filter summary when exporting current filtered 
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
     .mockResolvedValueOnce({
       ok: true,
       json: async () => exportResult(1),
@@ -749,18 +716,7 @@ test("runs cleaning and renders episode status folders", async () => {
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: cleaningSummary(),
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse()),
   );
   renderApp();
 
@@ -772,6 +728,34 @@ test("runs cleaning and renders episode status folders", async () => {
   expect(screen.getAllByText("Pass").length).toBeGreaterThan(0);
   expect(screen.getAllByText("#000000").length).toBeGreaterThan(0);
   expect(screen.getAllByText("72 / 100").length).toBeGreaterThan(0);
+  expect(screen.getByText("Data quality")).toBeInTheDocument();
+  expect(screen.getByText("Task success")).toBeInTheDocument();
+  expect(screen.getByText("Not evaluated")).toBeInTheDocument();
+});
+
+test("marks saved results from an older scorer as requiring a rerun", async () => {
+  const user = userEvent.setup();
+  const summary = cleaningSummary();
+  summary.requires_rerun = true;
+  summary.previous_scorer_version = "score_lerobot_episodes-compatible-v1";
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+      .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+      .mockResolvedValueOnce(pipelineJsonResponse(summary)),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(screen.getByText("Rerun required")).toBeInTheDocument();
+  expect(
+    screen.getByText("These saved scores use an older scoring version. Run the pipeline again."),
+  ).toBeInTheDocument();
 });
 
 test("shows passed episodes in the status folder when default issue filters are selected", async () => {
@@ -802,18 +786,7 @@ test("shows passed episodes in the status folder when default issue filters are 
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: allPassedSummary,
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse(allPassedSummary)),
   );
   renderApp();
 
@@ -847,18 +820,7 @@ test("collapses and expands cleaning status folders independently", async () => 
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: cleaningSummary(),
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse()),
   );
   renderApp();
 
@@ -904,18 +866,7 @@ test("marks a review episode as passed", async () => {
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
     .mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -961,18 +912,7 @@ test("advances to the next review episode after a manual decision", async () => 
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary,
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
+    .mockResolvedValueOnce(pipelineJsonResponse(summary))
     .mockResolvedValueOnce({
       ok: true,
       json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }),
@@ -985,6 +925,7 @@ test("advances to the next review episode after a manual decision", async () => 
         source: "manual",
       }),
     })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "warmed" }) })
     .mockResolvedValueOnce({
       ok: true,
       json: async () => ({ recording_url: "/api/artifacts/episode-000001.rrd" }),
@@ -1000,6 +941,92 @@ test("advances to the next review episode after a manual decision", async () => 
   expect(await screen.findByRole("heading", { name: "Episode 000001" })).toBeInTheDocument();
   expect(fetch).toHaveBeenCalledWith(
     "/api/projects/project-1/episodes/1/recording",
+    expect.objectContaining({ method: "POST" }),
+  );
+});
+
+test("advances to the next passed episode after excluding from the pass folder", async () => {
+  const user = userEvent.setup();
+  const summary = cleaningSummary();
+  summary.passed_count = 2;
+  summary.review_count = 0;
+  summary.excluded_count = 1;
+  summary.results = [
+    { ...summary.results[0], episode_index: 0, score: 0.7, status: "passed", findings: [] },
+    { ...summary.results[1], episode_index: 1, score: 0.9, status: "passed", findings: [] },
+    { ...summary.results[2], episode_index: 2, score: 0.95, status: "excluded", findings: [] },
+  ];
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }) })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...summary.results[0], status: "excluded", source: "manual" }),
+    })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "warmed" }) })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000001.rrd" }) });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
+  await user.click(await screen.findByRole("button", { name: "Exclude" }));
+
+  expect(await screen.findByRole("heading", { name: "Episode 000001" })).toBeInTheDocument();
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/projects/project-1/episodes/1/recording",
+    expect.objectContaining({ method: "POST" }),
+  );
+});
+
+test("stays on the current episode when its status folder is emptied by the decision", async () => {
+  const user = userEvent.setup();
+  const summary = cleaningSummary();
+  summary.passed_count = 1;
+  summary.review_count = 0;
+  summary.excluded_count = 2;
+  summary.results = [
+    { ...summary.results[0], episode_index: 0, score: 0.3, status: "passed", findings: [] },
+    { ...summary.results[1], episode_index: 1, score: 0.5, status: "excluded", findings: [] },
+    { ...summary.results[2], episode_index: 2, score: 0.6, status: "excluded", findings: [] },
+  ];
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }) })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...summary.results[0], status: "excluded", source: "manual" }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
+  await user.click(await screen.findByRole("button", { name: "Exclude" }));
+
+  await waitFor(() =>
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/projects/project-1/episodes/0/decision",
+      expect.objectContaining({ method: "PATCH" }),
+    ),
+  );
+  expect(screen.getByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalledWith(
+    "/api/projects/project-1/episodes/1/recording",
+    expect.objectContaining({ method: "POST" }),
+  );
+  expect(fetch).not.toHaveBeenCalledWith(
+    "/api/projects/project-1/episodes/2/recording",
     expect.objectContaining({ method: "POST" }),
   );
 });
@@ -1022,18 +1049,7 @@ test("filters cleaning results by search and finding type", async () => {
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: cleaningSummary(),
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse()),
   );
   renderApp();
 
@@ -1173,18 +1189,7 @@ test("sends VLM settings when running cleaning", async () => {
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    });
+    .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
@@ -1202,7 +1207,7 @@ test("sends VLM settings when running cleaning", async () => {
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
   expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/cleaning/runs",
+    "/api/projects/project-1/pipeline/runs/stream",
     expect.objectContaining({
       method: "POST",
       body: JSON.stringify({
@@ -1216,10 +1221,10 @@ test("sends VLM settings when running cleaning", async () => {
           "orientation_alignment",
         ],
         quality_weights: {
-          sudden_change: 1,
-          state_action_alignment: 1,
-          extreme_value: 1,
-          kinematic_consistency: 1,
+          sudden_change: 1.5,
+          state_action_alignment: 1.5,
+          extreme_value: 2,
+          kinematic_consistency: 2,
           orientation_alignment: 1,
           task_success: 2,
         },
@@ -1252,18 +1257,7 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    });
+    .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
@@ -1273,14 +1267,14 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
   const filters = within(sidebar as HTMLElement);
   expect(filters.queryByLabelText("Sudden change weight")).not.toBeInTheDocument();
   await user.click(filters.getByRole("button", { name: "Expand Sudden change weight" }));
-  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1");
+  expect(filters.getByLabelText("Sudden change weight")).toHaveValue("1.5");
   expect(screen.queryByText("Cleaning rules")).not.toBeInTheDocument();
   await user.click(filters.getByRole("button", { name: "Expand Time sync weight" }));
   fireEvent.change(filters.getByLabelText("Time sync weight"), { target: { value: "2.5" } });
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
   expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/cleaning/runs",
+    "/api/projects/project-1/pipeline/runs/stream",
     expect.objectContaining({
       method: "POST",
       body: JSON.stringify({
@@ -1294,10 +1288,10 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
           "orientation_alignment",
         ],
         quality_weights: {
-          sudden_change: 1,
+          sudden_change: 1.5,
           state_action_alignment: 2.5,
-          extreme_value: 1,
-          kinematic_consistency: 1,
+          extreme_value: 2,
+          kinematic_consistency: 2,
           orientation_alignment: 1,
         },
         vlm: {
@@ -1330,18 +1324,7 @@ test("runs cleaning only for the selected episode from the viewer toolbar", asyn
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    });
+    .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
@@ -1349,7 +1332,7 @@ test("runs cleaning only for the selected episode from the viewer toolbar", asyn
   await user.click(await screen.findByRole("button", { name: "Run selected episode" }));
 
   expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/cleaning/runs",
+    "/api/projects/project-1/pipeline/runs/stream",
     expect.objectContaining({
       method: "POST",
       body: expect.stringContaining('"episode_indexes":[0]'),
@@ -1461,30 +1444,8 @@ test("shows three quality findings and can add the selected episode to cleaning 
       ok: true,
       json: async () => episodesResponse(),
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        run_id: "run-2",
-        status: "succeeded",
-        summary: cleaningSummary(),
-      }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => filterRunResponse(),
-    });
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
@@ -1495,7 +1456,7 @@ test("shows three quality findings and can add the selected episode to cleaning 
   await user.click(screen.getByRole("button", { name: "Add to cleaning Pipeline" }));
 
   expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/cleaning/runs",
+    "/api/projects/project-1/pipeline/runs/stream",
     expect.objectContaining({ method: "POST" }),
   );
 });
@@ -1518,18 +1479,7 @@ test("shows the cleaning summary in the viewer after running the pipeline", asyn
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: cleaningSummary(),
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse()),
   );
   renderApp();
 
@@ -1560,6 +1510,63 @@ test("shows the cleaning summary in the viewer after running the pipeline", asyn
   expect(viewerStage).toHaveClass("viewer-stage-scroll");
 });
 
+test("selecting an episode shows the ready-to-build placeholder without auto-building the replay", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse());
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  expect(await screen.findByRole("heading", { name: "Cleaning summary" })).toBeInTheDocument();
+
+  const episodePanel = document.querySelector(".episode-panel");
+  expect(episodePanel).not.toBeNull();
+  await user.click(within(episodePanel as HTMLElement).getByRole("button", { name: /#000000/ }));
+
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalledWith(
+    "/api/projects/project-1/episodes/0/recording",
+    expect.objectContaining({ method: "POST" }),
+  );
+});
+
+test("warms the recording for the selected episode in the background without building it", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "warmed" }) });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+
+  const episodePanel = document.querySelector(".episode-panel");
+  expect(episodePanel).not.toBeNull();
+  await user.click(within(episodePanel as HTMLElement).getByRole("button", { name: /Episode 000000/ }));
+
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/projects/project-1/episodes/0/recording/warm",
+      expect.objectContaining({ method: "POST" }),
+    ),
+  );
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalledWith(
+    "/api/projects/project-1/episodes/0/recording",
+    expect.objectContaining({ method: "POST" }),
+  );
+});
+
 test("shows only valid manual decisions for passed and excluded episodes", async () => {
   const user = userEvent.setup();
   vi.stubGlobal(
@@ -1578,18 +1585,7 @@ test("shows only valid manual decisions for passed and excluded episodes", async
         ok: true,
         json: async () => episodesResponse(),
       })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          run_id: "run-1",
-          status: "succeeded",
-          summary: cleaningSummary(),
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => filterRunResponse(),
-      }),
+      .mockResolvedValueOnce(pipelineJsonResponse()),
   );
   renderApp();
 
@@ -1606,57 +1602,53 @@ test("shows only valid manual decisions for passed and excluded episodes", async
   expect(screen.queryByRole("button", { name: "Exclude" })).not.toBeInTheDocument();
 });
 
-test("replays the next episode from the viewer controls", async () => {
+test("renders a progress line on the Run cleaning Pipeline button while streaming", async () => {
   const user = userEvent.setup();
+  const encoder = new TextEncoder();
+  const controllerRef: {
+    current: ReadableStreamDefaultController<Uint8Array> | null;
+  } = { current: null };
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef.current = controller;
+      controller.enqueue(
+        encoder.encode(
+          `event: progress\ndata: ${JSON.stringify({ phase: "cleaning", completed: 1, total: 3 })}\n\n` +
+            `event: progress\ndata: ${JSON.stringify({ phase: "filters", completed: 3, total: 6 })}\n\n`,
+        ),
+      );
+    },
+  });
   const fetch = vi
     .fn()
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => formatsResponse(),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => projectResponse(),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => episodesResponse(),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ recording_url: "/api/artifacts/episode-000001.rrd" }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ recording_url: "/api/artifacts/episode-000002.rrd" }),
-    });
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce({ ok: true, body: stream });
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
   await importDatasetForTest(user);
-  await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
-  expect(await screen.findByRole("button", { name: "Previous episode" })).toBeDisabled();
-  await user.click(screen.getByRole("button", { name: "Next episode" }));
+  const button = document.querySelector(".viewer-toolbar .actions .has-progress") as HTMLButtonElement;
+  await waitFor(() => expect(button.textContent).toContain("Cleaning"));
+  const line = button.querySelector(".button-progress-line") as HTMLElement | null;
+  expect(line).not.toBeNull();
+  await waitFor(() => expect(line).toHaveStyle({ left: "35%" }));
 
-  expect(await screen.findByRole("heading", { name: "Episode 000001" })).toBeInTheDocument();
-  expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/episodes/1/recording",
-    expect.objectContaining({ method: "POST" }),
+  controllerRef.current?.enqueue(
+    encoder.encode(
+      `event: done\ndata: ${JSON.stringify({
+        cleaning: { run_id: "run-1", status: "succeeded", summary: cleaningSummary() },
+        filters: filterRunResponse(),
+      })}\n\n`,
+    ),
   );
+  controllerRef.current?.close();
 
-  await user.click(screen.getByRole("button", { name: "Next episode" }));
-
-  expect(await screen.findByRole("heading", { name: "Episode 000002" })).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Next episode" })).toBeDisabled();
-  expect(fetch).toHaveBeenCalledWith(
-    "/api/projects/project-1/episodes/2/recording",
-    expect.objectContaining({ method: "POST" }),
-  );
+  await screen.findByRole("button", { name: "Run cleaning Pipeline" });
+  expect(button.querySelector(".button-progress-line")).toBeNull();
 });
 
 function projectResponse(overrides: Partial<{ format: string; version: string }> = {}) {
@@ -1763,11 +1755,15 @@ function cleaningSummary() {
         sample_frames: 4,
       },
     },
-    scorer_version: "score_lerobot_episodes-compatible-v1",
+    scorer_version: "quality-rules-v2",
+    requires_rerun: false,
+    previous_scorer_version: null as string | null,
     results: [
       {
         episode_index: 0,
         score: 0.72,
+        data_quality_score: 0.72,
+        task_success_score: null,
         status: "review",
         source: "auto",
         per_attribute_scores: {
@@ -1786,6 +1782,8 @@ function cleaningSummary() {
       {
         episode_index: 1,
         score: 0.41,
+        data_quality_score: 0.41,
+        task_success_score: null,
         status: "excluded",
         source: "auto",
         per_attribute_scores: { smoothness: 0.41 },
@@ -1800,6 +1798,8 @@ function cleaningSummary() {
       {
         episode_index: 2,
         score: 0.96,
+        data_quality_score: 0.96,
+        task_success_score: null,
         status: "passed",
         source: "auto",
         per_attribute_scores: { smoothness: 0.96 },
@@ -1865,6 +1865,19 @@ function filterRunResponse() {
     run_id: "filter-run-1",
     status: "succeeded",
     summary: filterSummaryResponse(),
+  };
+}
+
+function pipelineJsonResponse(
+  cleaning: ReturnType<typeof cleaningSummary> = cleaningSummary(),
+  filters: ReturnType<typeof filterRunResponse> = filterRunResponse(),
+) {
+  return {
+    ok: true,
+    json: async () => ({
+      cleaning: { run_id: "run-1", status: "succeeded", summary: cleaning },
+      filters,
+    }),
   };
 }
 

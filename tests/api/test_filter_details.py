@@ -105,8 +105,13 @@ def test_kinematic_filter_autoconfigures_robomimic_panda_dataset(tmp_path: Path)
     client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
     project = client.post("/api/projects", json={"path": str(dataset), "format_hint": "robomimic_hdf5"}).json()
 
+    summary = client.post(f"/api/projects/{project['id']}/filters/runs").json()["summary"]
     detail = client.get(f"/api/projects/{project['id']}/filters/kinematic_consistency/episodes/0")
 
+    stage = summary["episodes"][0]["stage_status"]["kinematic_consistency"]
+    assert stage["score"] == 1.0
+    assert stage["severity"] == "none"
+    assert stage["skipped_reason"] is None
     assert detail.status_code == 200
     body = detail.json()
     assert body["status"] == "passed"

@@ -336,6 +336,19 @@ button:disabled { cursor: wait; opacity: .55; }
 }
 .viewer-toolbar h2 { margin: 2px 0 0; font-size: 18px; }
 .actions { display: flex; gap: 8px; }
+.actions .has-progress { position: relative; overflow: hidden; }
+.button-progress-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  transform: translateX(-50%);
+  background: #5fa8ff;
+  box-shadow: 0 0 6px #5fa8ff;
+  pointer-events: none;
+  transition: left 120ms linear;
+}
 .viewer-stage { flex: 0 0 530px; min-height: 0; height: 530px; background: #080c11; }
 .viewer-stage-scroll { overflow-x: hidden; overflow-y: auto; }
 .export-panel {

@@ -1,7 +1,9 @@
+import asyncio
+import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from robot_data_studio.formats import UnsupportedDatasetFormat
 from robot_data_studio.projects.models import CleaningRunRequest, CreateProjectRequest, ExportRequest, Project
@@ -126,6 +128,60 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/pipeline/runs/stream")
+    async def stream_pipeline(project_id: str, request: CleaningRunRequest) -> StreamingResponse:
+        try:
+            service.project(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        async def event_generator():
+            queue: asyncio.Queue[dict] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def emit(payload: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+            def cleaning_progress(completed: int, total: int) -> None:
+                emit({"event": "progress", "phase": "cleaning", "completed": completed, "total": total})
+
+            def filters_progress(completed: int, total: int) -> None:
+                emit({"event": "progress", "phase": "filters", "completed": completed, "total": total})
+
+            async def run_work() -> None:
+                try:
+                    cleaning, filters = await asyncio.to_thread(
+                        service.run_pipeline,
+                        project_id,
+                        request,
+                        cleaning_progress,
+                        filters_progress,
+                    )
+                    emit(
+                        {
+                            "event": "done",
+                            "cleaning": cleaning.model_dump(mode="json"),
+                            "filters": filters.model_dump(mode="json"),
+                        }
+                    )
+                except Exception as error:  # noqa: BLE001 - surfaced to client via SSE
+                    emit({"event": "error", "message": str(error)})
+
+            task = asyncio.create_task(run_work())
+            try:
+                while True:
+                    payload = await queue.get()
+                    event_name = payload.get("event", "message")
+                    data = json.dumps(payload, ensure_ascii=False)
+                    yield f"event: {event_name}\ndata: {data}\n\n"
+                    if event_name in ("done", "error"):
+                        break
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @app.get("/api/projects/{project_id}/filters", response_model=FilterSummary)
     def filters(project_id: str) -> FilterSummary:

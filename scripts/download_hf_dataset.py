@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ DEFAULT_REVISION = "main"
 class RepoFile:
     path: str
     size: int | None = None
+    local_path: str | None = None
 
 
 def destination_for_repo(repo_id: str) -> Path:
@@ -41,17 +43,67 @@ def resolve_url(repo_id: str, relative_path: str, revision: str = DEFAULT_REVISI
 
 
 def tree_url(repo_id: str, revision: str = DEFAULT_REVISION) -> str:
-    return f"https://huggingface.co/api/datasets/{repo_id}/tree/{revision}?recursive=1"
+    return (
+        f"https://huggingface.co/api/datasets/{repo_id}/tree/{revision}"
+        "?recursive=1&expand=1&limit=100"
+    )
 
 
 def fetch_tree(repo_id: str, revision: str = DEFAULT_REVISION) -> list[RepoFile]:
-    with urlopen(tree_url(repo_id, revision), timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return files_from_tree(payload)
+    files: list[RepoFile] = []
+    url: str | None = tree_url(repo_id, revision)
+    while url:
+        with urlopen(url, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            link = response.headers.get("Link", "")
+        files.extend(files_from_tree(payload))
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = match.group(1) if match else None
+    return files
+
+
+def select_repo_files(
+    files: list[RepoFile],
+    source_prefix: str | None = None,
+    data_only: bool = False,
+) -> list[RepoFile]:
+    prefix = (source_prefix or "").strip("/")
+    selected: list[RepoFile] = []
+    media_suffixes = {
+        ".avi",
+        ".gif",
+        ".jpeg",
+        ".jpg",
+        ".mov",
+        ".mp4",
+        ".png",
+        ".webm",
+    }
+    for repo_file in files:
+        if prefix:
+            marker = f"{prefix}/"
+            if not repo_file.path.startswith(marker):
+                continue
+            local_path = repo_file.path[len(marker) :]
+        else:
+            local_path = repo_file.path
+        path = Path(local_path)
+        if data_only and (
+            "videos" in path.parts or path.suffix.lower() in media_suffixes
+        ):
+            continue
+        selected.append(
+            RepoFile(
+                path=repo_file.path,
+                size=repo_file.size,
+                local_path=local_path,
+            )
+        )
+    return selected
 
 
 def download_file(repo_id: str, repo_file: RepoFile, destination: Path, revision: str, force: bool) -> None:
-    output = destination / repo_file.path
+    output = destination / (repo_file.local_path or repo_file.path)
     if output.is_file() and not force:
         existing_size = output.stat().st_size
         if repo_file.size is None or existing_size == repo_file.size:
@@ -180,10 +232,13 @@ def download_dataset(
     revision: str = DEFAULT_REVISION,
     force: bool = False,
     episode_index: int | None = None,
+    source_prefix: str | None = None,
+    data_only: bool = False,
 ) -> Path:
     files = fetch_tree(repo_id, revision)
     if not files:
         raise RuntimeError(f"No files found for dataset repo {repo_id!r}")
+    files = select_repo_files(files, source_prefix=source_prefix, data_only=data_only)
     if episode_index is not None:
         files = [repo_file for repo_file in files if _file_matches_episode(repo_file, episode_index)]
         if not files:
@@ -202,6 +257,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision", default=DEFAULT_REVISION, help="Dataset revision. Default: main")
     parser.add_argument("--destination", type=Path, help="Output directory. Default: data/samples/<repo-name>")
     parser.add_argument("--episode-index", type=int, help="Keep only one episode when downloading archive-based datasets.")
+    parser.add_argument(
+        "--source-prefix",
+        help="Only download this repository subdirectory and strip it from local paths.",
+    )
+    parser.add_argument(
+        "--data-only",
+        action="store_true",
+        help="Skip video and image assets while keeping metadata, labels, and numeric data.",
+    )
     parser.add_argument("--force", action="store_true", help="Re-download files even if they already exist.")
     return parser.parse_args()
 
@@ -209,7 +273,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     destination = args.destination or destination_for_repo(args.repo)
-    output = download_dataset(args.repo, destination, args.revision, args.force, args.episode_index)
+    output = download_dataset(
+        args.repo,
+        destination,
+        args.revision,
+        args.force,
+        args.episode_index,
+        args.source_prefix,
+        args.data_only,
+    )
     print(f"Dataset ready: {output.resolve()}")
 
 

@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import json
 import h5py
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
 from robot_data_studio.quality.models import DEFAULT_VLM_PROMPT
+from robot_data_studio.quality.filter_service import DatasetFilterService
 from tests.lerobot.test_reader import write_agibot_v2_episode_fixture
 
 
@@ -194,10 +196,10 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
             "orientation_alignment",
         ],
         "quality_weights": {
-            "sudden_change": 1.0,
-            "state_action_alignment": 1.0,
-            "extreme_value": 1.0,
-            "kinematic_consistency": 1.0,
+            "sudden_change": 1.5,
+            "state_action_alignment": 1.5,
+            "extreme_value": 2.0,
+            "kinematic_consistency": 2.0,
             "orientation_alignment": 1.0,
             "task_success": 2.0,
         },
@@ -214,8 +216,10 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
     first_result = summary["results"][0]
     assert first_result["episode_index"] == 0
     assert 0 <= first_result["score"] <= 1
+    assert first_result["data_quality_score"] == first_result["score"]
+    assert first_result["task_success_score"] is None
     assert first_result["source"] == "auto"
-    assert "smoothness" in first_result["per_attribute_scores"]
+    assert "sudden_change" in first_result["per_attribute_scores"]
 
     stored = client.get(f"/api/projects/{project['id']}/cleaning")
 
@@ -393,3 +397,76 @@ def test_saved_vlm_api_key_is_used_when_cleaning_runs_without_key(tmp_path: Path
     first_result = response.json()["summary"]["results"][0]
     messages = [finding["message"] for finding in first_result["findings"]]
     assert "Set OPENAI_API_KEY or enter an API key to use OpenAI VLM scoring." not in messages
+
+
+def _parse_sse_events(text: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    for frame in text.split("\n\n"):
+        if not frame.strip():
+            continue
+        name = "message"
+        data_line = ""
+        for line in frame.split("\n"):
+            if line.startswith("event:"):
+                name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_line += line[len("data:"):].strip()
+        if data_line:
+            events.append((name, json.loads(data_line)))
+    return events
+
+
+def test_pipeline_stream_emits_progress_and_done_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    summary_calls = 0
+    original_summary = DatasetFilterService.summary
+
+    def counted_summary(self, *args, **kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        return original_summary(self, *args, **kwargs)
+
+    monkeypatch.setattr(DatasetFilterService, "summary", counted_summary)
+
+    response = client.post(
+        f"/api/projects/{project['id']}/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    progress_events = [data for name, data in events if name == "progress"]
+    cleaning_progress = [data for data in progress_events if data["phase"] == "cleaning"]
+    filters_progress = [data for data in progress_events if data["phase"] == "filters"]
+
+    assert cleaning_progress, "expected cleaning progress events"
+    assert filters_progress, "expected filters progress events"
+    assert cleaning_progress[0]["completed"] == 1
+    assert cleaning_progress[-1]["completed"] == cleaning_progress[-1]["total"] == 206
+    assert filters_progress[-1]["completed"] == filters_progress[-1]["total"] == 206 * 2
+    completed = [data["completed"] for data in cleaning_progress]
+    assert completed == sorted(completed)
+
+    done_events = [data for name, data in events if name == "done"]
+    assert len(done_events) == 1
+    payload = done_events[0]
+    assert payload["cleaning"]["status"] == "succeeded"
+    assert payload["cleaning"]["summary"]["total"] == 206
+    assert payload["filters"]["status"] == "succeeded"
+    assert payload["filters"]["summary"]["total_episodes"] == 206
+    assert summary_calls == 1
+
+
+def test_pipeline_stream_returns_404_for_unknown_project(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+
+    response = client.post(
+        "/api/projects/does-not-exist/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    assert response.status_code == 404

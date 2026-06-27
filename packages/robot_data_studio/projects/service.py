@@ -21,7 +21,11 @@ from robot_data_studio.quality import (
     FilterSummary,
     VlmSettings,
 )
-from robot_data_studio.quality.filter_service import DatasetFilterService, infer_gripper_indices
+from robot_data_studio.quality.filter_service import (
+    DatasetFilterService,
+    ProgressCallback,
+    infer_gripper_indices,
+)
 from robot_data_studio.quality.models import utc_now
 from robot_data_studio.quality.store import CleaningStateStore, VlmSettingsStore, build_summary
 
@@ -92,9 +96,22 @@ class ProjectService:
         reader = self.reader(project_id)
         episodes = reader.list_episodes()
         existing = self._cleaning_store(project_id).load()
-        if existing is not None:
+        if existing is not None and existing.scorer_version == self._scorer.scorer_version:
             return existing
-        return build_summary(episodes, [], CleaningConfig())
+        summary = build_summary(
+            episodes,
+            [],
+            CleaningConfig(),
+            self._scorer.scorer_version,
+        )
+        if existing is not None:
+            return summary.model_copy(
+                update={
+                    "requires_rerun": True,
+                    "previous_scorer_version": existing.scorer_version,
+                }
+            )
+        return summary
 
     def vlm_settings(self, project_id: str) -> VlmSettings:
         self.project(project_id)
@@ -107,7 +124,13 @@ class ProjectService:
             settings = settings.model_copy(update={"api_key": existing.api_key})
         return self._vlm_settings_store(project_id).save(settings)
 
-    def run_cleaning(self, project_id: str, config: CleaningConfig) -> CleaningRun:
+    def run_cleaning(
+        self,
+        project_id: str,
+        config: CleaningConfig,
+        on_progress: ProgressCallback | None = None,
+        filter_summary: FilterSummary | None = None,
+    ) -> CleaningRun:
         episode_indexes = getattr(config, "episode_indexes", None)
         scoring_config = CleaningConfig.model_validate(
             config.model_dump(exclude={"episode_indexes"})
@@ -133,15 +156,48 @@ class ProjectService:
             for result in (previous.results if previous else [])
             if result.source == "manual"
         }
-        results = self._scorer.score_dataset(reader, scoring_config, episode_indexes)
+        if filter_summary is None:
+            filter_summary = self.run_filters(project_id).summary
+        results = self._scorer.score_dataset(
+            reader,
+            scoring_config,
+            episode_indexes,
+            on_progress=on_progress,
+            filter_summary=filter_summary,
+        )
         if not config.overwrite_manual:
             results = [
-                previous_manual.get(result.episode_index, result)
+                result.model_copy(
+                    update={
+                        "status": previous_manual[result.episode_index].status,
+                        "source": "manual",
+                        "review_note": previous_manual[result.episode_index].review_note,
+                        "updated_at": previous_manual[result.episode_index].updated_at,
+                    }
+                )
+                if result.episode_index in previous_manual
+                else result
                 for result in results
             ]
         summary = build_summary(episodes, results, scoring_config, self._scorer.scorer_version)
         self._cleaning_store(project_id).save(summary)
         return CleaningRun(run_id=uuid4().hex[:12], status="succeeded", summary=summary)
+
+    def run_pipeline(
+        self,
+        project_id: str,
+        config: CleaningConfig,
+        cleaning_progress: ProgressCallback | None = None,
+        filters_progress: ProgressCallback | None = None,
+    ) -> tuple[CleaningRun, FilterRun]:
+        filters = self.run_filters(project_id, on_progress=filters_progress)
+        cleaning = self.run_cleaning(
+            project_id,
+            config,
+            on_progress=cleaning_progress,
+            filter_summary=filters.summary,
+        )
+        return cleaning, filters
 
     def update_episode_decision(
         self,
@@ -172,9 +228,11 @@ class ProjectService:
         self._cleaning_store(project_id).save(new_summary)
         return updated
 
-    def run_filters(self, project_id: str) -> FilterRun:
+    def run_filters(
+        self, project_id: str, on_progress: ProgressCallback | None = None
+    ) -> FilterRun:
         self.project(project_id)
-        result = self._filter_service(project_id).run()
+        result = self._filter_service(project_id).run(on_progress=on_progress)
         self._filter_summary_store(project_id).write_text(
             result.summary.model_dump_json(indent=2),
             encoding="utf-8",

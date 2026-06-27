@@ -18,13 +18,23 @@ class LeRobotDatasetReader:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).expanduser().resolve()
         self.probe(self.root)
-        self._info = json.loads((self.root / "meta" / "info.json").read_text())
+        self._meta_root = self._metadata_root(self.root)
+        self._info = json.loads((self._meta_root / "info.json").read_text())
         self._version = str(self._info.get("codebase_version", ""))
+
+    @staticmethod
+    def _metadata_root(root: Path) -> Path:
+        nested = root / "meta"
+        if (nested / "info.json").is_file():
+            return nested
+        if (root / "info.json").is_file():
+            return root
+        return nested
 
     @classmethod
     def probe(cls, root: str | Path) -> DatasetProbe:
         root_path = Path(root).expanduser().resolve()
-        info_path = root_path / "meta" / "info.json"
+        info_path = cls._metadata_root(root_path) / "info.json"
         if not info_path.is_file():
             raise NotLeRobotDataset(f"Missing LeRobot metadata: {info_path}")
         try:
@@ -60,7 +70,7 @@ class LeRobotDatasetReader:
         return self._list_v3_episodes(limit)
 
     def _list_v3_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
-        files = sorted((self.root / "meta" / "episodes").glob("**/*.parquet"))
+        files = sorted((self._meta_root / "episodes").glob("**/*.parquet"))
         table = ds.dataset(files, format="parquet").to_table()
         if limit is not None:
             table = table.slice(0, limit)
@@ -99,7 +109,7 @@ class LeRobotDatasetReader:
         return summaries
 
     def _list_v2_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
-        episodes_path = self.root / "meta" / "episodes.jsonl"
+        episodes_path = self._meta_root / "episodes.jsonl"
         if not episodes_path.is_file():
             raise NotLeRobotDataset(f"Missing LeRobot v2 episodes metadata: {episodes_path}")
         rows = _read_jsonl(episodes_path)
@@ -142,7 +152,7 @@ class LeRobotDatasetReader:
         return summaries
 
     def _v2_subtasks_by_episode(self) -> dict[int, list[EpisodeSubtask]]:
-        annotations_path = self.root / "meta" / "annotations.json"
+        annotations_path = self._meta_root / "annotations.json"
         if not annotations_path.is_file():
             return {}
         try:
