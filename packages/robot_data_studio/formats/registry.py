@@ -13,6 +13,7 @@ from robot_data_studio.formats.hdf5 import (
 from robot_data_studio.formats.models import DatasetAdapter, ExportResult, FormatInfo, conversion_report
 from robot_data_studio.formats.umi_zarr import UMIZarrDatasetAdapter, write_umi_zarr
 from robot_data_studio.lerobot.reader import LeRobotDatasetReader
+from robot_data_studio.quality.metadata_completeness import build_metadata_inspection_report
 
 
 class UnsupportedDatasetFormat(ValueError):
@@ -110,6 +111,7 @@ class FormatRegistry:
             output_path=output_path,
             field_mapping=mapping,
             backend=backend,
+            metadata_completeness=build_metadata_inspection_report(adapter),
         )
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return ExportResult(

@@ -11,23 +11,28 @@ DecisionSource = Literal["auto", "manual"]
 FindingSeverity = Literal["info", "warn", "error", "critical"]
 VlmProvider = Literal["OpenAI", "Gemini", "Local"]
 FilterStageId = Literal[
+    "visual_quality",
     "sudden_change",
     "state_action_alignment",
     "extreme_value",
     "kinematic_consistency",
     "orientation_alignment",
+    "metadata_completeness",
 ]
 
 
 DEFAULT_ENABLED_FILTER_STAGES: list[FilterStageId] = [
+    "visual_quality",
     "sudden_change",
     "state_action_alignment",
     "extreme_value",
     "kinematic_consistency",
     "orientation_alignment",
+    "metadata_completeness",
 ]
 
 DEFAULT_QUALITY_WEIGHTS: dict[str, float] = {
+    "visual_quality": 1.5,
     "sudden_change": 1.5,
     "state_action_alignment": 1.5,
     "extreme_value": 2.0,

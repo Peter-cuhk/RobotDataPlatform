@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 
 import {
   createRecording,
@@ -26,6 +26,8 @@ import {
   type FilterSummary,
   type FormatInfo,
   type Project,
+  type VisualQualityIncident,
+  type VisualQualityMetricSample,
   type VlmSettings,
 } from "./api";
 import { languageStorageKey, readStoredLanguage, translations, type Language, type Translation } from "./i18n";
@@ -51,20 +53,29 @@ const minQualityPanelWidth = 220;
 const maxQualityPanelWidth = 520;
 
 const filterStageIds: FilterStageId[] = [
+  "visual_quality",
   "sudden_change",
   "state_action_alignment",
   "extreme_value",
   "kinematic_consistency",
   "orientation_alignment",
+  "metadata_completeness",
 ];
 
-const defaultSidebarFilterCodes = [
-  "blur",
-  "time_sync",
-  "action_jump",
+const defaultEnabledFilterStages: FilterStageId[] = [
+  "visual_quality",
   "sudden_change",
   "state_action_alignment",
   "extreme_value",
+  "metadata_completeness",
+];
+
+const defaultSidebarFilterCodes = [
+  "visual_quality",
+  "sudden_change",
+  "state_action_alignment",
+  "extreme_value",
+  "metadata_completeness",
 ];
 
 function hasOnlyDefaultSidebarFilters(filters: string[]) {
@@ -75,11 +86,13 @@ function hasOnlyDefaultSidebarFilters(filters: string[]) {
 }
 
 const defaultQualityWeights: Record<string, number> = {
-  sudden_change: 1,
-  state_action_alignment: 1,
-  extreme_value: 1,
-  kinematic_consistency: 1,
+  visual_quality: 1.5,
+  sudden_change: 1.5,
+  state_action_alignment: 1.5,
+  extreme_value: 2,
+  kinematic_consistency: 2,
   orientation_alignment: 1,
+  metadata_completeness: 1,
   task_success: 2,
 };
 
@@ -91,23 +104,32 @@ function clampPanelWidth(width: number) {
   return Math.min(maxQualityPanelWidth, Math.max(minQualityPanelWidth, width));
 }
 
-function findingFilters(copy: Translation) {
-  return [
-    { code: "blur", label: copy.filters.blur },
-    { code: "time_sync", label: copy.filters.timeSync },
-    { code: "action_jump", label: copy.filters.actionJump },
-    { code: "vlm_failed", label: copy.filters.vlmFailed },
-  ] as const;
+function findingFilters(_copy: Translation) {
+  return [] as Array<{ code: string; label: string }>;
 }
 
-function dataFilters(copy: Translation): Array<{ id: FilterStageId; label: string; code: string }> {
+type QualityRuleId = FilterStageId | "task_success";
+
+function dataFilters(copy: Translation): Array<{ id: QualityRuleId; stageId?: FilterStageId; label: string; code: string }> {
   return [
-    { id: "sudden_change", label: copy.filters.suddenChange, code: "sudden_change" },
-    { id: "state_action_alignment", label: copy.filters.stateActionAlignment, code: "state_action_alignment" },
-    { id: "extreme_value", label: copy.filters.extremeValue, code: "extreme_value" },
-    { id: "kinematic_consistency", label: copy.filters.kinematicConsistency, code: "kinematic_consistency" },
-    { id: "orientation_alignment", label: copy.filters.orientationAlignment, code: "orientation_alignment" },
+    { id: "visual_quality", stageId: "visual_quality", label: copy.filters.visualQuality, code: "visual_quality" },
+    { id: "sudden_change", stageId: "sudden_change", label: copy.filters.suddenChange, code: "sudden_change" },
+    { id: "state_action_alignment", stageId: "state_action_alignment", label: copy.filters.stateActionAlignment, code: "state_action_alignment" },
+    { id: "extreme_value", stageId: "extreme_value", label: copy.filters.extremeValue, code: "extreme_value" },
+    { id: "metadata_completeness", stageId: "metadata_completeness", label: copy.filters.metadataCompleteness, code: "metadata_completeness" },
+    { id: "kinematic_consistency", stageId: "kinematic_consistency", label: copy.filters.kinematicConsistency, code: "kinematic_consistency" },
+    { id: "task_success", label: copy.filters.taskVlmValidity, code: "vlm_failed" },
+    { id: "orientation_alignment", stageId: "orientation_alignment", label: copy.filters.orientationAlignment, code: "orientation_alignment" },
   ];
+}
+
+function isKinematicsConfigured(config: FilterConfig["kinematics"] | null | undefined) {
+  return Boolean(
+    config?.urdf_path &&
+    config.end_effector_link &&
+    config.joint_names.length > 0 &&
+    config.eef_position_indices.length > 0,
+  );
 }
 
 function episodeLabel(index: number) {
@@ -208,8 +230,9 @@ export default function App() {
   const [activeFilterStage, setActiveFilterStage] = useState<FilterStageId | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFindingFilters, setActiveFindingFilters] = useState<string[]>([]);
-  const [enabledFilterStages, setEnabledFilterStages] = useState<FilterStageId[]>(() => [...filterStageIds]);
+  const [enabledFilterStages, setEnabledFilterStages] = useState<FilterStageId[]>(() => [...defaultEnabledFilterStages]);
   const [qualityWeights, setQualityWeights] = useState<Record<string, number>>(() => ({ ...defaultQualityWeights }));
+  const [kinematicsConfigured, setKinematicsConfigured] = useState(false);
   const [showVlmSettings, setShowVlmSettings] = useState(false);
   const [vlmSettingsDirty, setVlmSettingsDirty] = useState(false);
   const [vlmSettings, setVlmSettings] = useState<VlmSettings>({
@@ -244,9 +267,13 @@ export default function App() {
       setCleaningSummary(null);
       setFilterSummary(null);
       setActiveFilterStage(null);
-      setActiveFindingFilters([...defaultSidebarFilterCodes]);
-      setEnabledFilterStages([...filterStageIds]);
+      setActiveFindingFilters([
+        ...defaultSidebarFilterCodes,
+        ...(vlmSettings.enabled ? ["vlm_failed"] : []),
+      ]);
+      setEnabledFilterStages([...defaultEnabledFilterStages]);
       setQualityWeights({ ...defaultQualityWeights });
+      setKinematicsConfigured(false);
     },
   });
   const episodesQuery = useQuery({
@@ -257,7 +284,7 @@ export default function App() {
   const cleaningMutation = useMutation({
     mutationFn: async (episodeIndexes?: number[]) => {
       const activeQualityWeights = Object.fromEntries(
-        filterStageIds.map((stageId) => [stageId, qualityWeights[stageId] ?? 1]),
+        enabledFilterStages.map((stageId) => [stageId, qualityWeights[stageId] ?? 1]),
       );
       if (vlmSettings.enabled) {
         activeQualityWeights.task_success = qualityWeights.task_success ?? 2;
@@ -274,11 +301,12 @@ export default function App() {
     },
     onMutate: () => setCleaningProgress(0),
     onSuccess: ({ cleaning, filters }) => {
+      const nextSelected = pickEpisodeAfterCleaning(cleaning.summary);
       setCleaningSummary(cleaning.summary);
       setFilterSummary(filters.summary);
-      setSelected(pickEpisodeAfterCleaning(cleaning.summary));
+      setSelected(nextSelected);
       setRecordingUrl(null);
-      setReplayReady(false);
+      setReplayReady(nextSelected !== null);
       setExportedResult(null);
       setCleaningProgress(0);
     },
@@ -303,7 +331,15 @@ export default function App() {
   });
   const filterConfigMutation = useMutation({
     mutationFn: (config: Partial<FilterConfig>) => saveFilterConfig(project!.id, config),
-    onSuccess: () => filterDetailQuery.refetch(),
+    onSuccess: (config) => {
+      const configured = isKinematicsConfigured(config.kinematics);
+      setKinematicsConfigured(configured);
+      setEnabledFilterStages((current) => {
+        const withoutKinematics = current.filter((stageId) => stageId !== "kinematic_consistency");
+        return configured ? [...withoutKinematics, "kinematic_consistency"] : withoutKinematics;
+      });
+      filterDetailQuery.refetch();
+    },
   });
   const exportMutation = useMutation({
     mutationFn: () => {
@@ -399,12 +435,44 @@ export default function App() {
     });
     setExportedResult(null);
   };
+  const toggleCheckedEpisodes = (episodeIndexes: number[]) => {
+    if (episodeIndexes.length === 0) return;
+    setCheckedEpisodeIndexes((current) => {
+      const next = new Set(current);
+      const allSelected = episodeIndexes.every((episodeIndex) => next.has(episodeIndex));
+      for (const episodeIndex of episodeIndexes) {
+        if (allSelected) {
+          next.delete(episodeIndex);
+        } else {
+          next.add(episodeIndex);
+        }
+      }
+      return next;
+    });
+    setExportedResult(null);
+  };
   const updateVlmSettings = (nextSettings: VlmSettings) => {
     setVlmSettingsDirty(true);
     setVlmSettings(nextSettings);
+    setActiveFindingFilters((current) => {
+      const withoutVlm = current.filter((filter) => filter !== "vlm_failed");
+      return nextSettings.enabled ? [...withoutVlm, "vlm_failed"] : withoutVlm;
+    });
     if (project) {
       vlmSettingsMutation.mutate(nextSettings);
     }
+  };
+  const toggleFilterStage = (stageId: FilterStageId) => {
+    setEnabledFilterStages((current) =>
+      current.includes(stageId)
+        ? current.filter((item) => item !== stageId)
+        : [...current, stageId],
+    );
+    setActiveFindingFilters((current) =>
+      current.includes(stageId)
+        ? current.filter((item) => item !== stageId)
+        : [...current, stageId],
+    );
   };
   const selectEpisode = (episodeIndex: number) => {
     setSelected(episodeIndex);
@@ -414,7 +482,8 @@ export default function App() {
     setReplayReady(true);
   };
   const buildReplay = (episodeIndex: number) => {
-    setReplayReady(false);
+    setRecordingUrl(null);
+    setReplayReady(true);
     recordingMutation.mutate(episodeIndex);
   };
   const replayEpisode = (episodeIndex: number) => {
@@ -547,6 +616,8 @@ export default function App() {
                   filterSummary={filterSummary}
                   activeFilterStage={activeFilterStage}
                   enabledFilterStages={enabledFilterStages}
+                  taskSuccessEnabled={vlmSettings.enabled}
+                  kinematicsConfigured={kinematicsConfigured}
                   weights={qualityWeights}
                   onSearchChange={setSearchQuery}
                   onToggleFindingFilter={(code) =>
@@ -556,6 +627,7 @@ export default function App() {
                         : [...filters, code],
                     )
                   }
+                  onToggleFilterStage={toggleFilterStage}
                   onOpenFilter={(stageId) => {
                     setActiveFilterStage(stageId);
                     setRecordingUrl(null);
@@ -563,6 +635,7 @@ export default function App() {
                   }}
                   onWeightChange={updateRuleWeight}
                   onToggleChecked={toggleCheckedEpisode}
+                  onToggleGroupChecked={toggleCheckedEpisodes}
                   onSelect={(episodeIndex) => selectEpisode(episodeIndex)}
                 />
               </div>
@@ -636,6 +709,7 @@ export default function App() {
                 {activeFilterStage ? (
                   <FilterDetailView
                     copy={copy}
+                    projectId={project.id}
                     detail={selectedFilterDetail}
                     pending={filterDetailQuery.isLoading}
                     error={filterDetailQuery.error}
@@ -719,6 +793,7 @@ export default function App() {
               filterDetail={activeFilterStage ? selectedFilterDetail : null}
               filterPending={filterDetailQuery.isLoading || urdfUploadMutation.isPending || filterConfigMutation.isPending}
               pending={decisionMutation.isPending}
+              requiresRerun={Boolean(cleaningSummary?.requires_rerun)}
               onDecision={(status) => {
                 if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
               }}
@@ -907,12 +982,16 @@ function EpisodeNavigation({
   filterSummary,
   activeFilterStage,
   enabledFilterStages,
+  taskSuccessEnabled,
+  kinematicsConfigured,
   weights,
   onSearchChange,
   onToggleFindingFilter,
+  onToggleFilterStage,
   onOpenFilter,
   onWeightChange,
   onToggleChecked,
+  onToggleGroupChecked,
   onSelect,
 }: {
   copy: Translation;
@@ -926,12 +1005,16 @@ function EpisodeNavigation({
   filterSummary: FilterSummary | null;
   activeFilterStage: FilterStageId | null;
   enabledFilterStages: FilterStageId[];
+  taskSuccessEnabled: boolean;
+  kinematicsConfigured: boolean;
   weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
+  onToggleFilterStage: (stageId: FilterStageId) => void;
   onOpenFilter: (stageId: FilterStageId) => void;
   onWeightChange: (key: string, value: number) => void;
   onToggleChecked: (episodeIndex: number) => void;
+  onToggleGroupChecked: (episodeIndexes: number[]) => void;
   onSelect: (episodeIndex: number) => void;
 }) {
   const [collapsedStatusFolders, setCollapsedStatusFolders] = useState<CleaningStatus[]>([]);
@@ -945,9 +1028,12 @@ function EpisodeNavigation({
           filterSummary={filterSummary}
           activeFilterStage={activeFilterStage}
           enabledFilterStages={enabledFilterStages}
+          taskSuccessEnabled={taskSuccessEnabled}
+          kinematicsConfigured={kinematicsConfigured}
           weights={weights}
           onSearchChange={onSearchChange}
           onToggleFindingFilter={onToggleFindingFilter}
+          onToggleFilterStage={onToggleFilterStage}
           onOpenFilter={onOpenFilter}
           onWeightChange={onWeightChange}
         />
@@ -988,9 +1074,12 @@ function EpisodeNavigation({
         filterSummary={filterSummary}
         activeFilterStage={activeFilterStage}
         enabledFilterStages={enabledFilterStages}
+        taskSuccessEnabled={taskSuccessEnabled}
+        kinematicsConfigured={kinematicsConfigured}
         weights={weights}
         onSearchChange={onSearchChange}
         onToggleFindingFilter={onToggleFindingFilter}
+        onToggleFilterStage={onToggleFilterStage}
         onOpenFilter={onOpenFilter}
         onWeightChange={onWeightChange}
       />
@@ -1011,6 +1100,7 @@ function EpisodeNavigation({
             )
           }
           onToggleChecked={onToggleChecked}
+          onToggleGroupChecked={onToggleGroupChecked}
           onSelect={onSelect}
         />
       ))}
@@ -1027,6 +1117,7 @@ function StatusEpisodeFolder({
   collapsed,
   onToggleCollapsed,
   onToggleChecked,
+  onToggleGroupChecked,
   onSelect,
 }: {
   group: { status: CleaningStatus; label: string; episodes: Episode[] };
@@ -1037,8 +1128,13 @@ function StatusEpisodeFolder({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onToggleChecked: (episodeIndex: number) => void;
+  onToggleGroupChecked: (episodeIndexes: number[]) => void;
   onSelect: (episodeIndex: number) => void;
 }) {
+  const episodeIndexes = group.episodes.map((episode) => episode.episode_index);
+  const checkedCount = episodeIndexes.filter((episodeIndex) => checkedEpisodeIndexes.has(episodeIndex)).length;
+  const allChecked = episodeIndexes.length > 0 && checkedCount === episodeIndexes.length;
+  const partiallyChecked = checkedCount > 0 && !allChecked;
   return (
     <section className="episode-folder">
       <div className="folder-heading">
@@ -1052,7 +1148,16 @@ function StatusEpisodeFolder({
           <span aria-hidden="true">▸</span>
           <strong>{group.label}</strong>
         </button>
-        <small>{group.episodes.length}</small>
+        <div className="folder-actions">
+          <FolderSelectionCheckbox
+            label={group.label}
+            checked={allChecked}
+            indeterminate={partiallyChecked}
+            disabled={episodeIndexes.length === 0}
+            onChange={() => onToggleGroupChecked(episodeIndexes)}
+          />
+          <small>{group.episodes.length}</small>
+        </div>
       </div>
       {collapsed
         ? null
@@ -1072,6 +1177,39 @@ function StatusEpisodeFolder({
   );
 }
 
+function FolderSelectionCheckbox({
+  label,
+  checked,
+  indeterminate,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  indeterminate: boolean;
+  disabled: boolean;
+  onChange: () => void;
+}) {
+  const checkboxRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (checkboxRef.current) {
+      checkboxRef.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+  return (
+    <label className="folder-check">
+      <input
+        ref={checkboxRef}
+        type="checkbox"
+        aria-label={`${checked ? "Clear all" : "Select all"} visible ${label} episodes for export`}
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+      />
+    </label>
+  );
+}
+
 function episodeMatchesFilters(
   episode: Episode,
   quality: EpisodeQualityResult | undefined,
@@ -1080,6 +1218,7 @@ function episodeMatchesFilters(
   filterSummary: FilterSummary | null,
 ) {
   if (!episodeMatchesSearchQuery(episode, query)) return false;
+  if (hasOnlyDefaultSidebarFilters(activeFilters)) return true;
   if (activeFilters.length === 0 || (!quality && !filterSummary)) return true;
   return activeFilters.every((filter) => {
     if (isFilterStageId(filter)) {
@@ -1111,9 +1250,12 @@ function SidebarFilters({
   filterSummary,
   activeFilterStage,
   enabledFilterStages,
+  taskSuccessEnabled,
+  kinematicsConfigured,
   weights,
   onSearchChange,
   onToggleFindingFilter,
+  onToggleFilterStage,
   onOpenFilter,
   onWeightChange,
 }: {
@@ -1123,14 +1265,17 @@ function SidebarFilters({
   filterSummary: FilterSummary | null;
   activeFilterStage: FilterStageId | null;
   enabledFilterStages: FilterStageId[];
+  taskSuccessEnabled: boolean;
+  kinematicsConfigured: boolean;
   weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
+  onToggleFilterStage: (stageId: FilterStageId) => void;
   onOpenFilter: (stageId: FilterStageId) => void;
   onWeightChange: (key: string, value: number) => void;
 }) {
   const counts = new Map((filterSummary?.stages ?? []).map((stage) => [stage.id, stage]));
-  const [expandedWeightStage, setExpandedWeightStage] = useState<FilterStageId | null>(null);
+  const [expandedWeightStage, setExpandedWeightStage] = useState<QualityRuleId | null>(null);
   return (
     <div className="sidebar-tools">
       <label className="search-box">
@@ -1155,10 +1300,29 @@ function SidebarFilters({
           </label>
         ))}
         {dataFilters(copy).map((filter) => {
-          const stage = counts.get(filter.id);
-          const badge = stage?.skipped_reason ? copy.filters.notConfigured : String(stage?.count ?? 0);
+          const stage = filter.stageId ? counts.get(filter.stageId) : undefined;
+          const configured =
+            filter.id === "kinematic_consistency"
+              ? kinematicsConfigured
+              : filter.id === "orientation_alignment"
+              ? false
+              : filter.id === "task_success"
+              ? taskSuccessEnabled
+              : true;
+          const checked =
+            filter.id === "task_success"
+              ? taskSuccessEnabled
+              : filter.stageId
+              ? enabledFilterStages.includes(filter.stageId)
+              : false;
+          const badge =
+            !configured && (filter.id === "task_success" || filter.id === "kinematic_consistency" || filter.id === "orientation_alignment")
+              ? copy.filters.notConfigured
+              : stage?.skipped_reason
+              ? copy.filters.notConfigured
+              : String(stage?.count ?? 0);
           const weight = weights[filter.id] ?? 1;
-          const weightEnabled = enabledFilterStages.includes(filter.id);
+          const weightEnabled = checked && configured;
           const expanded = expandedWeightStage === filter.id;
           return (
             <div className={`filter-row ${activeFilterStage === filter.id ? "active" : ""}`} key={filter.id}>
@@ -1167,10 +1331,20 @@ function SidebarFilters({
                   <input
                     type="checkbox"
                     aria-label={filter.label}
-                    checked={activeFindingFilters.includes(filter.code)}
-                    onChange={() => onToggleFindingFilter(filter.code)}
+                    checked={checked}
+                    disabled={!configured}
+                    onChange={() => {
+                      if (filter.stageId) onToggleFilterStage(filter.stageId);
+                    }}
                   />
-                  <button type="button" className="filter-link" onClick={() => onOpenFilter(filter.id)}>
+                  <button
+                    type="button"
+                    className="filter-link"
+                    disabled={!filter.stageId}
+                    onClick={() => {
+                      if (filter.stageId) onOpenFilter(filter.stageId);
+                    }}
+                  >
                     {filter.label}
                   </button>
                 </label>
@@ -1253,6 +1427,7 @@ function EpisodeRow({
 
 function FilterDetailView({
   copy,
+  projectId,
   detail,
   pending,
   error,
@@ -1261,6 +1436,7 @@ function FilterDetailView({
   configSaving,
 }: {
   copy: Translation;
+  projectId: string;
   detail: FilterDetail | null;
   pending: boolean;
   error: Error | null;
@@ -1297,14 +1473,357 @@ function FilterDetailView({
           saving={configSaving}
         />
       )}
-      {detail.stage_id === "orientation_alignment" ? (
+      {detail.stage_id === "visual_quality" && detail.visual_quality ? (
+        <VisualQualityPanel copy={copy} projectId={projectId} detail={detail} />
+      ) : detail.stage_id === "orientation_alignment" ? (
         <OrientationPanel detail={detail} />
+      ) : detail.stage_id === "metadata_completeness" ? (
+        <MetadataCompletenessPanel copy={copy} detail={detail} />
       ) : (
-        <SignalChart detail={detail} />
+        <>
+          <SignalChart detail={detail} />
+          <FilterRows copy={copy} detail={detail} />
+        </>
       )}
-      <FilterRows copy={copy} detail={detail} />
     </div>
   );
+}
+
+function VisualQualityPanel({
+  copy,
+  projectId,
+  detail,
+}: {
+  copy: Translation;
+  projectId: string;
+  detail: FilterDetail;
+}) {
+  const evidence = detail.visual_quality!;
+  const [camera, setCamera] = useState("all");
+  const [issue, setIssue] = useState("all");
+  const [metricsOpen, setMetricsOpen] = useState(false);
+  const [preview, setPreview] = useState<{ url: string; alt: string; frame: number } | null>(null);
+  const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
+  const cameras = [...new Set(evidence.incidents.map((incident) => incident.camera))].sort();
+  const issues = [...new Set(evidence.incidents.map((incident) => incident.issue))].sort();
+  const incidents = evidence.incidents.filter(
+    (incident) =>
+      (camera === "all" || incident.camera === camera)
+      && (issue === "all" || incident.issue === issue),
+  );
+  const issueRate = evidence.sampled_frame_count
+    ? ((evidence.issue_sample_count / evidence.sampled_frame_count) * 100).toFixed(1)
+    : "0.0";
+  const summary = detail.status === "skipped"
+    ? copy.filterDetail.visualSystemIssue
+    : detail.status === "passed" && evidence.issue_sample_count
+      ? copy.filterDetail.visualPassWithIssues(evidence.issue_sample_count)
+      : detail.status === "review"
+        ? copy.filterDetail.visualReviewSummary(evidence.issue_sample_count)
+        : copy.filterDetail.visualClean;
+  const systemIssues = detail.table_rows.filter((row) =>
+    ["video_missing", "decode_failed"].includes(String(row.issue ?? "")),
+  );
+
+  return (
+    <div className="visual-quality-panel">
+      <section className={`visual-quality-summary ${detail.status}`}>
+        <div>
+          <span className="eyebrow">{copy.filterDetail.visualEvidence}</span>
+          <strong>{summary}</strong>
+        </div>
+        <div className="visual-quality-metrics">
+          <div><b>{copy.filterDetail.visualIssueIntervals(evidence.incidents.length)}</b><small>{copy.filterDetail.visualTimeline}</small></div>
+          <div><b>{copy.filterDetail.visualAffectedCameras(evidence.affected_camera_count, evidence.camera_count)}</b><small>{copy.filterDetail.visualCamera}</small></div>
+          <div><b>{copy.filterDetail.visualSampledFrames(evidence.sampled_frame_count)}</b><small>{evidence.episode_frame_count} total</small></div>
+          <div><b>{copy.filterDetail.visualFlaggedRate(issueRate)}</b><small>{evidence.issue_sample_count} flagged</small></div>
+        </div>
+      </section>
+
+      {evidence.incidents.length > 0 && (
+        <section className="visual-issue-timeline" aria-label={copy.filterDetail.visualTimeline}>
+          <div className="visual-section-heading">
+            <strong>{copy.filterDetail.visualTimeline}</strong>
+            <small>0–{formatSeconds(evidence.episode_duration_seconds)}</small>
+          </div>
+          <div className="visual-timeline-track">
+            {evidence.incidents.map((incident) => {
+              const duration = Math.max(evidence.episode_duration_seconds, 0.001);
+              const left = Math.min(100, Math.max(0, incident.start_timestamp / duration * 100));
+              const width = Math.max(
+                0.8,
+                (incident.end_timestamp - incident.start_timestamp) / duration * 100,
+              );
+              return (
+                <button
+                  key={incident.id}
+                  type="button"
+                  className={`visual-timeline-marker issue-${incident.issue}`}
+                  style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}
+                  title={`${visualIssueLabel(copy, incident.issue)} · ${formatSeconds(incident.start_timestamp)}`}
+                  aria-label={`${visualIssueLabel(copy, incident.issue)} ${formatSeconds(incident.start_timestamp)}`}
+                  onClick={() => document
+                    .getElementById(`visual-incident-${safeDomId(incident.id)}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "nearest" })}
+                />
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {evidence.incidents.length > 0 && (
+        <div className="visual-evidence-toolbar">
+          <label>
+            <span>{copy.filterDetail.visualCamera}</span>
+            <select value={camera} onChange={(event) => setCamera(event.target.value)}>
+              <option value="all">{copy.filterDetail.visualAllCameras}</option>
+              {cameras.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>{copy.filterDetail.visualIssueType}</span>
+            <select value={issue} onChange={(event) => setIssue(event.target.value)}>
+              <option value="all">{copy.filterDetail.visualAllIssues}</option>
+              {issues.map((name) => (
+                <option key={name} value={name}>{visualIssueLabel(copy, name)}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+
+      {systemIssues.map((row, index) => (
+        <div className="visual-system-issue" key={`${String(row.camera)}-${index}`}>
+          <strong>{copy.filterDetail.visualSystemIssue}</strong>
+          <span>{String(row.camera ?? "-")} · {visualIssueLabel(copy, String(row.issue ?? ""))}</span>
+        </div>
+      ))}
+
+      {evidence.incidents.length === 0 && systemIssues.length === 0 ? (
+        <div className="visual-clean-state">
+          <strong>{copy.filterDetail.visualClean}</strong>
+          <span>{copy.filterDetail.visualSampledFrames(evidence.sampled_frame_count)} · {evidence.camera_count} cameras</span>
+        </div>
+      ) : evidence.incidents.length > 0 ? (
+        <div className="visual-incident-grid">
+          {incidents.map((incident) => (
+            <VisualIncidentCard
+              key={incident.id}
+              copy={copy}
+              projectId={projectId}
+              episodeIndex={detail.episode_index}
+              incident={incident}
+              failedImages={failedImages}
+              onImageError={(url) => setFailedImages((current) => new Set(current).add(url))}
+              onPreview={setPreview}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {Object.keys(evidence.metrics).length > 0 && <section className="visual-metrics-disclosure">
+        <button
+          type="button"
+          aria-label={copy.filterDetail.visualMetrics}
+          aria-expanded={metricsOpen}
+          onClick={() => setMetricsOpen((open) => !open)}
+        >
+          <span>{copy.filterDetail.visualMetrics}</span>
+          <span>{metricsOpen ? "−" : "+"}</span>
+        </button>
+        {metricsOpen && <VisualMetricsCharts detail={detail} />}
+      </section>}
+
+      {preview && (
+        <div className="visual-lightbox" role="dialog" aria-modal="true" aria-label={preview.alt}>
+          <button type="button" onClick={() => setPreview(null)}>{copy.filterDetail.visualClosePreview}</button>
+          <img src={preview.url} alt={preview.alt} />
+          <strong>{copy.filterDetail.visualFrame} {preview.frame}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VisualIncidentCard({
+  copy,
+  projectId,
+  episodeIndex,
+  incident,
+  failedImages,
+  onImageError,
+  onPreview,
+}: {
+  copy: Translation;
+  projectId: string;
+  episodeIndex: number;
+  incident: VisualQualityIncident;
+  failedImages: Set<string>;
+  onImageError: (url: string) => void;
+  onPreview: (preview: { url: string; alt: string; frame: number }) => void;
+}) {
+  return (
+    <article
+      className={`visual-incident-card issue-${incident.issue}`}
+      id={`visual-incident-${safeDomId(incident.id)}`}
+    >
+      <header>
+        <div>
+          <span className="visual-issue-pill">{visualIssueLabel(copy, incident.issue)}</span>
+          <strong>{incident.camera}</strong>
+        </div>
+        <small>{incident.sample_count} {copy.filterDetail.visualSamples}</small>
+      </header>
+      <div className="visual-incident-range">
+        <b>
+          {incident.start_frame === incident.end_frame
+            ? `${copy.filterDetail.visualFrame} ${incident.start_frame}`
+            : `${copy.filterDetail.visualFrame} ${incident.start_frame}–${incident.end_frame}`}
+        </b>
+        <span>
+          {formatSeconds(incident.start_timestamp)}
+          {incident.end_timestamp > incident.start_timestamp
+            ? `–${formatSeconds(incident.end_timestamp)}`
+            : ""}
+        </span>
+      </div>
+      <div className="visual-evidence-strip">
+        {incident.representative_frames.map((frame) => {
+          const url = visualEvidenceUrl(projectId, episodeIndex, incident.camera, frame.frame, 640);
+          const alt = `${visualIssueLabel(copy, incident.issue)} evidence at frame ${frame.frame} from ${incident.camera}`;
+          return (
+            <button
+              type="button"
+              className="visual-evidence-image"
+              key={`${frame.frame}-${frame.timestamp}`}
+              onClick={() => onPreview({
+                url: visualEvidenceUrl(projectId, episodeIndex, incident.camera, frame.frame, 1600),
+                alt,
+                frame: frame.frame,
+              })}
+            >
+              {failedImages.has(url) ? (
+                <span>{copy.filterDetail.visualImageUnavailable}</span>
+              ) : (
+                <img src={url} alt={alt} onError={() => onImageError(url)} />
+              )}
+              <small>{copy.filterDetail.visualFrame} {frame.frame}</small>
+            </button>
+          );
+        })}
+      </div>
+      <footer>
+        <span>{copy.filterDetail.visualObserved}: <b>{String(incident.worst_value)}</b></span>
+        <span>{copy.filterDetail.visualThreshold}: <b>{String(incident.threshold)}</b></span>
+      </footer>
+    </article>
+  );
+}
+
+function VisualMetricsCharts({ detail }: { detail: FilterDetail }) {
+  const evidence = detail.visual_quality!;
+  const thresholds = detail.thresholds.visual_quality ?? {};
+  const definitions: Array<{
+    key: "sharpness" | "brightness" | "contrast";
+    thresholds: number[];
+  }> = [
+    { key: "sharpness", thresholds: [thresholds.blur_laplacian].filter(Number.isFinite) },
+    { key: "brightness", thresholds: [thresholds.dark_mean, thresholds.bright_mean].filter(Number.isFinite) },
+    { key: "contrast", thresholds: [thresholds.low_contrast_std].filter(Number.isFinite) },
+  ];
+  return (
+    <div className="visual-camera-charts">
+      {Object.entries(evidence.metrics).map(([camera, samples]) => (
+        <section key={camera}>
+          <strong>{camera}</strong>
+          <div className="visual-metric-grid">
+            {definitions.map((definition) => (
+              <VisualMetricChart
+                key={definition.key}
+                label={definition.key}
+                metric={definition.key}
+                samples={samples}
+                duration={evidence.episode_duration_seconds}
+                thresholds={definition.thresholds}
+              />
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function VisualMetricChart({
+  label,
+  metric,
+  samples,
+  duration,
+  thresholds,
+}: {
+  label: string;
+  metric: "sharpness" | "brightness" | "contrast";
+  samples: VisualQualityMetricSample[];
+  duration: number;
+  thresholds: number[];
+}) {
+  const values = samples
+    .map((sample) => sample[metric])
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  const domain = [...values, ...thresholds];
+  const min = Math.min(...domain, 0);
+  const max = Math.max(...domain, 1);
+  const span = Math.max(max - min, 1e-9);
+  const y = (value: number) => 108 - ((value - min) / span) * 92;
+  const points = samples
+    .filter((sample) => sample[metric] !== null)
+    .map((sample) => {
+      const x = 8 + sample.timestamp / Math.max(duration, 0.001) * 704;
+      return `${x.toFixed(1)},${y(sample[metric] as number).toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <div className="visual-metric-chart">
+      <span>{label}</span>
+      <svg viewBox="0 0 720 120" role="img" aria-label={`${label} over time`}>
+        <rect x="0" y="0" width="720" height="120" rx="8" />
+        {thresholds.map((threshold) => (
+          <line
+            className="visual-threshold-line"
+            key={threshold}
+            x1="0"
+            x2="720"
+            y1={y(threshold)}
+            y2={y(threshold)}
+          />
+        ))}
+        <polyline className="visual-metric-line" points={points} />
+      </svg>
+    </div>
+  );
+}
+
+function visualEvidenceUrl(
+  projectId: string,
+  episodeIndex: number,
+  camera: string,
+  frame: number,
+  width: number,
+) {
+  return `/api/projects/${projectId}/episodes/${episodeIndex}/visual-quality/frame?camera=${encodeURIComponent(camera)}&frame=${frame}&width=${width}`;
+}
+
+function visualIssueLabel(copy: Translation, issue: string) {
+  return copy.filterDetail.visualIssueLabels[issue] ?? issue;
+}
+
+function formatSeconds(value: number) {
+  return `${value.toFixed(value >= 10 ? 1 : 2)}s`;
+}
+
+function safeDomId(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-");
 }
 
 function KinematicConfigStrip({
@@ -1480,6 +1999,87 @@ function OrientationPanel({ detail }: { detail: FilterDetail }) {
   );
 }
 
+type MetadataInspectionRow = {
+  kind?: string;
+  check?: string;
+  scope?: string;
+  status?: string;
+  label?: string;
+  expected?: string;
+  value?: string;
+  detail?: string | null;
+};
+
+function metadataInspectionRows(detail: FilterDetail): MetadataInspectionRow[] {
+  return detail.table_rows.filter((row) => row.kind === "inspection") as MetadataInspectionRow[];
+}
+
+function metadataInspectionLabel(copy: Translation, row: MetadataInspectionRow) {
+  const check = String(row.check ?? "");
+  return copy.filterDetail.metadataChecks[check] ?? row.label ?? check;
+}
+
+function metadataInspectionStatus(copy: Translation, status: string | undefined) {
+  if (status === "warning") return copy.filterDetail.metadataStatusWarning;
+  if (status === "info") return copy.filterDetail.metadataStatusInfo;
+  return copy.filterDetail.metadataStatusPassed;
+}
+
+function MetadataCompletenessPanel({
+  copy,
+  detail,
+}: {
+  copy: Translation;
+  detail: FilterDetail;
+}) {
+  const rows = metadataInspectionRows(detail);
+  const summary = (detail.parameters.summary ?? {}) as {
+    passed?: number;
+    total_checks?: number;
+    warnings?: number;
+    infos?: number;
+  };
+  const passed = summary.passed ?? rows.filter((row) => row.status === "passed").length;
+  const total = summary.total_checks ?? rows.length;
+  const allPassed = detail.findings.length === 0;
+
+  return (
+    <div className="metadata-inspection-panel">
+      <div className="metadata-inspection-summary">
+        <strong>{copy.filterDetail.metadataSummary(passed, total)}</strong>
+        <small>{allPassed ? copy.filterDetail.metadataAllPassed : copy.quality.issuesFound(detail.findings.length)}</small>
+      </div>
+      <div className="metadata-inspection-table">
+        <div className="metadata-inspection-header">
+          <span>{copy.filterDetail.metadataCheck}</span>
+          <span>{copy.filterDetail.metadataScope}</span>
+          <span>{copy.filterDetail.metadataExpected}</span>
+          <span>{copy.filterDetail.metadataActual}</span>
+          <span>{copy.status.passed}</span>
+        </div>
+        {rows.map((row) => (
+          <div className="metadata-inspection-row" key={String(row.check)}>
+            <strong>{metadataInspectionLabel(copy, row)}</strong>
+            <span>
+              {row.scope === "dataset"
+                ? copy.filterDetail.metadataScopeDataset
+                : copy.filterDetail.metadataScopeEpisode}
+            </span>
+            <span>{String(row.expected ?? "-")}</span>
+            <span>
+              {String(row.value ?? "-")}
+              {row.detail ? <small>{`${copy.filterDetail.metadataDetail}: ${row.detail}`}</small> : null}
+            </span>
+            <span className={`inspection-status ${row.status ?? "passed"}`}>
+              {metadataInspectionStatus(copy, row.status)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function FilterRows({ copy, detail }: { copy: Translation; detail: FilterDetail }) {
   const rows = detail.table_rows.slice(0, 8);
   return (
@@ -1490,8 +2090,14 @@ function FilterRows({ copy, detail }: { copy: Translation; detail: FilterDetail 
         rows.map((row, index) => (
           <div key={index}>
             <span>frame {String(row.frame ?? "-")}</span>
-            <strong>{String(row.dimension ?? row.source ?? row.status ?? "-")}</strong>
-            <small>{Object.entries(row).slice(2, 5).map(([key, value]) => `${key}: ${String(value)}`).join(" · ")}</small>
+            <strong>{String(row.dimension ?? row.source ?? row.issue ?? row.status ?? row.camera ?? "-")}</strong>
+            <small>
+              {Object.entries(row)
+                .filter(([key]) => key !== "frame")
+                .slice(0, 4)
+                .map(([key, value]) => `${key}: ${String(value)}`)
+                .join(" · ")}
+            </small>
           </div>
         ))
       )}
@@ -1519,6 +2125,7 @@ function QualityReport({
   filterDetail,
   filterPending,
   pending,
+  requiresRerun,
   onDecision,
   onAddToPipeline,
 }: {
@@ -1527,6 +2134,7 @@ function QualityReport({
   filterDetail: FilterDetail | null;
   filterPending: boolean;
   pending: boolean;
+  requiresRerun: boolean;
   onDecision: (status: "passed" | "excluded") => void;
   onAddToPipeline: () => void;
 }) {
@@ -1545,11 +2153,33 @@ function QualityReport({
         </div>
       ) : (
         <div className="quality-body">
+          {requiresRerun && (
+            <div className="finding">
+              <strong>{copy.quality.rerunRequired}</strong>
+              <p>{copy.quality.rerunExplanation}</p>
+            </div>
+          )}
           <div className="quality-score">
             <span>{scoreLabel(quality.score, copy)}</span>
             <small>{statusLabel(quality.status, copy)}{copy.quality.sourceSeparator}{quality.source}</small>
           </div>
           <div className="score-list">
+            <div>
+              <span>{copy.quality.dataQuality}</span>
+              <strong>
+                {quality.data_quality_score === null
+                  ? copy.quality.notEvaluated
+                  : Math.round(quality.data_quality_score * 100)}
+              </strong>
+            </div>
+            <div>
+              <span>{copy.quality.taskSuccess}</span>
+              <strong>
+                {quality.task_success_score === null
+                  ? copy.quality.notEvaluated
+                  : Math.round(quality.task_success_score * 100)}
+              </strong>
+            </div>
             {Object.entries(quality.per_attribute_scores).map(([name, value]) => (
               <div key={name}>
                 <span>{name.replaceAll("_", " ")}</span>
@@ -1610,20 +2240,58 @@ function FilterReport({
             <span>{detail.status === "review" ? copy.status.review : detail.status === "passed" ? copy.status.passed : copy.status.skipped}</span>
             <small>{detail.title}</small>
           </div>
-          <div className="score-list">
-            {Object.entries(detail.parameters).map(([name, value]) => (
-              <div key={name}>
-                <span>{name.replaceAll("_", " ")}</span>
-                <strong>{Array.isArray(value) ? value.join(", ") || "-" : String(value ?? "-")}</strong>
+          {detail.stage_id === "metadata_completeness" ? (
+            <>
+              <div className="score-list">
+                {Object.entries((detail.parameters.summary ?? {}) as Record<string, number>).map(([name, value]) => (
+                  <div key={name}>
+                    <span>{name.replaceAll("_", " ")}</span>
+                    <strong>{String(value)}</strong>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-          <div className="finding-list">
-            <h3>{copy.quality.issuesFound(detail.findings.length)}</h3>
-            {detail.findings.map((finding) => (
-              <div className="finding" key={`${finding.code}-${finding.message}`}>{finding.message}</div>
-            ))}
-          </div>
+              <div className="finding-list">
+                <h3>{copy.quality.issuesFound(detail.findings.length)}</h3>
+                {detail.findings.length === 0 ? (
+                  <p>{copy.filterDetail.metadataAllPassed}</p>
+                ) : (
+                  detail.findings.map((finding) => (
+                    <div className="finding" key={`${finding.code}-${finding.message}`}>{finding.message}</div>
+                  ))
+                )}
+              </div>
+              <details className="metadata-config-details">
+                <summary>{copy.filterDetail.metadataConfig}</summary>
+                <div className="score-list">
+                  {Object.entries(detail.parameters)
+                    .filter(([name]) => name !== "summary")
+                    .map(([name, value]) => (
+                      <div key={name}>
+                        <span>{name.replaceAll("_", " ")}</span>
+                        <strong>{Array.isArray(value) ? value.join(", ") || "-" : String(value ?? "-")}</strong>
+                      </div>
+                    ))}
+                </div>
+              </details>
+            </>
+          ) : (
+            <>
+              <div className="score-list">
+                {Object.entries(detail.parameters).map(([name, value]) => (
+                  <div key={name}>
+                    <span>{name.replaceAll("_", " ")}</span>
+                    <strong>{Array.isArray(value) ? value.join(", ") || "-" : String(value ?? "-")}</strong>
+                  </div>
+                ))}
+              </div>
+              <div className="finding-list">
+                <h3>{copy.quality.issuesFound(detail.findings.length)}</h3>
+                {detail.findings.map((finding) => (
+                  <div className="finding" key={`${finding.code}-${finding.message}`}>{finding.message}</div>
+                ))}
+              </div>
+            </>
+          )}
           <div className="review-actions">
             <button disabled={pending}>{copy.status.passed}</button>
             <button className="secondary danger" disabled={pending}>{copy.status.excluded}</button>

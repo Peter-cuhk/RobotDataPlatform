@@ -16,6 +16,7 @@ from .filter_models import (
     FilterKinematicsConfig,
     FilterRun,
     FilterSummary,
+    FilterVisualQualityConfig,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "FilterKinematicsConfig",
     "FilterRun",
     "FilterSummary",
+    "FilterVisualQualityConfig",
     "QualityFinding",
     "VlmEvaluation",
     "VlmSettings",

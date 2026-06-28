@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from robot_data_studio.lerobot.models import DatasetMetadata, EpisodeFrame, EpisodeSummary
@@ -78,6 +79,22 @@ class BurstReader(SpikeReader):
         return frames
 
 
+class MultiDimSpikeReader(SpikeReader):
+    def read_episode_frames(self, episode_index: int) -> list[EpisodeFrame]:
+        frames = []
+        for index in range(101):
+            action = [0.0, 8.0 if index == 50 else 0.0]
+            frames.append(
+                EpisodeFrame(
+                    frame_index=index,
+                    timestamp=index / 50,
+                    observation_state=[0.0, 0.0],
+                    action=action,
+                )
+            )
+        return frames
+
+
 class NonFiniteReader(SpikeReader):
     def read_episode_frames(self, episode_index: int) -> list[EpisodeFrame]:
         frames = super().read_episode_frames(episode_index)
@@ -115,6 +132,26 @@ class CrossEpisodeDimensionReader(SpikeReader):
         return frames
 
 
+class ThreeEpisodeReader(SpikeReader):
+    def list_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
+        episodes = [self.episode(0), self.episode(1), self.episode(2)]
+        return episodes[:limit] if limit is not None else episodes
+
+    def episode(self, episode_index: int) -> EpisodeSummary:
+        episode = super().episode(episode_index)
+        return episode.model_copy(update={"episode_index": episode_index})
+
+
+class CountingFrameReader(ThreeEpisodeReader):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_counts: dict[int, int] = {}
+
+    def read_episode_frames(self, episode_index: int) -> list[EpisodeFrame]:
+        self.read_counts[episode_index] = self.read_counts.get(episode_index, 0) + 1
+        return super().read_episode_frames(episode_index)
+
+
 class NamedGripperReader(SpikeReader):
     def metadata(self) -> DatasetMetadata:
         metadata = super().metadata()
@@ -127,6 +164,114 @@ class NamedGripperReader(SpikeReader):
                 }
             }
         )
+
+
+class SharedVideoReader(SpikeReader):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+
+    def metadata(self) -> DatasetMetadata:
+        metadata = super().metadata()
+        return metadata.model_copy(update={"video_keys": ["observation.images.cam_high"]})
+
+    def list_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
+        episodes = [self.episode(0), self.episode(1)]
+        return episodes[:limit] if limit is not None else episodes
+
+    def episode(self, episode_index: int) -> EpisodeSummary:
+        episode = super().episode(episode_index)
+        start = episode_index * episode.duration_seconds
+        return episode.model_copy(
+            update={
+                "episode_index": episode_index,
+                "video_files": {"observation.images.cam_high": "videos/shared.mp4"},
+                "video_start_seconds": {"observation.images.cam_high": start},
+                "video_end_seconds": {
+                    "observation.images.cam_high": start + episode.duration_seconds
+                },
+            }
+        )
+
+
+def test_visual_quality_samples_each_episode_segment_from_shared_video(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video_path = tmp_path / "videos" / "shared.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"fake video")
+    calls = []
+
+    def sample_once(path: Path, _config, *, start_seconds: float, duration_seconds: float):
+        calls.append((path, start_seconds, duration_seconds))
+        return [np.zeros((120, 160, 3), dtype=np.uint8)]
+
+    monkeypatch.setattr(
+        "robot_data_studio.quality.filter_service.sample_video_frames",
+        sample_once,
+    )
+
+    DatasetFilterService(SharedVideoReader(tmp_path), FilterConfig()).summary()
+
+    assert calls == [
+        (video_path, 0.0, 2.02),
+        (video_path, 2.02, 2.02),
+    ]
+
+
+def test_visual_quality_detail_exposes_real_episode_frames_and_incidents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video_path = tmp_path / "videos" / "shared.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"fake video")
+
+    monkeypatch.setattr(
+        "robot_data_studio.quality.filter_service.sample_video_frames",
+        lambda *_args, **_kwargs: [
+            np.full((120, 160, 3), 128, dtype=np.uint8),
+            np.full((120, 160, 3), 128, dtype=np.uint8),
+        ],
+    )
+
+    detail = DatasetFilterService(SharedVideoReader(tmp_path), FilterConfig()).detail(
+        "visual_quality", 1
+    )
+
+    assert detail.visual_quality is not None
+    assert detail.visual_quality.sampled_frame_count == 2
+    assert detail.visual_quality.camera_count == 1
+    incident = detail.visual_quality.incidents[0]
+    assert (incident.start_frame, incident.end_frame) == (0, 25)
+    assert [frame.frame for frame in incident.representative_frames] == [0, 25]
+
+
+def test_filter_summary_reuses_reference_normalization_statistics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original_quantile = np.quantile
+
+    def counted_quantile(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_quantile(*args, **kwargs)
+
+    monkeypatch.setattr(np, "quantile", counted_quantile)
+
+    DatasetFilterService(ThreeEpisodeReader(), FilterConfig()).summary()
+
+    assert calls <= 8
+
+
+def test_filter_summary_reads_each_episode_frames_once() -> None:
+    reader = CountingFrameReader()
+
+    DatasetFilterService(reader, FilterConfig()).summary()
+
+    assert reader.read_counts == {0: 1, 1: 1, 2: 1}
 
 
 def test_sudden_change_stage_exposes_continuous_health_score() -> None:
@@ -162,8 +307,29 @@ def test_sudden_change_detail_uses_the_same_normalized_analysis() -> None:
     assert detail.table_rows
 
 
+def test_sudden_change_detail_reports_dimension_metric_and_ratio() -> None:
+    detail = DatasetFilterService(MultiDimSpikeReader(), FilterConfig()).detail("sudden_change", 0)
+
+    first_row = detail.table_rows[0]
+
+    assert first_row["source"] == "action"
+    assert first_row["dimension"] == 1
+    assert first_row["metric"] in {"delta", "acceleration", "jerk"}
+    assert first_row["ratio"] > 1
+
+
+def test_sudden_change_detail_keeps_original_dimension_after_gripper_exemption() -> None:
+    detail = DatasetFilterService(
+        MultiDimSpikeReader(),
+        FilterConfig(gripper_indices=[0]),
+    ).detail("sudden_change", 0)
+
+    assert detail.table_rows[0]["dimension"] == 1
+
+
 def test_balanced_default_quality_weights_prioritize_hard_failures() -> None:
     assert CleaningConfig().quality_weights == {
+        "visual_quality": 1.5,
         "sudden_change": 1.5,
         "state_action_alignment": 1.5,
         "extreme_value": 2.0,
@@ -189,6 +355,16 @@ def test_sudden_change_ignores_configured_gripper_dimensions() -> None:
     ).summary()
 
     assert summary.episodes[0].stage_status["sudden_change"].count == 0
+
+
+def test_sudden_change_detail_handles_all_dimensions_exempted_as_gripper() -> None:
+    detail = DatasetFilterService(
+        SpikeReader(),
+        FilterConfig(gripper_indices=[0]),
+    ).detail("sudden_change", 0)
+
+    assert detail.status == "passed"
+    assert detail.table_rows == []
 
 
 def test_cleaning_score_uses_the_exact_filter_stage_scores() -> None:
@@ -218,6 +394,29 @@ def test_cleaning_score_uses_the_exact_filter_stage_scores() -> None:
     assert result.data_quality_score == weighted_total / weight_total
     assert result.score == result.data_quality_score
     assert result.task_success_score is None
+
+
+def test_visual_quality_stage_is_skipped_when_video_is_missing() -> None:
+    summary = DatasetFilterService(SpikeReader(), FilterConfig()).summary()
+
+    stage = summary.episodes[0].stage_status["visual_quality"]
+
+    assert summary.stages[0].id == "visual_quality"
+    assert stage.status == "skipped"
+    assert stage.score is None
+    assert stage.skipped_reason == "video_missing"
+
+
+def test_visual_quality_detail_reports_missing_video_without_blocking_other_filters() -> None:
+    detail = DatasetFilterService(SpikeReader(), FilterConfig()).detail("visual_quality", 0)
+
+    assert detail.stage_id == "visual_quality"
+    assert detail.status == "skipped"
+    assert detail.skipped_reason == "video_missing"
+    assert detail.findings[0].code == "video_missing"
+    assert detail.visual_quality is not None
+    assert detail.visual_quality.sampled_frame_count == 0
+    assert detail.table_rows[0]["issue"] == "video_missing"
 
 
 def test_sudden_change_is_weighted_but_not_a_critical_integrity_gate() -> None:

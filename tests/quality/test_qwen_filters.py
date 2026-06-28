@@ -35,6 +35,36 @@ def test_s1_sudden_change_requires_residual_and_high_order_motion() -> None:
     assert result.dimension_scores[0].max_residual > 5
 
 
+def test_s1_sudden_change_accepts_smooth_ramp_motion() -> None:
+    trajectory = np.linspace(0.0, 1.0, 80, dtype=np.float64).reshape(-1, 1)
+
+    result = detect_sudden_changes(
+        trajectory,
+        SuddenChangeConfig(residual_scale=3.0, delta_scale=3.0, acceleration_scale=3.0, jerk_scale=3.0),
+    )
+
+    assert result.flagged_frames == []
+    assert result.events == []
+
+
+def test_s1_sudden_change_reports_merged_events_and_metric_ratios() -> None:
+    trajectory = np.zeros((80, 2), dtype=np.float64)
+    trajectory[:, 0] = np.linspace(0.0, 1.0, 80)
+    trajectory[38:43, 1] = [0.0, 9.0, -9.0, 9.0, 0.0]
+
+    result = detect_sudden_changes(
+        trajectory,
+        SuddenChangeConfig(residual_scale=3.0, delta_scale=3.0, acceleration_scale=3.0, jerk_scale=3.0),
+    )
+
+    assert result.events
+    assert result.events[0].start_frame <= 39
+    assert result.events[0].end_frame >= 41
+    assert result.events[0].dimension == 1
+    assert result.events[0].source_metric in {"delta", "acceleration", "jerk"}
+    assert result.events[0].severity_ratio > 1.0
+
+
 def test_s2_state_action_alignment_accepts_action_leading_state_and_rejects_state_leading() -> None:
     action = np.asarray([[0.0], [0.0], [1.0], [2.0], [3.0], [4.0], [4.0]], dtype=np.float64)
     state = np.asarray([[0.0], [0.0], [0.0], [1.0], [2.0], [3.0], [4.0]], dtype=np.float64)

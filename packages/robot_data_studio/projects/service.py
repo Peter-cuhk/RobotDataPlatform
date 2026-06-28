@@ -28,6 +28,7 @@ from robot_data_studio.quality.filter_service import (
 )
 from robot_data_studio.quality.models import utc_now
 from robot_data_studio.quality.store import CleaningStateStore, VlmSettingsStore, build_summary
+from robot_data_studio.quality.visual_quality import extract_video_frame_jpeg
 
 from .models import Project
 
@@ -249,15 +250,40 @@ class ProjectService:
     def filter_detail(self, project_id: str, stage_id: str, episode_index: int) -> FilterDetail:
         self.reader(project_id).episode(episode_index)
         allowed = {
+            "visual_quality",
             "sudden_change",
             "state_action_alignment",
             "extreme_value",
             "kinematic_consistency",
             "orientation_alignment",
+            "metadata_completeness",
         }
         if stage_id not in allowed:
             raise KeyError(f"Filter stage {stage_id!r} not found")
         return self._filter_service(project_id).detail(stage_id, episode_index)  # type: ignore[arg-type]
+
+    def visual_quality_frame(
+        self,
+        project_id: str,
+        episode_index: int,
+        camera: str,
+        frame: int,
+        width: int,
+    ) -> bytes:
+        reader = self.reader(project_id)
+        episode = reader.episode(episode_index)
+        if camera not in episode.video_files:
+            raise KeyError(f"Camera {camera!r} not found")
+        if frame < 0 or frame >= episode.length:
+            raise ValueError(
+                f"Frame {frame} is outside episode range 0-{max(episode.length - 1, 0)}"
+            )
+        video_path = reader.root / episode.video_files[camera]
+        if not video_path.is_file():
+            raise KeyError(f"Video for camera {camera!r} not found")
+        timestamp = float(episode.video_start_seconds.get(camera, 0.0))
+        timestamp += frame / float(reader.metadata().fps)
+        return extract_video_frame_jpeg(video_path, timestamp, width)
 
     def filter_config(self, project_id: str) -> FilterConfig:
         self.project(project_id)
@@ -279,6 +305,18 @@ class ProjectService:
         if patch.kinematics is not None:
             update["kinematics"] = config.kinematics.model_copy(
                 update=patch.kinematics.model_dump(exclude_unset=True)
+            )
+        if patch.visual_quality is not None:
+            update["visual_quality"] = config.visual_quality.model_copy(
+                update=patch.visual_quality.model_dump(exclude_unset=True)
+            )
+        if patch.time_sync is not None:
+            update["time_sync"] = config.time_sync.model_copy(
+                update=patch.time_sync.model_dump(exclude_unset=True)
+            )
+        if patch.metadata_completeness is not None:
+            update["metadata_completeness"] = config.metadata_completeness.model_copy(
+                update=patch.metadata_completeness.model_dump(exclude_unset=True)
             )
         updated = config.model_copy(update=update)
         self._save_filter_config(project_id, updated)

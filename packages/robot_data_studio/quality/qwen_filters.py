@@ -19,11 +19,14 @@ class SuddenChangeConfig:
     savgol_window: int = 9
     savgol_polyorder: int = 2
     residual_scale: float = 8.0
+    delta_scale: float = 8.0
     acceleration_scale: float = 8.0
     jerk_scale: float = 8.0
     residual_min_threshold: float = 1e-9
+    delta_min_threshold: float = 1e-9
     acceleration_min_threshold: float = 1e-9
     jerk_min_threshold: float = 1e-9
+    event_merge_gap: int = 2
 
 
 @dataclass(frozen=True)
@@ -77,11 +80,25 @@ class QwenFilterConfig:
 class SuddenChangeDimensionScore:
     dimension: int
     residual_threshold: float
+    delta_threshold: float
     acceleration_threshold: float
     jerk_threshold: float
     max_residual: float
+    max_delta: float
     max_acceleration: float
     max_jerk: float
+
+
+@dataclass(frozen=True)
+class SuddenChangeEvent:
+    start_frame: int
+    end_frame: int
+    peak_frame: int
+    dimension: int
+    source_metric: Literal["delta", "acceleration", "jerk"]
+    severity_ratio: float
+    residual_ratio: float
+    metric_ratio: float
 
 
 @dataclass(frozen=True)
@@ -89,6 +106,7 @@ class SuddenChangeResult:
     frame_mask: np.ndarray
     flagged_frames: list[int]
     dimension_scores: list[SuddenChangeDimensionScore]
+    events: list[SuddenChangeEvent] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -221,6 +239,13 @@ def _robust_threshold(values: np.ndarray, scale: float, minimum: float) -> float
     return max(minimum, center + scale * 1.4826 * mad)
 
 
+def _first_difference(values: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(values)
+    if len(values) >= 2:
+        out[1:] = values[1:] - values[:-1]
+    return out
+
+
 def _second_difference(values: np.ndarray) -> np.ndarray:
     out = np.zeros_like(values)
     if len(values) >= 3:
@@ -235,34 +260,102 @@ def _third_difference(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _safe_ratio(values: np.ndarray, threshold: float) -> np.ndarray:
+    denominator = max(float(threshold), 1e-12)
+    return values / denominator
+
+
+def _merge_event_frames(
+    frames: np.ndarray,
+    gap: int,
+) -> list[tuple[int, int]]:
+    if frames.size == 0:
+        return []
+    segments = []
+    start = int(frames[0])
+    previous = int(frames[0])
+    for frame in frames[1:]:
+        current = int(frame)
+        if current - previous <= gap + 1:
+            previous = current
+            continue
+        segments.append((start, previous))
+        start = current
+        previous = current
+    segments.append((start, previous))
+    return segments
+
+
 def detect_sudden_changes(values: ArrayLike, config: SuddenChangeConfig | None = None) -> SuddenChangeResult:
     config = config or SuddenChangeConfig()
     raw = _as_2d_float(values)
     smoothed = _smooth(raw, config.median_windows, config.savgol_window)
     residual = np.abs(raw - smoothed)
+    delta = np.abs(_first_difference(raw))
     acceleration = np.abs(_second_difference(raw))
     jerk = np.abs(_third_difference(raw))
     frame_mask = np.zeros(raw.shape[0], dtype=bool)
     dimension_scores = []
+    events: list[SuddenChangeEvent] = []
     for dim in range(raw.shape[1]):
         residual_threshold = _robust_threshold(
             residual[:, dim], config.residual_scale, config.residual_min_threshold
         )
+        delta_threshold = _robust_threshold(delta[:, dim], config.delta_scale, config.delta_min_threshold)
         acceleration_threshold = _robust_threshold(
             acceleration[:, dim], config.acceleration_scale, config.acceleration_min_threshold
         )
         jerk_threshold = _robust_threshold(jerk[:, dim], config.jerk_scale, config.jerk_min_threshold)
+        delta_ratio = _safe_ratio(delta[:, dim], delta_threshold)
+        acceleration_ratio = _safe_ratio(acceleration[:, dim], acceleration_threshold)
+        jerk_ratio = _safe_ratio(jerk[:, dim], jerk_threshold)
+        residual_ratio = _safe_ratio(residual[:, dim], residual_threshold)
         dim_mask = (residual[:, dim] > residual_threshold) & (
-            (acceleration[:, dim] > acceleration_threshold) | (jerk[:, dim] > jerk_threshold)
+            (delta[:, dim] > delta_threshold)
+            | (acceleration[:, dim] > acceleration_threshold)
+            | (jerk[:, dim] > jerk_threshold)
         )
         frame_mask |= dim_mask
+        for start_frame, end_frame in _merge_event_frames(
+            np.flatnonzero(dim_mask).astype(int),
+            config.event_merge_gap,
+        ):
+            window = slice(start_frame, end_frame + 1)
+            metric_ratios = {
+                "delta": delta_ratio[window],
+                "acceleration": acceleration_ratio[window],
+                "jerk": jerk_ratio[window],
+            }
+            source_metric = max(
+                metric_ratios,
+                key=lambda name: float(np.max(metric_ratios[name])) if metric_ratios[name].size else 0.0,
+            )
+            local_metric_ratios = metric_ratios[source_metric]
+            local_peak_offset = int(np.argmax(local_metric_ratios)) if local_metric_ratios.size else 0
+            peak_frame = start_frame + local_peak_offset
+            metric_ratio = float(local_metric_ratios[local_peak_offset]) if local_metric_ratios.size else 0.0
+            peak_residual_ratio = float(residual_ratio[peak_frame]) if len(residual_ratio) else 0.0
+            events.append(
+                SuddenChangeEvent(
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    peak_frame=peak_frame,
+                    dimension=dim,
+                    source_metric=source_metric,  # type: ignore[arg-type]
+                    severity_ratio=max(peak_residual_ratio, metric_ratio),
+                    residual_ratio=peak_residual_ratio,
+                    metric_ratio=metric_ratio,
+                )
+            )
         dimension_scores.append(
             SuddenChangeDimensionScore(
                 dimension=dim,
                 residual_threshold=residual_threshold,
+                delta_threshold=delta_threshold,
                 acceleration_threshold=acceleration_threshold,
                 jerk_threshold=jerk_threshold,
                 max_residual=float(np.max(residual[:, dim])),
+                max_delta=float(np.max(delta[:, dim])),
                 max_acceleration=float(np.max(acceleration[:, dim])),
                 max_jerk=float(np.max(jerk[:, dim])),
             )
@@ -271,6 +364,7 @@ def detect_sudden_changes(values: ArrayLike, config: SuddenChangeConfig | None =
         frame_mask=frame_mask,
         flagged_frames=np.flatnonzero(frame_mask).astype(int).tolist(),
         dimension_scores=dimension_scores,
+        events=events,
     )
 
 
@@ -358,6 +452,7 @@ def detect_extreme_values(
     values_by_key: dict[str, ArrayLike],
     config: ExtremeValueConfig | None = None,
     reference_values_by_key: dict[str, ArrayLike] | None = None,
+    reference_bounds_by_key: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> ExtremeValueResult:
     config = config or ExtremeValueConfig()
     first = next(iter(values_by_key.values()), [])
@@ -368,10 +463,15 @@ def detect_extreme_values(
     for key, values in values_by_key.items():
         array = _as_2d_float(values)
         reference = _as_2d_float(reference_values_by_key.get(key, values) if reference_values_by_key else values)
+        reference_bounds = reference_bounds_by_key.get(key) if reference_bounds_by_key else None
         key_results = []
         for dim in range(array.shape[1]):
-            q_low = float(np.quantile(reference[:, dim], config.lower_quantile))
-            q_high = float(np.quantile(reference[:, dim], config.upper_quantile))
+            if reference_bounds is not None:
+                q_low = float(reference_bounds[0][dim])
+                q_high = float(reference_bounds[1][dim])
+            else:
+                q_low = float(np.quantile(reference[:, dim], config.lower_quantile))
+                q_high = float(np.quantile(reference[:, dim], config.upper_quantile))
             width = q_high - q_low
             low = q_low - config.alpha * width
             high = q_high + config.alpha * width

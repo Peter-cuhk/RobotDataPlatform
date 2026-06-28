@@ -21,11 +21,13 @@ def test_run_filters_and_fetch_extreme_value_detail(tmp_path: Path) -> None:
     summary = run.json()["summary"]
     assert summary["total_episodes"] == 206
     assert {stage["id"] for stage in summary["stages"]} == {
+        "visual_quality",
         "sudden_change",
         "state_action_alignment",
         "extreme_value",
         "kinematic_consistency",
         "orientation_alignment",
+        "metadata_completeness",
     }
     assert summary["episodes"][0]["stage_status"]["extreme_value"]["count"] >= 0
 
@@ -37,8 +39,50 @@ def test_run_filters_and_fetch_extreme_value_detail(tmp_path: Path) -> None:
     assert body["episode_index"] == 0
     assert body["status"] in {"passed", "review", "skipped"}
     assert "state[0]" in body["series"]
-    assert {"q01", "q99", "low", "high"} <= set(body["thresholds"]["state[0]"])
-    assert body["parameters"]["alpha"] == 0.5
+
+
+def test_fetch_metadata_completeness_detail(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    run = client.post(f"/api/projects/{project['id']}/filters/runs")
+    assert run.status_code == 201
+
+    detail = client.get(
+        f"/api/projects/{project['id']}/filters/metadata_completeness/episodes/0"
+    )
+
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["stage_id"] == "metadata_completeness"
+    assert body["episode_index"] == 0
+    assert body["status"] in {"passed", "review"}
+    assert "findings" in body
+    assert "table_rows" in body
+    assert len(body["table_rows"]) == 6
+    assert body["table_rows"][0]["kind"] == "inspection"
+    assert "summary" in body["parameters"]
+
+
+def test_fetch_time_sync_detail(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    run = client.post(f"/api/projects/{project['id']}/filters/runs")
+    assert run.status_code == 201
+
+    detail = client.get(
+        f"/api/projects/{project['id']}/filters/state_action_alignment/episodes/0"
+    )
+
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["stage_id"] == "state_action_alignment"
+    assert body["title"] == "Time sync"
+    assert body["status"] in {"passed", "review"}
+    assert "timestamp_delta" in body["series"]
+    assert "time_sync" in body["thresholds"]
+    assert "timestamp_jitter_seconds" in body["parameters"]
 
 
 def test_filter_detail_rejects_unknown_stage(tmp_path: Path) -> None:

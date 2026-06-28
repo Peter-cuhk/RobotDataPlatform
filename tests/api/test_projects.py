@@ -74,6 +74,72 @@ def test_get_episode_frames(tmp_path: Path) -> None:
     assert response.json()[0]["action"] == [233.0, 71.0]
 
 
+def test_get_visual_quality_evidence_frame_validates_and_decodes_source_video(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sample = write_agibot_v2_episode_fixture(tmp_path / "agibot-evidence")
+    video = (
+        sample
+        / "videos"
+        / "chunk-000"
+        / "observation.images.top_head"
+        / "episode_000000.mp4"
+    )
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    captured = []
+
+    def fake_extract(path: Path, timestamp: float, width: int) -> bytes:
+        captured.append((path, timestamp, width))
+        return b"jpeg"
+
+    monkeypatch.setattr(
+        "robot_data_studio.projects.service.extract_video_frame_jpeg",
+        fake_extract,
+        raising=False,
+    )
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(sample), "format_hint": "lerobot_v2_1"},
+    ).json()
+    url = f"/api/projects/{project['id']}/episodes/0/visual-quality/frame"
+
+    response = client.get(
+        url,
+        params={
+            "camera": "observation.images.top_head",
+            "frame": 2,
+            "width": 640,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"jpeg"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert captured == [(video, 2 / 30, 640)]
+    assert client.get(url, params={"camera": "unknown", "frame": 0}).status_code == 404
+    assert (
+        client.get(
+            url,
+            params={"camera": "observation.images.top_head", "frame": 4},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            url,
+            params={
+                "camera": "observation.images.top_head",
+                "frame": 0,
+                "width": 1601,
+            },
+        ).status_code
+        == 422
+    )
+
+
 def test_generate_rerun_recording(tmp_path: Path) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
@@ -189,13 +255,16 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
         "review_threshold": 0.65,
         "overwrite_manual": False,
         "enabled_filter_stages": [
+            "visual_quality",
             "sudden_change",
             "state_action_alignment",
             "extreme_value",
             "kinematic_consistency",
             "orientation_alignment",
+            "metadata_completeness",
         ],
         "quality_weights": {
+            "visual_quality": 1.5,
             "sudden_change": 1.5,
             "state_action_alignment": 1.5,
             "extreme_value": 2.0,
@@ -314,7 +383,18 @@ def test_cleaning_rerun_can_overwrite_manual_decisions(tmp_path: Path) -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/cleaning/runs",
-        json={"pass_threshold": 0.1, "review_threshold": 0.05, "overwrite_manual": True},
+        json={
+            "pass_threshold": 0.1,
+            "review_threshold": 0.05,
+            "overwrite_manual": True,
+            "enabled_filter_stages": [
+                "sudden_change",
+                "state_action_alignment",
+                "extreme_value",
+                "kinematic_consistency",
+                "orientation_alignment",
+            ],
+        },
     )
 
     assert response.status_code == 201

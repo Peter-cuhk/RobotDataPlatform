@@ -6,11 +6,13 @@ from pydantic import BaseModel, Field
 
 
 FilterStageId = Literal[
+    "visual_quality",
     "sudden_change",
     "state_action_alignment",
     "extreme_value",
     "kinematic_consistency",
     "orientation_alignment",
+    "metadata_completeness",
 ]
 FilterStatus = Literal["passed", "review", "skipped"]
 FilterSeverity = Literal["none", "warning", "critical"]
@@ -58,6 +60,44 @@ class FilterRun(BaseModel):
     summary: FilterSummary
 
 
+class VisualQualityEvidenceFrame(BaseModel):
+    frame: int
+    timestamp: float
+
+
+class VisualQualityMetricSample(BaseModel):
+    frame: int
+    timestamp: float
+    sharpness: float | None = None
+    brightness: float | None = None
+    contrast: float | None = None
+
+
+class VisualQualityIncident(BaseModel):
+    id: str
+    camera: str
+    issue: str
+    start_frame: int
+    end_frame: int
+    start_timestamp: float
+    end_timestamp: float
+    sample_count: int
+    worst_value: float | str
+    threshold: float | str
+    representative_frames: list[VisualQualityEvidenceFrame] = Field(default_factory=list)
+
+
+class VisualQualityDetail(BaseModel):
+    sampled_frame_count: int
+    camera_count: int
+    issue_sample_count: int
+    affected_camera_count: int
+    episode_frame_count: int
+    episode_duration_seconds: float
+    incidents: list[VisualQualityIncident] = Field(default_factory=list)
+    metrics: dict[str, list[VisualQualityMetricSample]] = Field(default_factory=dict)
+
+
 class FilterDetail(BaseModel):
     stage_id: FilterStageId
     episode_index: int
@@ -69,6 +109,7 @@ class FilterDetail(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     findings: list[FilterFinding] = Field(default_factory=list)
     skipped_reason: str | None = None
+    visual_quality: VisualQualityDetail | None = None
 
 
 class FilterKinematicsConfig(BaseModel):
@@ -81,11 +122,49 @@ class FilterKinematicsConfig(BaseModel):
     resolve_tcp_offset: bool = True
 
 
+class MetadataCompletenessConfig(BaseModel):
+    require_task_description: bool = True
+    min_camera_count: int = Field(default=2, ge=1)
+    expected_camera_prefix: str = "observation.images."
+
+
+class FilterVisualQualityConfig(BaseModel):
+    sample_fps: float = Field(default=2.0, gt=0)
+    max_frames_per_video: int = Field(default=48, ge=1)
+    sample_width: int = Field(default=160, ge=16)
+    sample_height: int = Field(default=120, ge=16)
+    blur_laplacian_threshold: float = Field(default=18.0, ge=0)
+    dark_mean_threshold: float = Field(default=25.0, ge=0, le=255)
+    bright_mean_threshold: float = Field(default=235.0, ge=0, le=255)
+    dark_global_mean_threshold: float = Field(default=85.0, ge=0, le=255)
+    dark_global_p75_threshold: float = Field(default=120.0, ge=0, le=255)
+    bright_global_mean_threshold: float = Field(default=155.0, ge=0, le=255)
+    bright_global_p75_threshold: float = Field(default=185.0, ge=0, le=255)
+    low_contrast_std_threshold: float = Field(default=12.0, ge=0)
+    freeze_mse_threshold: float = Field(default=1.0, ge=0)
+    freeze_min_run: int = Field(default=4, ge=2)
+
+
+class FilterTimeSyncConfig(BaseModel):
+    timestamp_jitter_seconds: float = Field(default=0.01, ge=0)
+    timestamp_jitter_ratio: float = Field(default=0.25, ge=0)
+    duration_tolerance_seconds: float = Field(default=0.1, ge=0)
+    video_boundary_tolerance_seconds: float = Field(default=0.1, ge=0)
+
+
 class FilterConfig(BaseModel):
     gripper_indices: list[int] = Field(default_factory=list)
     kinematics: FilterKinematicsConfig = Field(default_factory=FilterKinematicsConfig)
+    visual_quality: FilterVisualQualityConfig = Field(default_factory=FilterVisualQualityConfig)
+    time_sync: FilterTimeSyncConfig = Field(default_factory=FilterTimeSyncConfig)
+    metadata_completeness: MetadataCompletenessConfig = Field(
+        default_factory=MetadataCompletenessConfig
+    )
 
 
 class FilterConfigPatch(BaseModel):
     gripper_indices: list[int] | None = None
     kinematics: FilterKinematicsConfig | None = None
+    visual_quality: FilterVisualQualityConfig | None = None
+    time_sync: FilterTimeSyncConfig | None = None
+    metadata_completeness: MetadataCompletenessConfig | None = None

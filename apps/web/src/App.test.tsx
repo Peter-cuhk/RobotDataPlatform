@@ -64,13 +64,11 @@ async function clearDefaultSidebarFilters(user: ReturnType<typeof userEvent.setu
   const sidebar = document.querySelector(".sidebar-tools");
   if (!sidebar) throw new Error("Sidebar filters are not rendered");
   const filters = within(sidebar as HTMLElement);
-  await user.click(filters.getByLabelText("Blurred frames"));
-  for (const filter of filters.getAllByLabelText("Time sync")) {
-    await user.click(filter);
-  }
-  await user.click(filters.getByLabelText("Action jump"));
+  await user.click(filters.getByLabelText("Visual quality"));
+  await user.click(filters.getByLabelText("Time sync"));
   await user.click(filters.getByLabelText("Sudden change"));
   await user.click(filters.getByLabelText("Extreme value"));
+  await user.click(filters.getByLabelText("Metadata completeness"));
 }
 
 beforeEach(() => {
@@ -260,15 +258,14 @@ test("selects configured sidebar filters and leaves setup-dependent filters unch
   const sidebar = document.querySelector(".sidebar-tools");
   expect(sidebar).not.toBeNull();
   const filters = within(sidebar as HTMLElement);
-  expect(await filters.findByLabelText("Blurred frames")).toBeChecked();
-  expect(filters.getAllByLabelText("Time sync")).toHaveLength(2);
-  for (const filter of filters.getAllByLabelText("Time sync")) {
-    expect(filter).toBeChecked();
-  }
-  expect(filters.getByLabelText("Action jump")).toBeChecked();
+  expect(await filters.findByLabelText("Visual quality")).toBeChecked();
+  expect(filters.queryByLabelText("Blurred frames")).not.toBeInTheDocument();
+  expect(filters.getAllByLabelText("Time sync")).toHaveLength(1);
+  expect(filters.getByLabelText("Time sync")).toBeChecked();
+  expect(filters.queryByLabelText("Action jump")).not.toBeInTheDocument();
   expect(filters.getByLabelText("Sudden change")).toBeChecked();
   expect(filters.getByLabelText("Extreme value")).toBeChecked();
-  expect(filters.getByLabelText("VLM failed")).not.toBeChecked();
+  expect(filters.getByLabelText("Task / VLM validity")).not.toBeChecked();
   expect(filters.getByLabelText("Kinematic consistency")).not.toBeChecked();
   expect(filters.getByLabelText("Orientation alignment")).not.toBeChecked();
 });
@@ -551,10 +548,12 @@ test("exports the current filtered episode list", async () => {
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
+  await user.click(screen.getByRole("button", { name: "VLM settings" }));
+  await user.click(screen.getByLabelText("Enable VLM"));
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
   await clearDefaultSidebarFilters(user);
-  await user.click(await screen.findByLabelText("VLM failed"));
+  expect(screen.getByLabelText("Task / VLM validity")).toBeChecked();
   await user.selectOptions(screen.getByLabelText("Export scope"), "filtered");
   await user.click(screen.getByRole("button", { name: "Export 1 episode" }));
 
@@ -850,6 +849,54 @@ test("collapses and expands cleaning status folders independently", async () => 
   expect(panel.queryByRole("button", { name: /#000001/ })).not.toBeInTheDocument();
 });
 
+test("checks visible episodes in a cleaning status folder for export", async () => {
+  const user = userEvent.setup();
+  const summary = cleaningSummary();
+  summary.results[1] = {
+    ...summary.results[1],
+    score: 0.68,
+    status: "review",
+    findings: [{ code: "time_sync", severity: "warn", message: "RGB / state offset is around 67ms." }],
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => exportResult(1),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await clearDefaultSidebarFilters(user);
+  await user.type(screen.getByLabelText("Search / filter"), "close the laptop");
+  await user.click(screen.getByLabelText("Select all visible Review episodes for export"));
+  await user.selectOptions(screen.getByLabelText("Export scope"), "checked");
+  await user.click(screen.getByRole("button", { name: "Export 1 episode" }));
+
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/exports",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ episode_indexes: [1], format: "act_hdf5", options: {} }),
+    }),
+  );
+});
+
 test("marks a review episode as passed", async () => {
   const user = userEvent.setup();
   const fetch = vi
@@ -1053,6 +1100,8 @@ test("filters cleaning results by search and finding type", async () => {
   );
   renderApp();
 
+  await user.click(screen.getByRole("button", { name: "VLM settings" }));
+  await user.click(screen.getByLabelText("Enable VLM"));
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
   await clearDefaultSidebarFilters(user);
@@ -1064,13 +1113,13 @@ test("filters cleaning results by search and finding type", async () => {
   expect(within(episodePanel as HTMLElement).getByText("#000001")).toBeInTheDocument();
 
   await user.clear(screen.getByLabelText("Search / filter"));
-  await user.click(screen.getByLabelText("VLM failed"));
+  expect(screen.getByLabelText("Task / VLM validity")).toBeChecked();
 
   expect(within(episodePanel as HTMLElement).queryByText("#000000")).not.toBeInTheDocument();
   expect(within(episodePanel as HTMLElement).getByText("#000001")).toBeInTheDocument();
 });
 
-test("renders the five data filters without Qwen branding", async () => {
+test("renders the data filters without Qwen branding", async () => {
   const user = userEvent.setup();
   vi.stubGlobal(
     "fetch",
@@ -1093,12 +1142,70 @@ test("renders the five data filters without Qwen branding", async () => {
 
   await importDatasetForTest(user);
 
+  expect((await screen.findAllByText("Visual quality")).length).toBeGreaterThan(0);
   expect((await screen.findAllByText("Sudden change")).length).toBeGreaterThan(0);
   expect(screen.getAllByText("Time sync").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Extreme value").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Kinematic consistency").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Orientation alignment").length).toBeGreaterThan(0);
   expect(screen.queryByText(/qwen/i)).not.toBeInTheDocument();
+});
+
+test("opens the visual quality detail view from the filter label", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Visual quality" }));
+
+  expect(await screen.findByRole("heading", { name: "Visual quality" })).toBeInTheDocument();
+  expect(screen.getByText("1 issue interval")).toBeInTheDocument();
+  expect(screen.getByText("1 / 1 affected")).toBeInTheDocument();
+  expect(screen.getByText("Pass with 1 low-rate anomaly")).toBeInTheDocument();
+  expect(screen.getAllByText("Frame 2").length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: "Metrics & thresholds" })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  expect(
+    screen.getByRole("img", { name: "Blur evidence at frame 2 from cam_high" }),
+  ).toHaveAttribute(
+    "src",
+    expect.stringContaining(
+      "/api/projects/project-1/episodes/0/visual-quality/frame?camera=cam_high&frame=2&width=640",
+    ),
+  );
+  await user.click(screen.getByRole("button", { name: /Blur evidence at frame 2/ }));
+  expect(screen.getByRole("dialog", { name: "Blur evidence at frame 2 from cam_high" }))
+    .toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Close preview" }));
+  await user.click(screen.getByRole("button", { name: "Metrics & thresholds" }));
+  expect(screen.getByRole("img", { name: "sharpness over time" })).toBeInTheDocument();
+  fireEvent.error(screen.getByRole("img", { name: "Blur evidence at frame 2 from cam_high" }));
+  expect(screen.getByText("Image unavailable")).toBeInTheDocument();
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/filters/visual_quality/episodes/0",
+    expect.any(Object),
+  );
 });
 
 test("opens the extreme value detail view from the filter label", async () => {
@@ -1133,6 +1240,40 @@ test("opens the extreme value detail view from the filter label", async () => {
   expect(screen.getByText("frame 12")).toBeInTheDocument();
   expect(fetch).toHaveBeenLastCalledWith(
     "/api/projects/project-1/filters/extreme_value/episodes/0",
+    expect.any(Object),
+  );
+});
+
+test("opens the time sync detail view from the filter label", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("state_action_alignment"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Time sync" }));
+
+  expect(await screen.findByRole("heading", { name: "Time sync" })).toBeInTheDocument();
+  expect(screen.getByText("timestamp_gap")).toBeInTheDocument();
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/filters/state_action_alignment/episodes/0",
     expect.any(Object),
   );
 });
@@ -1214,18 +1355,18 @@ test("sends VLM settings when running cleaning", async () => {
         pass_threshold: 0.8,
         review_threshold: 0.6,
         enabled_filter_stages: [
+          "visual_quality",
           "sudden_change",
           "state_action_alignment",
           "extreme_value",
-          "kinematic_consistency",
-          "orientation_alignment",
+          "metadata_completeness",
         ],
         quality_weights: {
+          visual_quality: 1.5,
           sudden_change: 1.5,
           state_action_alignment: 1.5,
           extreme_value: 2,
-          kinematic_consistency: 2,
-          orientation_alignment: 1,
+          metadata_completeness: 1,
           task_success: 2,
         },
         vlm: {
@@ -1239,6 +1380,57 @@ test("sends VLM settings when running cleaning", async () => {
       }),
     }),
   );
+});
+
+test("shows all eight principles and keeps configurable checks off until configured", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse());
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+
+  expect(filters.getByLabelText("Visual quality")).toBeChecked();
+  expect(filters.getByLabelText("Sudden change")).toBeChecked();
+  expect(filters.getByLabelText("Time sync")).toBeChecked();
+  expect(filters.getByLabelText("Extreme value")).toBeChecked();
+  expect(filters.getByLabelText("Metadata completeness")).toBeChecked();
+  expect(filters.getByLabelText("Kinematic consistency")).not.toBeChecked();
+  expect(filters.getByLabelText("Task / VLM validity")).not.toBeChecked();
+  expect(filters.getByLabelText("Orientation alignment")).not.toBeChecked();
+
+  await user.click(filters.getByRole("button", { name: "Expand Task / VLM validity weight" }));
+  expect(filters.getByLabelText("Task / VLM validity weight")).toBeDisabled();
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/projects/project-1/pipeline/runs/stream",
+    expect.objectContaining({
+      method: "POST",
+      body: expect.stringContaining('"enabled_filter_stages":["visual_quality","sudden_change","state_action_alignment","extreme_value","metadata_completeness"]'),
+    }),
+  );
+  const body = JSON.parse(fetch.mock.calls.at(-1)?.[1]?.body as string);
+  expect(body.quality_weights).not.toHaveProperty("kinematic_consistency");
+  expect(body.quality_weights).not.toHaveProperty("orientation_alignment");
+  expect(body.quality_weights).not.toHaveProperty("task_success");
 });
 
 test("sends selected cleaning rules and slider weights when running cleaning", async () => {
@@ -1281,18 +1473,18 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
         pass_threshold: 0.8,
         review_threshold: 0.6,
         enabled_filter_stages: [
+          "visual_quality",
           "sudden_change",
           "state_action_alignment",
           "extreme_value",
-          "kinematic_consistency",
-          "orientation_alignment",
+          "metadata_completeness",
         ],
         quality_weights: {
+          visual_quality: 1.5,
           sudden_change: 1.5,
           state_action_alignment: 2.5,
           extreme_value: 2,
-          kinematic_consistency: 2,
-          orientation_alignment: 1,
+          metadata_completeness: 1,
         },
         vlm: {
           enabled: false,
@@ -1461,7 +1653,7 @@ test("shows three quality findings and can add the selected episode to cleaning 
   );
 });
 
-test("shows the cleaning summary in the viewer after running the pipeline", async () => {
+test("shows the selected episode ready-to-build view after running the pipeline", async () => {
   const user = userEvent.setup();
   vi.stubGlobal(
     "fetch",
@@ -1486,24 +1678,9 @@ test("shows the cleaning summary in the viewer after running the pipeline", asyn
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
-  expect(await screen.findByRole("heading", { name: "Cleaning summary" })).toBeInTheDocument();
-  expect(screen.getByText("Pass 1")).toBeInTheDocument();
-  expect(screen.getByText("Review 1")).toBeInTheDocument();
-  expect(screen.getByText("Exclude 1")).toBeInTheDocument();
-  expect(screen.getByText("Lowest score episodes")).toBeInTheDocument();
-  expect(screen.getByLabelText("Episode 000001 score 41 status Exclude")).toBeInTheDocument();
-
-  const scoreBars = within(screen.getByRole("list", { name: "Episode cleaning scores" })).getAllByRole("button");
-  expect(scoreBars.map((bar) => bar.getAttribute("aria-label"))).toEqual([
-    "Episode 000001 score 41 status Exclude",
-    "Episode 000000 score 72 status Review",
-    "Episode 000002 score 96 status Pass",
-  ]);
-  expect(scoreBars[1]).toHaveClass("review");
-
-  const scoreChart = document.querySelector(".score-chart");
-  expect(scoreChart).not.toBeNull();
-  expect(within(scoreChart as HTMLElement).queryByText("#000001")).not.toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
 
   const viewerStage = document.querySelector(".viewer-stage");
   expect(viewerStage).not.toBeNull();
@@ -1523,18 +1700,46 @@ test("selecting an episode shows the ready-to-build placeholder without auto-bui
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
-  expect(await screen.findByRole("heading", { name: "Cleaning summary" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
 
   const episodePanel = document.querySelector(".episode-panel");
   expect(episodePanel).not.toBeNull();
-  await user.click(within(episodePanel as HTMLElement).getByRole("button", { name: /#000000/ }));
+  await user.click(within(episodePanel as HTMLElement).getByRole("button", { name: /#000001/ }));
 
+  expect(await screen.findByRole("heading", { name: "Episode 000001" })).toBeInTheDocument();
   expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
   expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
   expect(fetch).not.toHaveBeenCalledWith(
-    "/api/projects/project-1/episodes/0/recording",
+    "/api/projects/project-1/episodes/1/recording",
     expect.objectContaining({ method: "POST" }),
   );
+});
+
+test("keeps the ready-to-build placeholder visible while replay is building", async () => {
+  const user = userEvent.setup();
+  let resolveRecording: ((value: { ok: true; json: () => Promise<{ recording_url: string }> }) => void) | null = null;
+  const recordingResponse = new Promise<{ ok: true; json: () => Promise<{ recording_url: string }> }>((resolve) => {
+    resolveRecording = resolve;
+  });
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockReturnValueOnce(recordingResponse);
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
+
+  expect(await screen.findByRole("button", { name: "Building replay..." })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
+  expect(resolveRecording).not.toBeNull();
+  resolveRecording!({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }) });
 });
 
 test("warms the recording for the selected episode in the background without building it", async () => {
@@ -1635,7 +1840,7 @@ test("renders a progress line on the Run cleaning Pipeline button while streamin
   await waitFor(() => expect(button.textContent).toContain("Cleaning"));
   const line = button.querySelector(".button-progress-line") as HTMLElement | null;
   expect(line).not.toBeNull();
-  await waitFor(() => expect(line).toHaveStyle({ left: "35%" }));
+  await waitFor(() => expect(line).toHaveStyle({ left: "75%" }));
 
   controllerRef.current?.enqueue(
     encoder.encode(
@@ -1819,41 +2024,49 @@ function filterSummaryResponse() {
     total_episodes: 3,
     total_frames: 421,
     stages: [
+      { id: "visual_quality", label: "Visual quality", count: 1, status: "review", skipped_reason: null },
       { id: "sudden_change", label: "Sudden change", count: 1, status: "review", skipped_reason: null },
       { id: "state_action_alignment", label: "Time sync", count: 0, status: "passed", skipped_reason: null },
       { id: "extreme_value", label: "Extreme value", count: 0, status: "passed", skipped_reason: null },
       { id: "kinematic_consistency", label: "Kinematic consistency", count: 0, status: "passed", skipped_reason: null },
       { id: "orientation_alignment", label: "Orientation alignment", count: 0, status: "passed", skipped_reason: null },
+      { id: "metadata_completeness", label: "Metadata completeness", count: 0, status: "passed", skipped_reason: null },
     ],
     episodes: [
       {
         episode_index: 0,
         stage_status: {
+          visual_quality: passed,
           sudden_change: passed,
           state_action_alignment: passed,
           extreme_value: passed,
           kinematic_consistency: passed,
           orientation_alignment: passed,
+          metadata_completeness: passed,
         },
       },
       {
         episode_index: 1,
         stage_status: {
+          visual_quality: review,
           sudden_change: review,
           state_action_alignment: passed,
           extreme_value: passed,
           kinematic_consistency: passed,
           orientation_alignment: passed,
+          metadata_completeness: passed,
         },
       },
       {
         episode_index: 2,
         stage_status: {
+          visual_quality: passed,
           sudden_change: passed,
           state_action_alignment: passed,
           extreme_value: passed,
           kinematic_consistency: passed,
           orientation_alignment: passed,
+          metadata_completeness: passed,
         },
       },
     ],
@@ -1881,7 +2094,77 @@ function pipelineJsonResponse(
   };
 }
 
-function filterDetailResponse(stageId: "extreme_value" | "kinematic_consistency") {
+function filterDetailResponse(
+  stageId: "visual_quality" | "extreme_value" | "kinematic_consistency" | "state_action_alignment",
+) {
+  if (stageId === "visual_quality") {
+    return {
+      stage_id: "visual_quality",
+      episode_index: 0,
+      title: "Visual quality",
+      status: "passed",
+      series: {
+        "observation.images.cam_high:sharpness": [24.1, 18.2, 8.5],
+        "observation.images.cam_high:brightness": [120, 119, 118],
+        "observation.images.cam_high:contrast": [32, 30, 8],
+      },
+      thresholds: {
+        visual_quality: {
+          blur_laplacian: 18,
+          dark_mean: 25,
+          bright_mean: 235,
+          dark_global_mean: 85,
+          dark_global_p75: 120,
+          bright_global_mean: 155,
+          bright_global_p75: 185,
+          low_contrast_std: 12,
+          freeze_mse: 1,
+        },
+      },
+      table_rows: [
+        {
+          camera: "cam_high",
+          frame: 2,
+          timestamp: 1,
+          issue: "blur",
+          value: 8.5,
+          threshold: 18,
+        },
+      ],
+      parameters: { sample_fps: 2, max_frames_per_video: 48 },
+      findings: [{ code: "visual_quality", severity: "warn", message: "Detected visual quality issue(s). blur: 1" }],
+      skipped_reason: null,
+      visual_quality: {
+        sampled_frame_count: 48,
+        camera_count: 1,
+        issue_sample_count: 1,
+        affected_camera_count: 1,
+        episode_frame_count: 1100,
+        episode_duration_seconds: 22,
+        incidents: [
+          {
+            id: "cam_high:blur:2:2",
+            camera: "cam_high",
+            issue: "blur",
+            start_frame: 2,
+            end_frame: 2,
+            start_timestamp: 1,
+            end_timestamp: 1,
+            sample_count: 1,
+            worst_value: 8.5,
+            threshold: 18,
+            representative_frames: [{ frame: 2, timestamp: 1 }],
+          },
+        ],
+        metrics: {
+          cam_high: [
+            { frame: 0, timestamp: 0, sharpness: 24.1, brightness: 120, contrast: 32 },
+            { frame: 2, timestamp: 1, sharpness: 8.5, brightness: 118, contrast: 8 },
+          ],
+        },
+      },
+    };
+  }
   if (stageId === "kinematic_consistency") {
     return {
       stage_id: "kinematic_consistency",
@@ -1900,6 +2183,50 @@ function filterDetailResponse(stageId: "extreme_value" | "kinematic_consistency"
       },
       findings: [{ code: "backend_missing", severity: "warn", message: "Pinocchio not installed; kinematic consistency unavailable." }],
       skipped_reason: "backend_missing",
+    };
+  }
+  if (stageId === "state_action_alignment") {
+    return {
+      stage_id: "state_action_alignment",
+      episode_index: 0,
+      title: "Time sync",
+      status: "review",
+      series: {
+        timestamp_delta: [0.1, 0.25, 0.1],
+      },
+      thresholds: {
+        time_sync: {
+          timestamp_jitter_seconds: 0.01,
+          timestamp_jitter_ratio: 0.25,
+          duration_tolerance_seconds: 0.1,
+          video_boundary_tolerance_seconds: 0.1,
+        },
+      },
+      table_rows: [
+        {
+          issue: "timestamp_gap",
+          frame: 2,
+          camera: null,
+          value: 0.25,
+          expected: 0.1,
+          delta: 0.15,
+          threshold: 0.025,
+        },
+      ],
+      parameters: {
+        timestamp_jitter_seconds: 0.01,
+        timestamp_jitter_ratio: 0.25,
+        duration_tolerance_seconds: 0.1,
+        video_boundary_tolerance_seconds: 0.1,
+      },
+      findings: [
+        {
+          code: "state_action_alignment",
+          severity: "warn",
+          message: "Detected timestamp synchronization issue(s). Count: 1",
+        },
+      ],
+      skipped_reason: null,
     };
   }
   return {

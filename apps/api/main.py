@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from robot_data_studio.formats import UnsupportedDatasetFormat
 from robot_data_studio.projects.models import CleaningRunRequest, CreateProjectRequest, ExportRequest, Project
@@ -62,6 +62,37 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             return service.reader(project_id).read_episode_frames(episode_index)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get(
+        "/api/projects/{project_id}/episodes/{episode_index}/visual-quality/frame",
+        response_class=Response,
+    )
+    def visual_quality_frame(
+        project_id: str,
+        episode_index: int,
+        camera: str = Query(min_length=1),
+        frame: int = Query(ge=0),
+        width: int = Query(default=640, ge=160, le=1600),
+    ) -> Response:
+        try:
+            content = service.visual_quality_frame(
+                project_id,
+                episode_index,
+                camera,
+                frame,
+                width,
+            )
+            return Response(
+                content=content,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.post(
         "/api/projects/{project_id}/episodes/{episode_index}/recording",

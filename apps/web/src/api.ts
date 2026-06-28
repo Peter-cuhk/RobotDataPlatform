@@ -113,18 +113,56 @@ export type VlmSettings = {
 };
 
 export type FilterStageId =
+  | "visual_quality"
   | "sudden_change"
   | "state_action_alignment"
   | "extreme_value"
   | "kinematic_consistency"
-  | "orientation_alignment";
+  | "orientation_alignment"
+  | "metadata_completeness";
 
 export type FilterStatus = "passed" | "review" | "skipped";
 
 export type FilterFinding = {
   code: string;
-  severity: "info" | "warn" | "error";
+  severity: "info" | "warn" | "error" | "critical";
   message: string;
+};
+
+export type VisualQualityMetricSample = {
+  frame: number;
+  timestamp: number;
+  sharpness: number | null;
+  brightness: number | null;
+  contrast: number | null;
+};
+
+export type VisualQualityIncident = {
+  id: string;
+  camera: string;
+  issue: string;
+  start_frame: number;
+  end_frame: number;
+  start_timestamp: number;
+  end_timestamp: number;
+  sample_count: number;
+  worst_value: number | string;
+  threshold: number | string;
+  representative_frames: Array<{
+    frame: number;
+    timestamp: number;
+  }>;
+};
+
+export type VisualQualityDetail = {
+  sampled_frame_count: number;
+  camera_count: number;
+  issue_sample_count: number;
+  affected_camera_count: number;
+  episode_frame_count: number;
+  episode_duration_seconds: number;
+  incidents: VisualQualityIncident[];
+  metrics: Record<string, VisualQualityMetricSample[]>;
 };
 
 export type FilterDetail = {
@@ -138,6 +176,7 @@ export type FilterDetail = {
   parameters: Record<string, unknown>;
   findings: FilterFinding[];
   skipped_reason: string | null;
+  visual_quality?: VisualQualityDetail | null;
 };
 
 export type FilterSummary = {
@@ -175,6 +214,22 @@ export type FilterRun = {
 
 export type FilterConfig = {
   gripper_indices: number[];
+  visual_quality: {
+    sample_fps: number;
+    max_frames_per_video: number;
+    sample_width: number;
+    sample_height: number;
+    blur_laplacian_threshold: number;
+    dark_mean_threshold: number;
+    bright_mean_threshold: number;
+    dark_global_mean_threshold: number;
+    dark_global_p75_threshold: number;
+    bright_global_mean_threshold: number;
+    bright_global_p75_threshold: number;
+    low_contrast_std_threshold: number;
+    freeze_mse_threshold: number;
+    freeze_min_run: number;
+  };
   kinematics: {
     urdf_path: string | null;
     end_effector_link: string | null;
@@ -183,6 +238,12 @@ export type FilterConfig = {
     eef_position_indices: number[];
     position_tolerance: number;
     resolve_tcp_offset: boolean;
+  };
+  time_sync: {
+    timestamp_jitter_seconds: number;
+    timestamp_jitter_ratio: number;
+    duration_tolerance_seconds: number;
+    video_boundary_tolerance_seconds: number;
   };
 };
 

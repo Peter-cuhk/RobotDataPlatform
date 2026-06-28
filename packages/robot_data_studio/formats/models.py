@@ -48,6 +48,7 @@ def conversion_report(
     field_mapping: dict[str, str],
     warnings: list[str] | None = None,
     backend: dict[str, Any] | None = None,
+    metadata_completeness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "source_format": source.format,
@@ -59,4 +60,5 @@ def conversion_report(
         "field_mapping": field_mapping,
         "warnings": warnings or [],
         "backend": backend or {},
+        "metadata_completeness": metadata_completeness or {},
     }

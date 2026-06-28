@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
@@ -20,23 +21,41 @@ from robot_data_studio.quality.filter_models import (
     FilterStageSummary,
     FilterStatus,
     FilterSummary,
+    VisualQualityDetail,
+    VisualQualityEvidenceFrame,
+    VisualQualityIncident,
+    VisualQualityMetricSample,
+)
+from robot_data_studio.quality.metadata_completeness import (
+    analyze_metadata_completeness,
+    build_metadata_inspection,
+    inspection_summary,
 )
 from robot_data_studio.quality.qwen_filters import (
     ExtremeValueConfig,
-    StateActionAlignmentConfig,
     SuddenChangeConfig,
     detect_extreme_values,
-    detect_state_action_trend_alignment,
     detect_sudden_changes,
+)
+from robot_data_studio.quality.time_sync import analyze_time_sync
+from robot_data_studio.quality.visual_quality import (
+    VisualQualityResult,
+    VisualQualityRow,
+    aggregate_visual_quality_incidents,
+    analyze_sampled_frames,
+    has_signal_motion,
+    sample_video_frames,
 )
 
 
 STAGE_LABELS: dict[FilterStageId, str] = {
+    "visual_quality": "Visual quality",
     "sudden_change": "Sudden change",
     "state_action_alignment": "Time sync",
     "extreme_value": "Extreme value",
     "kinematic_consistency": "Kinematic consistency",
     "orientation_alignment": "Orientation alignment",
+    "metadata_completeness": "Metadata completeness",
 }
 
 ProgressCallback = Callable[[int, int], None]
@@ -55,6 +74,8 @@ class DatasetFilterService:
     def __init__(self, reader: DatasetAdapter, config: FilterConfig) -> None:
         self.reader = reader
         self.config = config
+        self._sampled_video_cache: dict[tuple[Path, float, float], list[np.ndarray]] = {}
+        self._episode_frame_cache: dict[int, list] = {}
 
     def run(self, on_progress: ProgressCallback | None = None) -> FilterRun:
         summary = self.summary(on_progress=on_progress)
@@ -72,6 +93,18 @@ class DatasetFilterService:
             on_progress=load_progress
         )
         reference = self._reference_arrays(states_by_episode, actions_by_episode)
+        reference_stats = {
+            "state": self._normalization_stats(reference["state"]),
+            "action": self._normalization_stats(reference["action"]),
+        }
+        extreme_bounds = {
+            "state": self._extreme_bounds(reference["state"]),
+            "action": self._extreme_bounds(reference["action"]),
+        }
+        metadata_result = analyze_metadata_completeness(
+            self.reader,
+            self.config.metadata_completeness,
+        )
         episode_summaries = []
         totals = {stage_id: 0 for stage_id in STAGE_LABELS}
         for index, episode in enumerate(episodes, start=1):
@@ -81,7 +114,18 @@ class DatasetFilterService:
             status = (
                 self._integrity_failed_statuses()
                 if integrity_findings
-                else self._stage_statuses(states, actions, reference)
+                else self._stage_statuses(
+                    episode,
+                    states,
+                    actions,
+                    reference,
+                    reference_stats,
+                    extreme_bounds,
+                )
+            )
+            status["metadata_completeness"] = self._metadata_completeness_status(
+                metadata_result,
+                episode.episode_index,
             )
             for stage_id, item in status.items():
                 totals[stage_id] += item.count
@@ -113,13 +157,15 @@ class DatasetFilterService:
         )
 
     def detail(self, stage_id: FilterStageId, episode_index: int) -> FilterDetail:
-        frames = self.reader.read_episode_frames(episode_index)
+        frames = self._read_episode_frames(episode_index)
         states = np.asarray([frame.observation_state for frame in frames], dtype=np.float64)
         actions = np.asarray([frame.action for frame in frames], dtype=np.float64)
         states_by_episode, actions_by_episode, _integrity_by_episode = self._episode_arrays()
         reference = self._reference_arrays(states_by_episode, actions_by_episode)
         normalized_states = self._normalize(states, reference["state"])
         normalized_actions = self._normalize(actions, reference["action"])
+        if stage_id == "visual_quality":
+            return self._visual_quality_detail(episode_index, states, actions)
         if stage_id == "sudden_change":
             return self._sudden_change_detail(
                 episode_index,
@@ -129,12 +175,9 @@ class DatasetFilterService:
                 normalized_actions,
             )
         if stage_id == "state_action_alignment":
-            return self._state_action_alignment_detail(
+            return self._time_sync_detail(
                 episode_index,
-                states,
-                actions,
-                normalized_states,
-                normalized_actions,
+                frames,
             )
         if stage_id == "extreme_value":
             return self._extreme_value_detail(episode_index, states, actions, reference)
@@ -142,6 +185,8 @@ class DatasetFilterService:
             return self._kinematic_detail(episode_index)
         if stage_id == "orientation_alignment":
             return self._orientation_detail(episode_index, states)
+        if stage_id == "metadata_completeness":
+            return self._metadata_completeness_detail(episode_index)
         raise ValueError(f"Unsupported filter stage: {stage_id}")
 
     def _episode_arrays(
@@ -157,7 +202,7 @@ class DatasetFilterService:
         episodes = self.reader.list_episodes()
         total = len(episodes)
         for completed, episode in enumerate(episodes, start=1):
-            frames = self.reader.read_episode_frames(episode.episode_index)
+            frames = self._read_episode_frames(episode.episode_index)
             integrity_by_episode[episode.episode_index] = self._integrity_findings(frames)
             state_rows = [frame.observation_state for frame in frames]
             action_rows = [frame.action for frame in frames]
@@ -303,12 +348,25 @@ class DatasetFilterService:
 
     def _stage_statuses(
         self,
+        episode,
         states: np.ndarray,
         actions: np.ndarray,
         reference: dict[str, np.ndarray],
+        reference_stats: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+        extreme_bounds: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> dict[FilterStageId, EpisodeFilterStageStatus]:
-        normalized_states = self._normalize(states, reference["state"])
-        normalized_actions = self._normalize(actions, reference["action"])
+        if reference_stats is None:
+            reference_stats = {
+                "state": self._normalization_stats(reference["state"]),
+                "action": self._normalization_stats(reference["action"]),
+            }
+        if extreme_bounds is None:
+            extreme_bounds = {
+                "state": self._extreme_bounds(reference["state"]),
+                "action": self._extreme_bounds(reference["action"]),
+            }
+        normalized_states = self._normalize_with_stats(states, reference_stats["state"])
+        normalized_actions = self._normalize_with_stats(actions, reference_stats["action"])
         sudden_states = self._without_indices(
             normalized_states,
             self.config.gripper_indices,
@@ -329,21 +387,20 @@ class DatasetFilterService:
                 ).flagged_frames
             )
         )
-        alignment = detect_state_action_trend_alignment(
-            normalized_states,
-            normalized_actions,
-            self._alignment_config(),
+        time_sync = analyze_time_sync(
+            episode,
+            self._read_episode_frames(episode.episode_index),
+            self.reader.metadata().fps,
+            self.config.time_sync,
         )
         extreme = detect_extreme_values(
             {"state": states, "action": actions},
             self._extreme_config(),
             reference_values_by_key=reference,
-        )
-        active_dimensions = max(
-            0,
-            min(states.shape[1], actions.shape[1]) - len(self.config.gripper_indices),
+            reference_bounds_by_key=extreme_bounds,
         )
         return {
+            "visual_quality": self._visual_quality_status(episode, states, actions),
             "sudden_change": self._count_status(
                 len(sudden),
                 len(states),
@@ -351,10 +408,11 @@ class DatasetFilterService:
                 critical=False,
             ),
             "state_action_alignment": self._count_status(
-                len(alignment.flagged_dimensions),
-                active_dimensions,
-                critical_rate=0.5,
+                time_sync.issue_count,
+                max(len(states), 1),
+                critical_rate=0.05,
                 critical=False,
+                score=time_sync.score,
             ),
             "extreme_value": self._count_status(
                 len(extreme.flagged_frames),
@@ -370,6 +428,121 @@ class DatasetFilterService:
                 skipped_reason="not_configured",
             ),
         }
+
+    def _visual_quality_status(
+        self,
+        episode,
+        states: np.ndarray,
+        actions: np.ndarray,
+    ) -> EpisodeFilterStageStatus:
+        result, skipped_reason = self._visual_quality_result(episode, states, actions)
+        if skipped_reason:
+            return EpisodeFilterStageStatus(
+                count=0,
+                status="skipped",
+                score=None,
+                skipped_reason=skipped_reason,
+            )
+        issue_rate = result.issue_count / max(result.frame_count, 1)
+        severity = (
+            "critical"
+            if result.issue_count and (issue_rate >= 0.10 or result.critical_issue)
+            else "warning"
+            if result.issue_count
+            else "none"
+        )
+        return EpisodeFilterStageStatus(
+            count=result.issue_count,
+            status="review" if issue_rate >= 0.02 else "passed",
+            score=result.score,
+            severity=severity,
+        )
+
+    def _visual_quality_result(
+        self,
+        episode,
+        states: np.ndarray,
+        actions: np.ndarray,
+    ) -> tuple[VisualQualityResult, str | None]:
+        video_files = getattr(episode, "video_files", {}) or {}
+        if not video_files:
+            return VisualQualityResult(frame_count=0, issue_count=0, score=0.0), "video_missing"
+        config = self.config.visual_quality
+        metadata = self.reader.metadata()
+        has_motion = has_signal_motion(states, actions)
+        combined = VisualQualityResult(frame_count=0, issue_count=0, score=1.0)
+        existing_videos = 0
+        for camera, relative_path in video_files.items():
+            path = self.reader.root / relative_path
+            if not path.is_file():
+                combined.rows.append(
+                    _visual_row(None, None, camera, "video_missing", str(relative_path), "exists")
+                )
+                combined.issue_count += 1
+                combined.issue_counts["video_missing"] = combined.issue_counts.get("video_missing", 0) + 1
+                continue
+            existing_videos += 1
+            start_seconds = float(episode.video_start_seconds.get(camera, 0.0))
+            end_seconds = float(
+                episode.video_end_seconds.get(
+                    camera,
+                    start_seconds + episode.duration_seconds,
+                )
+            )
+            duration_seconds = max(0.0, end_seconds - start_seconds)
+            cache_key = (path, start_seconds, duration_seconds)
+            frames = self._sampled_video_cache.get(cache_key)
+            if frames is None:
+                frames = sample_video_frames(
+                    path,
+                    config,
+                    start_seconds=start_seconds,
+                    duration_seconds=duration_seconds,
+                )
+                self._sampled_video_cache[cache_key] = frames
+            if not frames:
+                combined.rows.append(
+                    _visual_row(None, None, camera, "decode_failed", "unavailable", "decodable")
+                )
+                combined.issue_count += 1
+                combined.issue_counts["decode_failed"] = (
+                    combined.issue_counts.get("decode_failed", 0) + 1
+                )
+                continue
+            timestamps = [index / config.sample_fps for index in range(len(frames))]
+            frame_indexes = [
+                min(
+                    max(episode.length - 1, 0),
+                    round(timestamp * metadata.fps),
+                )
+                for timestamp in timestamps
+            ]
+            result = analyze_sampled_frames(
+                frames,
+                config,
+                has_motion=has_motion,
+                camera=camera,
+                timestamps=timestamps,
+                frame_indexes=frame_indexes,
+            )
+            combined.frame_count += result.frame_count
+            combined.issue_count += result.issue_count
+            combined.rows.extend(result.rows)
+            combined.critical_issue = combined.critical_issue or result.critical_issue
+            combined.metrics.update(result.metrics)
+            for name, values in result.series.items():
+                key = f"{camera}:{name}"
+                combined.series[key] = values
+            for issue, count in result.issue_counts.items():
+                combined.issue_counts[issue] = combined.issue_counts.get(issue, 0) + count
+        if existing_videos == 0:
+            return combined, "video_missing"
+        combined.camera_count = existing_videos
+        denominator = max(combined.frame_count, 1)
+        combined.score = max(0.0, 1.0 - combined.issue_count / denominator)
+        if combined.issue_counts.get("video_missing", 0):
+            combined.critical_issue = True
+        return combined, None
 
     def _kinematic_status(self, states: np.ndarray) -> EpisodeFilterStageStatus:
         skipped_reason = self._default_skipped_reason("kinematic_consistency")
@@ -410,9 +583,9 @@ class DatasetFilterService:
         )
 
     @staticmethod
-    def _normalize(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
-        if values.size == 0 or reference.size == 0:
-            return values.astype(np.float64, copy=True)
+    def _normalization_stats(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if reference.size == 0:
+            return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
         center = np.median(reference, axis=0)
         low = np.quantile(reference, 0.01, axis=0)
         high = np.quantile(reference, 0.99, axis=0)
@@ -420,13 +593,48 @@ class DatasetFilterService:
         full_span = np.max(reference, axis=0) - np.min(reference, axis=0)
         scale = np.where(robust_span > 1e-9, robust_span, full_span)
         scale = np.where(scale > 1e-9, scale, 1.0)
+        return center, scale
+
+    @staticmethod
+    def _normalize_with_stats(
+        values: np.ndarray,
+        stats: tuple[np.ndarray, np.ndarray],
+    ) -> np.ndarray:
+        center, scale = stats
+        if values.size == 0 or center.size == 0 or scale.size == 0:
+            return values.astype(np.float64, copy=True)
         return (values - center) / scale
 
     @staticmethod
+    def _normalize(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
+        return DatasetFilterService._normalize_with_stats(
+            values,
+            DatasetFilterService._normalization_stats(reference),
+        )
+
+    def _read_episode_frames(self, episode_index: int) -> list:
+        frames = self._episode_frame_cache.get(episode_index)
+        if frames is None:
+            frames = self.reader.read_episode_frames(episode_index)
+            self._episode_frame_cache[episode_index] = frames
+        return frames
+
+    def _extreme_bounds(self, reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if reference.size == 0:
+            return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+        config = self._extreme_config()
+        low = np.quantile(reference, config.lower_quantile, axis=0)
+        high = np.quantile(reference, config.upper_quantile, axis=0)
+        return low, high
+
+    @staticmethod
     def _without_indices(values: np.ndarray, ignored_indices: list[int]) -> np.ndarray:
+        return values[:, DatasetFilterService._retained_indices(values, ignored_indices)]
+
+    @staticmethod
+    def _retained_indices(values: np.ndarray, ignored_indices: list[int]) -> list[int]:
         ignored = set(ignored_indices)
-        columns = [index for index in range(values.shape[1]) if index not in ignored]
-        return values[:, columns]
+        return [index for index in range(values.shape[1]) if index not in ignored]
 
     def _sudden_change_detail(
         self,
@@ -444,80 +652,106 @@ class DatasetFilterService:
             self._without_indices(normalized_actions, self.config.gripper_indices),
             self._sudden_config(),
         )
+        state_dimensions = self._retained_indices(normalized_states, self.config.gripper_indices)
+        action_dimensions = self._retained_indices(normalized_actions, self.config.gripper_indices)
         rows = []
-        for source, result in [("state", state_result), ("action", action_result)]:
-            for frame in result.flagged_frames[:200]:
+        for source, result, dimensions in [
+            ("state", state_result, state_dimensions),
+            ("action", action_result, action_dimensions),
+        ]:
+            for event in result.events[:200]:
+                original_dimension = (
+                    dimensions[event.dimension]
+                    if event.dimension < len(dimensions)
+                    else event.dimension
+                )
                 rows.append(
                     {
-                        "frame": frame,
+                        "frame": event.peak_frame,
+                        "start_frame": event.start_frame,
+                        "end_frame": event.end_frame,
                         "source": source,
-                        "dimension": 0,
-                        "reason": "residual + acceleration/jerk",
+                        "dimension": original_dimension,
+                        "metric": event.source_metric,
+                        "ratio": round(event.severity_ratio, 4),
+                        "residual_ratio": round(event.residual_ratio, 4),
+                        "metric_ratio": round(event.metric_ratio, 4),
+                        "reason": f"residual + {event.source_metric}",
                     }
                 )
+        thresholds = {}
+        if state_result.dimension_scores:
+            thresholds["state[0]"] = {
+                "residual": state_result.dimension_scores[0].residual_threshold,
+                "delta": state_result.dimension_scores[0].delta_threshold,
+                "acceleration": state_result.dimension_scores[0].acceleration_threshold,
+                "jerk": state_result.dimension_scores[0].jerk_threshold,
+            }
         return FilterDetail(
             stage_id="sudden_change",
             episode_index=episode_index,
             title=STAGE_LABELS["sudden_change"],
             status="review" if rows else "passed",
             series={"raw": self._sample(states[:, 0]), "action": self._sample(actions[:, 0])},
-            thresholds={
-                "state[0]": {
-                    "residual": state_result.dimension_scores[0].residual_threshold,
-                    "acceleration": state_result.dimension_scores[0].acceleration_threshold,
-                    "jerk": state_result.dimension_scores[0].jerk_threshold,
-                }
-            },
+            thresholds=thresholds,
             table_rows=rows,
             parameters={
                 "median_windows": list(self._sudden_config().median_windows),
                 "savgol_window": self._sudden_config().savgol_window,
                 "residual_scale": self._sudden_config().residual_scale,
+                "delta_scale": self._sudden_config().delta_scale,
+                "event_merge_gap": self._sudden_config().event_merge_gap,
                 "normalized_by": "dataset_q01_q99",
             },
             findings=self._finding_list(len(rows), "sudden_change", "Detected sudden change frames."),
         )
 
-    def _state_action_alignment_detail(
+    def _time_sync_detail(
         self,
         episode_index: int,
-        states: np.ndarray,
-        actions: np.ndarray,
-        normalized_states: np.ndarray,
-        normalized_actions: np.ndarray,
+        frames: list,
     ) -> FilterDetail:
-        result = detect_state_action_trend_alignment(
-            normalized_states,
-            normalized_actions,
-            self._alignment_config(),
+        episode = self.reader.episode(episode_index)
+        result = analyze_time_sync(
+            episode,
+            frames,
+            self.reader.metadata().fps,
+            self.config.time_sync,
         )
         rows = [
             {
-                "dimension": item.dimension,
-                "lag": item.lag,
-                "correlation": round(item.correlation, 4),
-                "directional_agreement": round(item.directional_agreement, 4),
-                "status": "review" if item.flagged else "passed",
+                "issue": item.issue,
+                "frame": item.frame,
+                "camera": item.camera,
+                "value": round(item.value, 6),
+                "expected": round(item.expected, 6),
+                "delta": round(item.delta, 6),
+                "threshold": round(item.threshold, 6),
             }
-            for item in result.dimension_results
+            for item in result.rows
         ]
         return FilterDetail(
             stage_id="state_action_alignment",
             episode_index=episode_index,
             title=STAGE_LABELS["state_action_alignment"],
-            status="review" if result.flagged_dimensions else "passed",
-            series={"state[0]": self._sample(states[:, 0]), "action[0]": self._sample(actions[:, 0])},
-            table_rows=rows,
-            parameters={
-                "max_lag": self._alignment_config().max_lag,
-                "directional_agreement_threshold": self._alignment_config().directional_agreement_threshold,
-                "ignored_indices": self._alignment_config().ignored_indices,
-                "normalized_by": "dataset_q01_q99",
+            status="review" if result.issue_count else "passed",
+            series=result.series,
+            thresholds={
+                "time_sync": {
+                    "timestamp_jitter_seconds": self.config.time_sync.timestamp_jitter_seconds,
+                    "timestamp_jitter_ratio": self.config.time_sync.timestamp_jitter_ratio,
+                    "duration_tolerance_seconds": self.config.time_sync.duration_tolerance_seconds,
+                    "video_boundary_tolerance_seconds": (
+                        self.config.time_sync.video_boundary_tolerance_seconds
+                    ),
+                }
             },
+            table_rows=rows,
+            parameters=self.config.time_sync.model_dump(),
             findings=self._finding_list(
-                len(result.flagged_dimensions),
+                result.issue_count,
                 "state_action_alignment",
-                "Detected state/action trend desync dimension(s).",
+                "Detected timestamp synchronization issue(s).",
             ),
         )
 
@@ -639,6 +873,43 @@ class DatasetFilterService:
             findings=self._finding_list(len(rows), "kinematic_consistency", "Detected FK vs logged EEF mismatch frames."),
         )
 
+    def _metadata_completeness_status(
+        self,
+        metadata_result,
+        episode_index: int,
+    ) -> EpisodeFilterStageStatus:
+        count = metadata_result.count_for_episode(episode_index)
+        return EpisodeFilterStageStatus(
+            count=count,
+            status="review" if count else "passed",
+            score=None,
+            severity="warning" if count else "none",
+        )
+
+    def _metadata_completeness_detail(self, episode_index: int) -> FilterDetail:
+        result = analyze_metadata_completeness(
+            self.reader,
+            self.config.metadata_completeness,
+        )
+        findings = result.findings_for_episode(episode_index)
+        inspection_rows = build_metadata_inspection(
+            self.reader,
+            episode_index,
+            self.config.metadata_completeness,
+        )
+        return FilterDetail(
+            stage_id="metadata_completeness",
+            episode_index=episode_index,
+            title=STAGE_LABELS["metadata_completeness"],
+            status="review" if findings else "passed",
+            table_rows=inspection_rows,
+            parameters={
+                **self.config.metadata_completeness.model_dump(),
+                "summary": inspection_summary(inspection_rows),
+            },
+            findings=findings,
+        )
+
     def _orientation_detail(self, episode_index: int, states: np.ndarray) -> FilterDetail:
         return FilterDetail(
             stage_id="orientation_alignment",
@@ -659,6 +930,152 @@ class DatasetFilterService:
                     message="Orientation alignment correction matrix not configured.",
                 )
             ],
+        )
+
+    def _visual_quality_detail(
+        self,
+        episode_index: int,
+        states: np.ndarray,
+        actions: np.ndarray,
+    ) -> FilterDetail:
+        episode = self.reader.episode(episode_index)
+        result, skipped_reason = self._visual_quality_result(episode, states, actions)
+        if skipped_reason:
+            skipped = self._skipped_detail(
+                "visual_quality",
+                episode_index,
+                skipped_reason,
+                "No local video stream is available for visual quality scoring.",
+            )
+            return skipped.model_copy(
+                update={
+                    "table_rows": [
+                        {
+                            "camera": None,
+                            "frame": None,
+                            "timestamp": None,
+                            "issue": skipped_reason,
+                            "value": "unavailable",
+                            "threshold": "available local video",
+                        }
+                    ],
+                    "visual_quality": VisualQualityDetail(
+                        sampled_frame_count=0,
+                        camera_count=0,
+                        issue_sample_count=0,
+                        affected_camera_count=0,
+                        episode_frame_count=episode.length,
+                        episode_duration_seconds=episode.duration_seconds,
+                    ),
+                }
+            )
+        rows = [
+            {
+                "camera": row.camera,
+                "frame": row.frame,
+                "timestamp": round(row.timestamp, 4) if row.timestamp is not None else None,
+                "end_frame": row.end_frame,
+                "end_timestamp": (
+                    round(row.end_timestamp, 4) if row.end_timestamp is not None else None
+                ),
+                "issue": row.issue,
+                "value": row.value,
+                "threshold": row.threshold,
+            }
+            for row in result.rows[:200]
+        ]
+        issue_summary = ", ".join(
+            f"{name}: {count}" for name, count in sorted(result.issue_counts.items())
+        )
+        findings = (
+            [
+                FilterFinding(
+                    code="visual_quality",
+                    severity="warn",
+                    message=f"Detected visual quality issue(s). {issue_summary}",
+                )
+            ]
+            if result.issue_count
+            else []
+        )
+        incidents = aggregate_visual_quality_incidents(
+            result.rows,
+            sample_interval_seconds=1 / self.config.visual_quality.sample_fps,
+        )
+        issue_samples = {
+            (row.camera, row.frame)
+            for row in result.rows
+            if row.frame is not None and row.issue not in {"video_missing", "decode_failed"}
+        }
+        visual_quality = VisualQualityDetail(
+            sampled_frame_count=result.frame_count,
+            camera_count=result.camera_count,
+            issue_sample_count=len(issue_samples),
+            affected_camera_count=len({incident.camera for incident in incidents}),
+            episode_frame_count=episode.length,
+            episode_duration_seconds=episode.duration_seconds,
+            incidents=[
+                VisualQualityIncident(
+                    id=(
+                        f"{incident.camera}:{incident.issue}:"
+                        f"{incident.start_frame}:{incident.end_frame}"
+                    ),
+                    camera=incident.camera,
+                    issue=incident.issue,
+                    start_frame=incident.start_frame,
+                    end_frame=incident.end_frame,
+                    start_timestamp=round(incident.start_timestamp, 4),
+                    end_timestamp=round(incident.end_timestamp, 4),
+                    sample_count=incident.sample_count,
+                    worst_value=incident.worst_value,
+                    threshold=incident.threshold,
+                    representative_frames=[
+                        VisualQualityEvidenceFrame(
+                            frame=frame.frame,
+                            timestamp=round(frame.timestamp, 4),
+                        )
+                        for frame in incident.representative_frames
+                    ],
+                )
+                for incident in incidents
+            ],
+            metrics={
+                camera: [
+                    VisualQualityMetricSample(
+                        frame=metric.frame,
+                        timestamp=round(metric.timestamp, 4),
+                        sharpness=metric.sharpness,
+                        brightness=metric.brightness,
+                        contrast=metric.contrast,
+                    )
+                    for metric in samples
+                ]
+                for camera, samples in result.metrics.items()
+            },
+        )
+        return FilterDetail(
+            stage_id="visual_quality",
+            episode_index=episode_index,
+            title=STAGE_LABELS["visual_quality"],
+            status="review" if result.issue_count / max(result.frame_count, 1) >= 0.02 else "passed",
+            series=result.series,
+            thresholds={
+                "visual_quality": {
+                    "blur_laplacian": self.config.visual_quality.blur_laplacian_threshold,
+                    "dark_mean": self.config.visual_quality.dark_mean_threshold,
+                    "bright_mean": self.config.visual_quality.bright_mean_threshold,
+                    "dark_global_mean": self.config.visual_quality.dark_global_mean_threshold,
+                    "dark_global_p75": self.config.visual_quality.dark_global_p75_threshold,
+                    "bright_global_mean": self.config.visual_quality.bright_global_mean_threshold,
+                    "bright_global_p75": self.config.visual_quality.bright_global_p75_threshold,
+                    "low_contrast_std": self.config.visual_quality.low_contrast_std_threshold,
+                    "freeze_mse": self.config.visual_quality.freeze_mse_threshold,
+                }
+            },
+            table_rows=rows,
+            parameters=self.config.visual_quality.model_dump(),
+            findings=findings,
+            visual_quality=visual_quality,
         )
 
     def _skipped_detail(
@@ -701,9 +1118,10 @@ class DatasetFilterService:
         total: int,
         critical_rate: float,
         critical: bool,
+        score: float | None = None,
     ) -> EpisodeFilterStageStatus:
         rate = count / total if total > 0 else 1.0
-        score = max(0.0, min(1.0, 1.0 - rate / critical_rate))
+        computed_score = max(0.0, min(1.0, 1.0 - rate / critical_rate))
         severity = (
             "critical"
             if critical and count and rate >= critical_rate
@@ -714,7 +1132,7 @@ class DatasetFilterService:
         return EpisodeFilterStageStatus(
             count=count,
             status="review" if count else "passed",
-            score=score,
+            score=computed_score if score is None else score,
             severity=severity,
         )
 
@@ -724,9 +1142,6 @@ class DatasetFilterService:
             acceleration_min_threshold=0.02,
             jerk_min_threshold=0.02,
         )
-
-    def _alignment_config(self) -> StateActionAlignmentConfig:
-        return StateActionAlignmentConfig(max_lag=8, ignored_indices=self.config.gripper_indices)
 
     def _extreme_config(self) -> ExtremeValueConfig:
         return ExtremeValueConfig(alpha=0.5, gripper_indices=self.config.gripper_indices)
@@ -741,6 +1156,24 @@ class DatasetFilterService:
             return [round(float(value), 6) for value in values]
         indexes = np.linspace(0, len(values) - 1, max_points).astype(int)
         return [round(float(values[index]), 6) for index in indexes]
+
+
+def _visual_row(
+    frame: int | None,
+    timestamp: float | None,
+    camera: str,
+    issue: str,
+    value: float | str,
+    threshold: float | str,
+) -> VisualQualityRow:
+    return VisualQualityRow(
+        frame=frame,
+        timestamp=timestamp,
+        camera=camera,
+        issue=issue,
+        value=value,
+        threshold=threshold,
+    )
 
 
 def _pinocchio_fk_detail(states: np.ndarray, config: FilterKinematicsConfig) -> dict[str, np.ndarray]:

@@ -124,8 +124,9 @@ def _filter_findings(
     config: CleaningConfig,
 ) -> list[QualityFinding]:
     messages = {
+        "visual_quality": ("visual_quality", "Visual quality issues require review."),
         "sudden_change": ("action_jump", "Sudden motion or action changes require review."),
-        "state_action_alignment": ("time_sync", "State/action alignment requires review."),
+        "state_action_alignment": ("time_sync", "Timestamp synchronization requires review."),
         "extreme_value": ("extreme_value", "Extreme values are outside the expected range."),
         "kinematic_consistency": (
             "kinematic_consistency",
@@ -135,8 +136,16 @@ def _filter_findings(
             "orientation_alignment",
             "Orientation alignment requires review.",
         ),
+        "metadata_completeness": (
+            "metadata_completeness",
+            "Metadata completeness issues require review.",
+        ),
     }
     skipped_messages = {
+        "visual_quality": (
+            "video_missing",
+            "No video stream is available for visual quality scoring.",
+        ),
         "kinematic_consistency": (
             "kinematic_consistency_unconfigured",
             "Kinematic consistency is not configured. Import a URDF file and configure the end-effector/joint mapping.",
@@ -201,8 +210,9 @@ def _findings(scores: dict[str, float], has_video: bool) -> list[QualityFinding]
 
 def _deterministic_findings(scores: dict[str, float], config: CleaningConfig) -> list[QualityFinding]:
     low_score_messages = {
+        "visual_quality": ("visual_quality", "Visual quality score is low."),
         "sudden_change": ("action_jump", "Sudden motion or action changes require review."),
-        "state_action_alignment": ("time_sync", "State/action alignment score is low."),
+        "state_action_alignment": ("time_sync", "Timestamp synchronization score is low."),
         "extreme_value": ("extreme_value", "Extreme values are outside the expected range."),
         "orientation_alignment": ("orientation_alignment", "Orientation alignment score is low."),
     }
