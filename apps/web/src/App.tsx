@@ -1,37 +1,174 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 
 import {
   createRecording,
   exportDataset,
+  getFilterDetail,
+  getReportSignals,
+  getVlmSettings,
   importDataset,
   listFormats,
   listEpisodes,
-  runCleaning,
+  runPipelineStream,
+  saveFilterConfig,
   saveVlmSettings,
   updateEpisodeDecision,
+  uploadKinematicsUrdf,
+  warmRecording,
+  type CleaningRuleConfig,
   type CleaningStatus,
   type CleaningSummary,
   type Episode,
   type EpisodeQualityResult,
   type ExportResult,
+  type FilterConfig,
+  type FilterDetail,
+  type FilterStageId,
+  type FilterSummary,
   type FormatInfo,
   type Project,
+  type ReportGripperSeries,
+  type ReportSignals,
+  type VisualQualityIncident,
+  type VisualQualityMetricSample,
   type VlmSettings,
 } from "./api";
+import { languageStorageKey, readStoredLanguage, translations, type Language, type Translation } from "./i18n";
 import RerunViewer from "./RerunViewer";
 import "./styles.css";
 
-const defaultPath = "data/samples/lerobot-pusht";
-const datasetPathPlaceholder = "data/samples/lerobot-pusht";
+const defaultPath = "";
+const datasetPathPlaceholder = "Enter a local dataset path";
 const defaultVlmPrompt =
   "You are an automated robot episode evaluator. Return only JSON with success, score, and reason. Judge whether the task was successfully completed from the visual evidence.";
-const findingFilters = [
-  { code: "blur", label: "模糊帧" },
-  { code: "time_sync", label: "时间不同步" },
-  { code: "action_jump", label: "Action 跳变" },
-  { code: "vlm_failed", label: "VLM 失败" },
-] as const;
+
+type ExportScope =
+  | "selected"
+  | "all"
+  | "filtered"
+  | "checked"
+  | "status_passed"
+  | "status_review"
+  | "status_excluded";
+
+type CleaningRunScope = "dataset" | "selected";
+
+const defaultQualityPanelWidth = 300;
+const minQualityPanelWidth = 220;
+const maxQualityPanelWidth = 520;
+
+const filterStageIds: FilterStageId[] = [
+  "visual_quality",
+  "sudden_change",
+  "state_action_alignment",
+  "extreme_value",
+  "kinematic_consistency",
+  "orientation_alignment",
+  "metadata_completeness",
+];
+
+const defaultEnabledFilterStages: FilterStageId[] = [
+  "visual_quality",
+  "sudden_change",
+  "state_action_alignment",
+  "extreme_value",
+  "metadata_completeness",
+];
+
+const defaultSidebarFilterCodes = [
+  "visual_quality",
+  "sudden_change",
+  "state_action_alignment",
+  "extreme_value",
+  "metadata_completeness",
+];
+
+function hasOnlyDefaultSidebarFilters(filters: string[]) {
+  return (
+    filters.length === defaultSidebarFilterCodes.length &&
+    defaultSidebarFilterCodes.every((filter) => filters.includes(filter))
+  );
+}
+
+const defaultQualityWeights: Record<string, number> = {
+  visual_quality: 1.5,
+  sudden_change: 1.5,
+  state_action_alignment: 1.5,
+  extreme_value: 2,
+  kinematic_consistency: 2,
+  orientation_alignment: 1,
+  metadata_completeness: 1,
+  task_success: 2,
+};
+
+function isFilterStageId(value: string): value is FilterStageId {
+  return filterStageIds.includes(value as FilterStageId);
+}
+
+function filterStageForFindingCode(code: string): FilterStageId | null {
+  const stagesByFindingCode: Record<string, FilterStageId> = {
+    visual_quality: "visual_quality",
+    video_missing: "visual_quality",
+    action_jump: "sudden_change",
+    sudden_change: "sudden_change",
+    time_sync: "state_action_alignment",
+    state_action_alignment: "state_action_alignment",
+    extreme_value: "extreme_value",
+    kinematic_consistency: "kinematic_consistency",
+    kinematic_consistency_unconfigured: "kinematic_consistency",
+    orientation_alignment: "orientation_alignment",
+    orientation_alignment_unconfigured: "orientation_alignment",
+    metadata_completeness: "metadata_completeness",
+  };
+  return stagesByFindingCode[code] ?? null;
+}
+
+function issueTabsForQuality(
+  quality: EpisodeQualityResult | null,
+  filterSummary: FilterSummary | null,
+) {
+  const labels = new Map(filterSummary?.stages.map((stage) => [stage.id, stage.label]) ?? []);
+  const seen = new Set<FilterStageId>();
+  return (quality?.findings ?? []).flatMap((finding) => {
+    const stageId = filterStageForFindingCode(finding.code);
+    if (!stageId || seen.has(stageId)) return [];
+    seen.add(stageId);
+    return [{ stageId, label: labels.get(stageId) ?? humanizeMetric(stageId) }];
+  });
+}
+
+function clampPanelWidth(width: number) {
+  return Math.min(maxQualityPanelWidth, Math.max(minQualityPanelWidth, width));
+}
+
+function findingFilters(_copy: Translation) {
+  return [] as Array<{ code: string; label: string }>;
+}
+
+type QualityRuleId = FilterStageId | "task_success";
+
+function dataFilters(copy: Translation): Array<{ id: QualityRuleId; stageId?: FilterStageId; label: string; code: string }> {
+  return [
+    { id: "visual_quality", stageId: "visual_quality", label: copy.filters.visualQuality, code: "visual_quality" },
+    { id: "sudden_change", stageId: "sudden_change", label: copy.filters.suddenChange, code: "sudden_change" },
+    { id: "state_action_alignment", stageId: "state_action_alignment", label: copy.filters.stateActionAlignment, code: "state_action_alignment" },
+    { id: "extreme_value", stageId: "extreme_value", label: copy.filters.extremeValue, code: "extreme_value" },
+    { id: "metadata_completeness", stageId: "metadata_completeness", label: copy.filters.metadataCompleteness, code: "metadata_completeness" },
+    { id: "kinematic_consistency", stageId: "kinematic_consistency", label: copy.filters.kinematicConsistency, code: "kinematic_consistency" },
+    { id: "task_success", label: copy.filters.taskVlmValidity, code: "vlm_failed" },
+    { id: "orientation_alignment", stageId: "orientation_alignment", label: copy.filters.orientationAlignment, code: "orientation_alignment" },
+  ];
+}
+
+function isKinematicsConfigured(config: FilterConfig["kinematics"] | null | undefined) {
+  return Boolean(
+    config?.urdf_path &&
+    config.end_effector_link &&
+    config.joint_names.length > 0 &&
+    config.eef_position_indices.length > 0,
+  );
+}
 
 function episodeLabel(index: number) {
   return `Episode ${index.toString().padStart(6, "0")}`;
@@ -41,16 +178,25 @@ function compactEpisodeLabel(index: number) {
   return `#${index.toString().padStart(6, "0")}`;
 }
 
-function scoreLabel(score: number | null) {
-  return score === null ? "unscored" : `${Math.round(score * 100)} / 100`;
+function scoreLabel(score: number | null, copy: Translation) {
+  return score === null ? copy.status.unscored.toLowerCase() : `${Math.round(score * 100)} / 100`;
 }
 
-function statusLabel(status: CleaningStatus) {
+function subtaskTimeRange(startSeconds: number, endSeconds: number) {
+  return `${startSeconds.toFixed(1)}-${endSeconds.toFixed(1)}s`;
+}
+
+function errorMessage(error: unknown) {
+  if (!error) return null;
+  return error instanceof Error ? error.message : String(error);
+}
+
+function statusLabel(status: CleaningStatus, copy: Translation) {
   return {
-    passed: "通过",
-    review: "待审查",
-    excluded: "排除",
-    unscored: "未评分",
+    passed: copy.status.passed,
+    review: copy.status.review,
+    excluded: copy.status.excluded,
+    unscored: copy.status.unscored,
   }[status];
 }
 
@@ -63,19 +209,79 @@ function pickEpisodeAfterCleaning(summary: CleaningSummary) {
   return scored[0]?.episode_index ?? summary.results[0]?.episode_index ?? null;
 }
 
+function pickNextEpisodeInStatus(
+  summary: CleaningSummary,
+  currentEpisodeIndex: number,
+  status: CleaningStatus,
+) {
+  const inStatus = summary.results
+    .filter((result) => result.status === status)
+    .sort((left, right) => left.episode_index - right.episode_index);
+  return (
+    inStatus.find((result) => result.episode_index > currentEpisodeIndex)?.episode_index ??
+    inStatus[0]?.episode_index ??
+    null
+  );
+}
+
+function resolveExportEpisodeIndexes(
+  scope: ExportScope,
+  episodes: Episode[],
+  selected: number | null,
+  checkedEpisodeIndexes: Set<number>,
+  visibleEpisodes: Episode[],
+  cleaningSummary: CleaningSummary | null,
+) {
+  if (scope === "selected") return selected === null ? [] : [selected];
+  if (scope === "all") return episodes.map((episode) => episode.episode_index);
+  if (scope === "filtered") return visibleEpisodes.map((episode) => episode.episode_index);
+  if (scope === "checked") {
+    const validIndexes = new Set(episodes.map((episode) => episode.episode_index));
+    return [...checkedEpisodeIndexes]
+      .filter((episodeIndex) => validIndexes.has(episodeIndex))
+      .sort((left, right) => left - right);
+  }
+  const status = {
+    status_passed: "passed",
+    status_review: "review",
+    status_excluded: "excluded",
+  }[scope];
+  if (!cleaningSummary || !status) return [];
+  return cleaningSummary.results
+    .filter((result) => result.status === status)
+    .map((result) => result.episode_index)
+    .sort((left, right) => left - right);
+}
+
 export default function App() {
+  const queryClient = useQueryClient();
+  const [language, setLanguageState] = useState<Language>(() => readStoredLanguage());
   const [path, setPath] = useState(defaultPath);
   const [importFormat, setImportFormat] = useState("auto");
   const [exportFormat, setExportFormat] = useState("act_hdf5");
-  const [exportScope, setExportScope] = useState<"selected" | "all">("selected");
+  const [exportOutputDir, setExportOutputDir] = useState("");
+  const [exportScope, setExportScope] = useState<ExportScope>("selected");
+  const [qualityPanelWidth, setQualityPanelWidth] = useState(defaultQualityPanelWidth);
   const [project, setProject] = useState<Project | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
+  const [checkedEpisodeIndexes, setCheckedEpisodeIndexes] = useState<Set<number>>(() => new Set());
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const [replayReady, setReplayReady] = useState(false);
   const [exportedResult, setExportedResult] = useState<ExportResult | null>(null);
   const [cleaningSummary, setCleaningSummary] = useState<CleaningSummary | null>(null);
+  const [showCleaningReport, setShowCleaningReport] = useState(false);
+  const [reportEpisodeIndex, setReportEpisodeIndex] = useState<number | null>(null);
+  const [cleaningProgress, setCleaningProgress] = useState(0);
+  const [cleaningRunScope, setCleaningRunScope] = useState<CleaningRunScope | null>(null);
+  const [filterSummary, setFilterSummary] = useState<FilterSummary | null>(null);
+  const [activeFilterStage, setActiveFilterStage] = useState<FilterStageId | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFindingFilters, setActiveFindingFilters] = useState<string[]>([]);
+  const [enabledFilterStages, setEnabledFilterStages] = useState<FilterStageId[]>(() => [...defaultEnabledFilterStages]);
+  const [qualityWeights, setQualityWeights] = useState<Record<string, number>>(() => ({ ...defaultQualityWeights }));
+  const [kinematicsConfigured, setKinematicsConfigured] = useState(false);
   const [showVlmSettings, setShowVlmSettings] = useState(false);
+  const [vlmSettingsDirty, setVlmSettingsDirty] = useState(false);
   const [vlmSettings, setVlmSettings] = useState<VlmSettings>({
     enabled: false,
     provider: "OpenAI",
@@ -84,6 +290,13 @@ export default function App() {
     prompt: defaultVlmPrompt,
     sample_frames: 4,
   });
+  const copy = translations[language];
+  const setLanguage = (nextLanguage: Language) => {
+    setLanguageState(nextLanguage);
+    if (typeof window.localStorage?.setItem === "function") {
+      window.localStorage.setItem(languageStorageKey, nextLanguage);
+    }
+  };
 
   const formatsQuery = useQuery({
     queryKey: ["formats"],
@@ -94,9 +307,29 @@ export default function App() {
     onSuccess: (value) => {
       setProject(value);
       setSelected(0);
+      setCheckedEpisodeIndexes(new Set());
       setRecordingUrl(null);
+      setReplayReady(false);
       setExportedResult(null);
       setCleaningSummary(null);
+      setShowCleaningReport(false);
+      setReportEpisodeIndex(null);
+      setFilterSummary(null);
+      setActiveFilterStage(null);
+      const configuredKinematics = isKinematicsConfigured(value.filter_config?.kinematics);
+      setActiveFindingFilters([
+        ...defaultSidebarFilterCodes,
+        ...(configuredKinematics ? ["kinematic_consistency"] : []),
+        ...(vlmSettings.enabled ? ["vlm_failed"] : []),
+      ]);
+      const savedEnabledStages = value.filter_config?.enabled_filter_stages?.filter(isFilterStageId) ?? defaultEnabledFilterStages;
+      setEnabledFilterStages(Array.from(new Set(
+        configuredKinematics
+          ? [...savedEnabledStages, "kinematic_consistency"]
+          : savedEnabledStages.filter((stageId) => stageId !== "kinematic_consistency"),
+      )));
+      setQualityWeights({ ...defaultQualityWeights });
+      setKinematicsConfigured(configuredKinematics);
     },
   });
   const episodesQuery = useQuery({
@@ -105,46 +338,116 @@ export default function App() {
     enabled: Boolean(project),
   });
   const cleaningMutation = useMutation({
-    mutationFn: () => runCleaning(project!.id, vlmSettings),
-    onSuccess: ({ summary }) => {
-      setCleaningSummary(summary);
-      setSelected(pickEpisodeAfterCleaning(summary));
-      setRecordingUrl(null);
-      setExportedResult(null);
+    mutationFn: async (episodeIndexes?: number[]) => {
+      const activeQualityWeights = Object.fromEntries(
+        enabledFilterStages.map((stageId) => [stageId, qualityWeights[stageId] ?? 1]),
+      );
+      if (vlmSettingsDirty && vlmSettings.enabled) {
+        activeQualityWeights.task_success = qualityWeights.task_success ?? 2;
+      }
+      const ruleConfig: CleaningRuleConfig = {
+        enabled_filter_stages: enabledFilterStages,
+        quality_weights: activeQualityWeights,
+      };
+      return runPipelineStream(project!.id, vlmSettingsDirty ? vlmSettings : undefined, episodeIndexes, ruleConfig, (progress) => {
+        const ratio = progress.total > 0 ? progress.completed / progress.total : 0;
+        const pct = progress.phase === "filters" ? 50 * ratio : 50 + 50 * ratio;
+        setCleaningProgress(Math.min(100, Math.max(0, Math.round(pct))));
+      });
     },
+    onMutate: (episodeIndexes) => {
+      setCleaningProgress(0);
+      setCleaningRunScope(episodeIndexes ? "selected" : "dataset");
+    },
+    onSuccess: ({ cleaning, filters }, episodeIndexes) => {
+      const nextSelected = pickEpisodeAfterCleaning(cleaning.summary);
+      const isDatasetReport =
+        episodeIndexes === undefined &&
+        cleaning.summary.total === project?.dataset.total_episodes;
+      setCleaningSummary(cleaning.summary);
+      setFilterSummary(filters.summary);
+      setSelected(nextSelected);
+      setRecordingUrl(null);
+      setReplayReady(!isDatasetReport && nextSelected !== null);
+      setShowCleaningReport(isDatasetReport);
+      setExportedResult(null);
+      setCleaningProgress(0);
+    },
+    onError: () => setCleaningProgress(0),
+    onSettled: () => setCleaningRunScope(null),
   });
   const vlmSettingsMutation = useMutation({
     mutationFn: (settings: VlmSettings) => saveVlmSettings(project!.id, settings),
-  });
-  const decisionMutation = useMutation({
-    mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
-      updateEpisodeDecision(project!.id, episodeIndex, status),
-    onSuccess: (updated) => {
-      setCleaningSummary((summary) => {
-        if (!summary) return summary;
-        const results = summary.results.map((result) =>
-          result.episode_index === updated.episode_index ? updated : result,
-        );
-        return summarizeCleaning({ ...summary, results });
-      });
+    onSuccess: (settings) => {
+      setVlmSettings(settings);
+      setVlmSettingsDirty(false);
+      if (project) {
+        queryClient.setQueryData(["vlm-settings", project.id], settings);
+      }
     },
+  });
+  const vlmSettingsQuery = useQuery({
+    queryKey: ["vlm-settings", project?.id],
+    queryFn: () => getVlmSettings(project!.id),
+    enabled: Boolean(project && showVlmSettings && !vlmSettingsDirty),
   });
   const recordingMutation = useMutation({
     mutationFn: (episodeIndex: number) => createRecording(project!.id, episodeIndex),
     onSuccess: ({ recording_url }) => setRecordingUrl(recording_url),
   });
-  const exportMutation = useMutation({
-    mutationFn: () => {
-      const episodeIndexes =
-        exportScope === "all"
-          ? (episodesQuery.data ?? []).map((episode) => episode.episode_index)
-          : selected !== null
-            ? [selected]
-            : [];
-      return exportDataset(project!.id, episodeIndexes, exportFormat);
+  const recordingWarmMutation = useMutation({
+    mutationFn: (episodeIndex: number) => warmRecording(project!.id, episodeIndex),
+  });
+  const urdfUploadMutation = useMutation({
+    mutationFn: (file: File) => uploadKinematicsUrdf(project!.id, file),
+    onSuccess: () => filterDetailQuery.refetch(),
+  });
+  const filterConfigMutation = useMutation({
+    mutationFn: (config: Partial<FilterConfig>) => saveFilterConfig(project!.id, config),
+    onSuccess: (config) => {
+      const configured = isKinematicsConfigured(config.kinematics);
+      setKinematicsConfigured(configured);
+      setEnabledFilterStages((current) => {
+        const withoutKinematics = current.filter((stageId) => stageId !== "kinematic_consistency");
+        return configured ? [...withoutKinematics, "kinematic_consistency"] : withoutKinematics;
+      });
+      setActiveFindingFilters((current) => {
+        const withoutKinematics = current.filter((filter) => filter !== "kinematic_consistency");
+        return configured ? [...withoutKinematics, "kinematic_consistency"] : withoutKinematics;
+      });
+      filterDetailQuery.refetch();
     },
+  });
+  const exportMutation = useMutation({
+    mutationFn: (requestedEpisodeIndexes?: number[]) => {
+      const episodeIndexes = requestedEpisodeIndexes ?? exportEpisodeIndexes;
+      if (episodeIndexes.length === 0) {
+        throw new Error("Select at least one episode to export");
+      }
+      return exportDataset(project!.id, episodeIndexes, exportFormat, exportOutputDir);
+    },
+    onMutate: () => setExportedResult(null),
     onSuccess: (result) => setExportedResult(result),
   });
+  const workspaceStyle = {
+    "--quality-panel-width": `${qualityPanelWidth}px`,
+  } as CSSProperties & Record<"--quality-panel-width", string>;
+  const resizeQualityPanel = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = qualityPanelWidth;
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      if (!Number.isFinite(moveEvent.clientX)) return;
+      setQualityPanelWidth(clampPanelWidth(startWidth + startX - moveEvent.clientX));
+    };
+    const onPointerUp = () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+  };
 
   const qualityByEpisode = useMemo(
     () => new Map(cleaningSummary?.results.map((result) => [result.episode_index, result]) ?? []),
@@ -154,48 +457,201 @@ export default function App() {
     () => episodesQuery.data?.find((episode) => episode.episode_index === selected) ?? null,
     [episodesQuery.data, selected],
   );
-  const selectedEpisodePosition = useMemo(
-    () => (selected === null ? -1 : (episodesQuery.data ?? []).findIndex((episode) => episode.episode_index === selected)),
-    [episodesQuery.data, selected],
-  );
   const selectedQuality = selected === null ? null : qualityByEpisode.get(selected) ?? null;
+  const selectedIssueTabs = useMemo(
+    () => issueTabsForQuality(selectedQuality, filterSummary),
+    [filterSummary, selectedQuality],
+  );
+  const filterDetailQuery = useQuery({
+    queryKey: ["filter-detail", project?.id, activeFilterStage, selected],
+    queryFn: () => getFilterDetail(project!.id, activeFilterStage!, selected!),
+    enabled: Boolean(project && activeFilterStage && selected !== null),
+  });
+  const selectedFilterDetail = filterDetailQuery.data ?? null;
   const formats = formatsQuery.data ?? [];
   const importFormats = formats.filter((format) => format.can_import);
   const exportFormats = formats.filter((format) => format.can_export);
+  const episodes = episodesQuery.data ?? [];
+  const reportSignalsQuery = useQuery({
+    queryKey: ["report-signals", project?.id, reportEpisodeIndex],
+    queryFn: () => getReportSignals(project!.id, reportEpisodeIndex!),
+    enabled: showCleaningReport && Boolean(project) && reportEpisodeIndex !== null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const visibleEpisodes = useMemo(
+    () =>
+      episodes.filter((episode) =>
+        episodeMatchesFilters(
+          episode,
+          qualityByEpisode.get(episode.episode_index),
+          searchQuery,
+          activeFindingFilters,
+          filterSummary,
+        ),
+      ),
+    [activeFindingFilters, episodes, filterSummary, qualityByEpisode, searchQuery],
+  );
+  const exportEpisodeIndexes = useMemo(
+    () =>
+      resolveExportEpisodeIndexes(
+        exportScope,
+        episodes,
+        selected,
+        checkedEpisodeIndexes,
+        visibleEpisodes,
+        cleaningSummary,
+      ),
+    [checkedEpisodeIndexes, cleaningSummary, episodes, exportScope, selected, visibleEpisodes],
+  );
+  useEffect(() => {
+    if (vlmSettingsQuery.data && !vlmSettingsDirty) {
+      setVlmSettings(vlmSettingsQuery.data);
+    }
+  }, [vlmSettingsDirty, vlmSettingsQuery.data]);
+  useEffect(() => {
+    if (!episodes.length) return;
+    const indexes = episodes.map((episode) => episode.episode_index);
+    if (reportEpisodeIndex === null || !indexes.includes(reportEpisodeIndex)) {
+      setReportEpisodeIndex(Math.min(...indexes));
+    }
+  }, [episodes, reportEpisodeIndex]);
+  const updateRuleWeight = (key: string, value: number) => {
+    setQualityWeights((current) => ({ ...current, [key]: value }));
+  };
+  const toggleCheckedEpisode = (episodeIndex: number) => {
+    setCheckedEpisodeIndexes((current) => {
+      const next = new Set(current);
+      if (next.has(episodeIndex)) {
+        next.delete(episodeIndex);
+      } else {
+        next.add(episodeIndex);
+      }
+      return next;
+    });
+    setExportedResult(null);
+  };
+  const toggleCheckedEpisodes = (episodeIndexes: number[]) => {
+    if (episodeIndexes.length === 0) return;
+    setCheckedEpisodeIndexes((current) => {
+      const next = new Set(current);
+      const allSelected = episodeIndexes.every((episodeIndex) => next.has(episodeIndex));
+      for (const episodeIndex of episodeIndexes) {
+        if (allSelected) {
+          next.delete(episodeIndex);
+        } else {
+          next.add(episodeIndex);
+        }
+      }
+      return next;
+    });
+    setExportedResult(null);
+  };
   const updateVlmSettings = (nextSettings: VlmSettings) => {
+    setVlmSettingsDirty(true);
     setVlmSettings(nextSettings);
+    setActiveFindingFilters((current) => {
+      const withoutVlm = current.filter((filter) => filter !== "vlm_failed");
+      return nextSettings.enabled ? [...withoutVlm, "vlm_failed"] : withoutVlm;
+    });
     if (project) {
       vlmSettingsMutation.mutate(nextSettings);
     }
   };
-  const replayEpisode = (episodeIndex: number) => {
+  const toggleFindingFilter = (code: string) => {
+    setActiveFindingFilters((current) =>
+      current.includes(code)
+        ? current.filter((filter) => filter !== code)
+        : [...current, code],
+    );
+  };
+  const selectEpisode = (episodeIndex: number) => {
     setSelected(episodeIndex);
+    setActiveFilterStage(null);
     setRecordingUrl(null);
     setExportedResult(null);
+    setReplayReady(true);
+    setShowCleaningReport(false);
+    recordingWarmMutation.mutate(episodeIndex);
+  };
+  const buildReplay = (episodeIndex: number) => {
+    setRecordingUrl(null);
+    setReplayReady(true);
     recordingMutation.mutate(episodeIndex);
   };
-  const replayAdjacentEpisode = (offset: -1 | 1) => {
-    const episodes = episodesQuery.data ?? [];
-    if (selectedEpisodePosition < 0) return;
-    const nextEpisode = episodes[selectedEpisodePosition + offset];
-    if (!nextEpisode) return;
-    replayEpisode(nextEpisode.episode_index);
+  const replayEpisode = (episodeIndex: number) => {
+    selectEpisode(episodeIndex);
+    buildReplay(episodeIndex);
   };
+  const openInspectionMode = () => {
+    setShowCleaningReport(false);
+  };
+  const openReportMode = () => {
+    setActiveFilterStage(null);
+    setRecordingUrl(null);
+    setReplayReady(false);
+    setShowCleaningReport(true);
+  };
+  const decisionMutation = useMutation({
+    mutationFn: ({ episodeIndex, status }: { episodeIndex: number; status: "passed" | "review" | "excluded" }) =>
+      updateEpisodeDecision(project!.id, episodeIndex, status),
+    onSuccess: (updated) => {
+      const originalStatus =
+        cleaningSummary?.results.find((result) => result.episode_index === updated.episode_index)?.status ?? null;
+      const updatedSummary = cleaningSummary
+        ? summarizeCleaning({
+            ...cleaningSummary,
+            results: cleaningSummary.results.map((result) =>
+              result.episode_index === updated.episode_index ? updated : result,
+            ),
+          })
+        : null;
+      setCleaningSummary(updatedSummary);
+      if (!updatedSummary || !originalStatus) return;
+      const nextEpisode = pickNextEpisodeInStatus(updatedSummary, updated.episode_index, originalStatus);
+      if (nextEpisode === null) return;
+      replayEpisode(nextEpisode);
+    },
+  });
+  const operationError =
+    exportMutation.error ??
+    recordingMutation.error ??
+    decisionMutation.error ??
+    vlmSettingsMutation.error ??
+    urdfUploadMutation.error ??
+    filterConfigMutation.error ??
+    cleaningMutation.error;
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <span className="eyebrow">LOCAL-FIRST ROBOT DATA</span>
+          <span className="eyebrow">{copy.topbar.eyebrow}</span>
           <h1>Robot Data Studio</h1>
         </div>
         <div className="topbar-actions">
+          <div className="language-toggle" aria-label="Language">
+            <button
+              type="button"
+              className={language === "en" ? "active" : ""}
+              onClick={() => setLanguage("en")}
+            >
+              {copy.language.english}
+            </button>
+            <button
+              type="button"
+              className={language === "zh" ? "active" : ""}
+              onClick={() => setLanguage("zh")}
+            >
+              {copy.language.chinese}
+            </button>
+          </div>
           <button className="secondary" onClick={() => setShowVlmSettings((value) => !value)}>
-            VLM 设置
+            {copy.topbar.vlmSettings}
           </button>
-          <span className="status-dot">● local</span>
+          <span className="status-dot">{copy.topbar.local}</span>
           {showVlmSettings && (
             <VlmSettingsPanel
+              copy={copy}
               settings={vlmSettings}
               onChange={updateVlmSettings}
             />
@@ -205,22 +661,22 @@ export default function App() {
 
       <section className="import-bar">
         <label>
-          <span>Dataset path</span>
+          <span>{copy.import.datasetPath}</span>
           <input
-            aria-label="Dataset path"
+            aria-label={copy.import.datasetPath}
             placeholder={datasetPathPlaceholder}
             value={path}
             onChange={(event) => setPath(event.target.value)}
           />
         </label>
         <label>
-          <span>Import format</span>
+          <span>{copy.import.importFormat}</span>
           <select
-            aria-label="Import format"
+            aria-label={copy.import.importFormat}
             value={importFormat}
             onChange={(event) => setImportFormat(event.target.value)}
           >
-            <option value="auto">Auto detect</option>
+            <option value="auto">{copy.import.autoDetect}</option>
             {importFormats.map((format) => (
               <option key={format.id} value={format.id}>
                 {format.label}
@@ -228,8 +684,11 @@ export default function App() {
             ))}
           </select>
         </label>
-        <button onClick={() => importMutation.mutate()} disabled={importMutation.isPending}>
-          {importMutation.isPending ? "Scanning…" : "Import dataset"}
+        <button
+          onClick={() => importMutation.mutate()}
+          disabled={importMutation.isPending || cleaningMutation.isPending || !path.trim()}
+        >
+          {importMutation.isPending ? copy.import.scanning : copy.import.importDataset}
         </button>
         {importMutation.error && <p className="error">{importMutation.error.message}</p>}
       </section>
@@ -237,45 +696,61 @@ export default function App() {
       {!project ? (
         <section className="empty-state">
           <div className="empty-icon">↳</div>
-          <h2>Open a robot dataset</h2>
-          <p>LeRobot, HDF5 and UMI/Zarr data stay on this machine.</p>
+          <h2>{copy.import.emptyTitle}</h2>
+          <p>{copy.import.emptyBody}</p>
         </section>
       ) : (
         <>
           <section className="dataset-strip">
-            <div><span>Format</span><strong>{project.dataset.format} · {project.dataset.version}</strong></div>
-            <div><span>Dataset</span><strong>{project.dataset.total_episodes} episodes</strong></div>
-            <div><span>Frames</span><strong>{project.dataset.total_frames.toLocaleString()}</strong></div>
-            <div><span>Rate</span><strong>{project.dataset.fps} Hz</strong></div>
-            <div><span>Cleaning</span><strong>{cleaningSummary ? `${cleaningSummary.review_count} review` : "not run"}</strong></div>
+            <div><span>{copy.dataset.format}</span><strong>{project.dataset.format} · {project.dataset.version}</strong></div>
+            <div><span>{copy.dataset.dataset}</span><strong>{project.dataset.total_episodes} {copy.dataset.episodes}</strong></div>
+            <div><span>{copy.dataset.frames}</span><strong>{project.dataset.total_frames.toLocaleString()}</strong></div>
+            <div><span>{copy.dataset.rate}</span><strong>{project.dataset.fps} Hz</strong></div>
+            <div>
+              <span>{copy.dataset.cleaning}</span>
+              <strong>
+                {cleaningMutation.isPending
+                  ? copy.dataset.cleaningProgress(cleaningProgress)
+                  : cleaningSummary
+                  ? `${cleaningSummary.review_count} ${copy.dataset.review}`
+                  : copy.dataset.notRun}
+              </strong>
+            </div>
           </section>
 
-          <section className="workspace">
+          <section className={showCleaningReport ? "workspace report-mode" : "workspace"} style={workspaceStyle}>
             <aside className="episode-panel">
               <div className="panel-heading">
                 <span>Episodes</span>
-                <small>{episodesQuery.data?.length ?? 0} indexed</small>
+                <small>{episodesQuery.data?.length ?? 0} {copy.dataset.indexed}</small>
               </div>
               <div className="episode-list">
                 <EpisodeNavigation
-                  episodes={episodesQuery.data ?? []}
+                  copy={copy}
+                  episodes={episodes}
+                  visibleEpisodes={visibleEpisodes}
                   qualityByEpisode={qualityByEpisode}
                   selected={selected}
+                  checkedEpisodeIndexes={checkedEpisodeIndexes}
                   searchQuery={searchQuery}
                   activeFindingFilters={activeFindingFilters}
+                  filterSummary={filterSummary}
+                  activeFilterStage={activeFilterStage}
+                  enabledFilterStages={enabledFilterStages}
+                  taskSuccessEnabled={vlmSettings.enabled}
+                  kinematicsConfigured={kinematicsConfigured}
+                  weights={qualityWeights}
                   onSearchChange={setSearchQuery}
-                  onToggleFindingFilter={(code) =>
-                    setActiveFindingFilters((filters) =>
-                      filters.includes(code)
-                        ? filters.filter((filter) => filter !== code)
-                        : [...filters, code],
-                    )
-                  }
-                  onSelect={(episodeIndex) => {
-                    setSelected(episodeIndex);
+                  onToggleFindingFilter={toggleFindingFilter}
+                  onOpenFilter={(stageId) => {
+                    setActiveFilterStage(stageId);
                     setRecordingUrl(null);
                     setExportedResult(null);
                   }}
+                  onWeightChange={updateRuleWeight}
+                  onToggleChecked={toggleCheckedEpisode}
+                  onToggleGroupChecked={toggleCheckedEpisodes}
+                  onSelect={(episodeIndex) => selectEpisode(episodeIndex)}
                 />
               </div>
             </aside>
@@ -283,93 +758,229 @@ export default function App() {
             <section className="viewer-panel">
               <div className="viewer-toolbar">
                 <div>
-                  <span className="eyebrow">INSPECT</span>
-                  <h2>{selectedEpisode ? episodeLabel(selectedEpisode.episode_index) : "Episode"}</h2>
+                  <span className="eyebrow">{copy.viewer.inspect}</span>
+                  <h2>{selectedEpisode ? episodeLabel(selectedEpisode.episode_index) : copy.viewer.fallbackEpisode}</h2>
                 </div>
                 <div className="actions">
                   <button
-                    className="secondary"
+                    className="secondary has-progress"
                     disabled={cleaningMutation.isPending}
-                    onClick={() => cleaningMutation.mutate()}
+                    onClick={() => cleaningMutation.mutate(undefined)}
                   >
-                    {cleaningMutation.isPending ? "清洗中…" : "运行清洗 Pipeline"}
+                    {cleaningMutation.isPending && cleaningRunScope === "dataset"
+                      ? copy.viewer.cleaningDataset
+                      : copy.viewer.runCleaning}
+                    {cleaningMutation.isPending && (
+                      <i className="button-progress-line" style={{ left: `${cleaningProgress}%` }} />
+                    )}
                   </button>
                   <button
                     className="secondary"
                     disabled={selected === null || recordingMutation.isPending}
-                    onClick={() => selected !== null && replayEpisode(selected)}
+                    onClick={() => selected !== null && buildReplay(selected)}
                   >
-                    {recordingMutation.isPending ? "Building replay…" : "Replay in Rerun"}
+                    {recordingMutation.isPending ? copy.viewer.buildingReplay : copy.viewer.replay}
                   </button>
-                  <button
-                    disabled={
-                      exportMutation.isPending ||
-                      (exportScope === "selected" && selected === null) ||
-                      (exportScope === "all" && !episodesQuery.data?.length)
-                    }
-                    onClick={() => exportMutation.mutate()}
-                  >
-                    {exportMutation.isPending ? "Exporting…" : exportScope === "all" ? "Export all" : "Export selected"}
-                  </button>
+                  {cleaningSummary && (
+                    <button
+                      className="secondary"
+                      type="button"
+                      onClick={openReportMode}
+                    >
+                      {copy.report.viewReport}
+                    </button>
+                  )}
+                  {recordingUrl && (
+                    <button
+                      className="secondary"
+                      disabled={recordingMutation.isPending}
+                      onClick={() => {
+                        setRecordingUrl(null);
+                        setExportedResult(null);
+                        setReplayReady(false);
+                      }}
+                    >
+                      {copy.viewer.report}
+                    </button>
+                  )}
                 </div>
               </div>
 
               <ExportPanel
+                copy={copy}
                 formats={exportFormats}
                 selectedFormat={exportFormat}
+                outputDir={exportOutputDir}
                 scope={exportScope}
+                exportCount={exportEpisodeIndexes.length}
+                checkedCount={checkedEpisodeIndexes.size}
+                cleaningReady={Boolean(cleaningSummary)}
+                pending={exportMutation.isPending}
+                disabled={exportMutation.isPending || exportEpisodeIndexes.length === 0}
                 onFormatChange={setExportFormat}
+                onOutputDirChange={setExportOutputDir}
                 onScopeChange={setExportScope}
+                onExport={() => exportMutation.mutate(undefined)}
               />
+              <OperationError error={operationError} />
 
-              <div className="viewer-stage">
-                {recordingUrl ? (
-                  <RerunViewer
-                    recordingUrl={recordingUrl}
-                    canGoPrevious={selectedEpisodePosition > 0 && !recordingMutation.isPending}
-                    canGoNext={
-                      selectedEpisodePosition >= 0 &&
-                      selectedEpisodePosition < (episodesQuery.data?.length ?? 0) - 1 &&
-                      !recordingMutation.isPending
+              <div className="viewer-stage viewer-stage-scroll">
+                {showCleaningReport && cleaningSummary ? (
+                  <CleaningReportDashboard
+                    copy={copy}
+                    project={project}
+                    episodes={episodes}
+                    summary={cleaningSummary}
+                    filterSummary={filterSummary}
+                    reportEpisodeIndex={reportEpisodeIndex}
+                    reportSignals={reportSignalsQuery.data ?? null}
+                    reportSignalsPending={reportSignalsQuery.isLoading}
+                    reportSignalsError={reportSignalsQuery.error}
+                    exportPending={exportMutation.isPending}
+                    exportError={exportMutation.error}
+                    exportedResult={exportedResult}
+                    onInspect={openInspectionMode}
+                    onReportEpisodeChange={setReportEpisodeIndex}
+                    onSelect={(episodeIndex) => {
+                      setShowCleaningReport(false);
+                      selectEpisode(episodeIndex);
+                    }}
+                    onDownload={() =>
+                      downloadCleaningReport(
+                        project,
+                        episodes,
+                        cleaningSummary,
+                        filterSummary,
+                        reportSignalsQuery.data ?? null,
+                        reportSignalsQuery.error,
+                      )
                     }
-                    onPreviousEpisode={() => replayAdjacentEpisode(-1)}
-                    onNextEpisode={() => replayAdjacentEpisode(1)}
+                    onExportClean={() =>
+                      exportMutation.mutate(
+                        cleaningSummary.results
+                          .filter((result) => result.status === "passed")
+                          .map((result) => result.episode_index)
+                          .sort((left, right) => left - right),
+                      )
+                    }
                   />
+                ) : activeFilterStage ? (
+                  <div className="filter-detail-shell">
+                    {selectedIssueTabs.length > 0 && (
+                      <div className="episode-issue-tabs" role="tablist" aria-label="Episode issues">
+                        {selectedIssueTabs.map((tab) => (
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={tab.stageId === activeFilterStage}
+                            className={tab.stageId === activeFilterStage ? "active" : ""}
+                            key={tab.stageId}
+                            onClick={() => setActiveFilterStage(tab.stageId)}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <FilterDetailView
+                      copy={copy}
+                      projectId={project.id}
+                      detail={selectedFilterDetail}
+                      pending={filterDetailQuery.isLoading}
+                      error={filterDetailQuery.error}
+                      onUrdfUpload={(file) => urdfUploadMutation.mutate(file)}
+                      onConfigSave={(config) => filterConfigMutation.mutate(config)}
+                      configSaving={filterConfigMutation.isPending}
+                    />
+                  </div>
+                ) : recordingUrl ? (
+                  <RerunViewer recordingUrl={recordingUrl} />
+                ) : replayReady && selected !== null ? (
+                  <div className="viewer-placeholder">
+                    <div className="signal-preview">
+                      <i /><i /><i /><i /><i /><i /><i /><i />
+                    </div>
+                    <h3>{copy.viewer.placeholderTitle}</h3>
+                    <p>{copy.viewer.placeholderBody}</p>
+                  </div>
                 ) : (
                   <div className="viewer-placeholder">
                     <div className="signal-preview">
                       <i /><i /><i /><i /><i /><i /><i /><i />
                     </div>
-                    <h3>Rerun replay is ready to build</h3>
-                    <p>Select an episode and click “Replay in Rerun”.</p>
+                    <h3>{copy.viewer.placeholderTitle}</h3>
+                    <p>{copy.viewer.placeholderBody}</p>
                   </div>
                 )}
               </div>
 
               {selectedEpisode && (
                 <footer className="episode-detail">
-                  <div><span>Length</span><strong>{selectedEpisode.length} frames</strong></div>
-                  <div><span>Duration</span><strong>{selectedEpisode.duration_seconds.toFixed(1)} s</strong></div>
-                  <div className="task"><span>Task</span><strong>{selectedEpisode.tasks[0]}</strong></div>
+                  <div><span>{copy.viewer.length}</span><strong>{selectedEpisode.length} {copy.viewer.frames}</strong></div>
+                  <div><span>{copy.viewer.duration}</span><strong>{selectedEpisode.duration_seconds.toFixed(1)} s</strong></div>
+                  <div className="task">
+                    <span>{copy.viewer.task}</span>
+                    <strong>{selectedEpisode.tasks[0]}</strong>
+                    {(selectedEpisode.subtasks?.length ?? 0) > 0 && (
+                      <div className="subtask-list">
+                        <span>{copy.viewer.subtasks}</span>
+                        {selectedEpisode.subtasks?.map((subtask, index) => (
+                          <div className="subtask-row" key={`${subtask.start_frame}-${subtask.end_frame}-${index}`}>
+                            <small>{subtaskTimeRange(subtask.start_seconds, subtask.end_seconds)}</small>
+                            {subtask.skill && <em>{subtask.skill}</em>}
+                            <b>{subtask.prompt}</b>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </footer>
               )}
               {exportedResult && (
                 <div className="success">
-                  Exported {exportedResult.episode_count} episode(s) to {exportedResult.output_path}
+                  {copy.viewer.exportedPrefix} {exportedResult.episode_count} {copy.viewer.episodeCountSuffix} {exportedResult.output_path}
                   <br />
-                  Report: {exportedResult.report_path}
+                  {copy.viewer.report}: {exportedResult.report_path}
                 </div>
               )}
             </section>
 
-            <QualityReport
-              quality={selectedQuality}
-              pending={decisionMutation.isPending}
-              onDecision={(status) => {
-                if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
-              }}
-              onAddToPipeline={() => cleaningMutation.mutate()}
-            />
+            {!showCleaningReport && (
+              <>
+                <div
+                  aria-label={copy.quality.resizePanel}
+                  aria-orientation="vertical"
+                  aria-valuemax={maxQualityPanelWidth}
+                  aria-valuemin={minQualityPanelWidth}
+                  aria-valuenow={qualityPanelWidth}
+                  className="quality-resizer"
+                  role="separator"
+                  tabIndex={0}
+                  onPointerDown={resizeQualityPanel}
+                />
+
+                <QualityReport
+                  copy={copy}
+                  quality={selectedQuality}
+                  filterDetail={activeFilterStage ? selectedFilterDetail : null}
+                  filterPending={filterDetailQuery.isLoading || urdfUploadMutation.isPending || filterConfigMutation.isPending}
+                  pending={decisionMutation.isPending || cleaningMutation.isPending}
+                  rerunPending={cleaningMutation.isPending && cleaningRunScope === "selected"}
+                  requiresRerun={Boolean(cleaningSummary?.requires_rerun)}
+                  onDecision={(status) => {
+                    if (selected !== null) decisionMutation.mutate({ episodeIndex: selected, status });
+                  }}
+                  onAddToPipeline={() => {
+                    if (selected !== null) cleaningMutation.mutate([selected]);
+                  }}
+                  onOpenFilter={(stageId) => {
+                    setActiveFilterStage(stageId);
+                    setRecordingUrl(null);
+                    setExportedResult(null);
+                  }}
+                />
+              </>
+            )}
           </section>
         </>
       )}
@@ -378,24 +989,42 @@ export default function App() {
 }
 
 function ExportPanel({
+  copy,
   formats,
   selectedFormat,
+  outputDir,
   scope,
+  exportCount,
+  checkedCount,
+  cleaningReady,
+  pending,
+  disabled,
   onFormatChange,
+  onOutputDirChange,
   onScopeChange,
+  onExport,
 }: {
+  copy: Translation;
   formats: FormatInfo[];
   selectedFormat: string;
-  scope: "selected" | "all";
+  outputDir: string;
+  scope: ExportScope;
+  exportCount: number;
+  checkedCount: number;
+  cleaningReady: boolean;
+  pending: boolean;
+  disabled: boolean;
   onFormatChange: (value: string) => void;
-  onScopeChange: (value: "selected" | "all") => void;
+  onOutputDirChange: (value: string) => void;
+  onScopeChange: (value: ExportScope) => void;
+  onExport: () => void;
 }) {
   return (
     <div className="export-panel">
       <label>
-        <span>Export format</span>
+        <span>{copy.exportPanel.format}</span>
         <select
-          aria-label="Export format"
+          aria-label={copy.exportPanel.format}
           value={selectedFormat}
           onChange={(event) => onFormatChange(event.target.value)}
         >
@@ -406,17 +1035,794 @@ function ExportPanel({
           ))}
         </select>
       </label>
+      <label className="export-output">
+        <span>{copy.exportPanel.outputFolder}</span>
+        <input
+          aria-label={copy.exportPanel.outputFolder}
+          value={outputDir}
+          placeholder={copy.exportPanel.outputPlaceholder}
+          onChange={(event) => onOutputDirChange(event.target.value)}
+        />
+      </label>
       <label>
-        <span>Export scope</span>
+        <span>{copy.exportPanel.scope}</span>
         <select
-          aria-label="Export scope"
+          aria-label={copy.exportPanel.scope}
           value={scope}
-          onChange={(event) => onScopeChange(event.target.value as "selected" | "all")}
+          onChange={(event) => onScopeChange(event.target.value as ExportScope)}
         >
-          <option value="selected">Selected episode</option>
-          <option value="all">All indexed episodes</option>
+          <option value="selected">{copy.exportPanel.selectedEpisode}</option>
+          <option value="all">{copy.exportPanel.allEpisodes}</option>
+          <option value="filtered">{copy.exportPanel.filteredEpisodes}</option>
+          <option value="checked">{copy.exportPanel.checkedEpisodes}</option>
+          <option value="status_passed" disabled={!cleaningReady}>{copy.exportPanel.passedEpisodes}</option>
+          <option value="status_review" disabled={!cleaningReady}>{copy.exportPanel.reviewEpisodes}</option>
+          <option value="status_excluded" disabled={!cleaningReady}>{copy.exportPanel.excludedEpisodes}</option>
         </select>
       </label>
+      <div className="export-count" aria-live="polite">
+        <span>{copy.exportPanel.exportingCount}</span>
+        <strong>{exportCount}</strong>
+        <small>{copy.exportPanel.scopeCount(exportCount, checkedCount)}</small>
+      </div>
+      <button type="button" disabled={disabled} onClick={onExport}>
+        {pending ? copy.viewer.exporting : copy.exportPanel.exportCount(exportCount)}
+      </button>
+    </div>
+  );
+}
+
+function OperationError({ error }: { error: unknown }) {
+  const message = errorMessage(error);
+  if (!message) return null;
+  return (
+    <p className="operation-error" role="alert">
+      {message}
+    </p>
+  );
+}
+
+type FeatureSchema = Record<string, unknown>;
+
+function asRecord(value: unknown): FeatureSchema | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as FeatureSchema
+    : null;
+}
+
+function featureSchema(project: Project, key: string): FeatureSchema | null {
+  return asRecord(project.dataset.features[key]);
+}
+
+function firstSchemaString(schema: FeatureSchema | null, keys: string[]) {
+  for (const key of keys) {
+    const value = schema?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function schemaShape(schema: FeatureSchema | null) {
+  const shape = schema?.shape;
+  return Array.isArray(shape) && shape.every((value) => typeof value === "number")
+    ? `[${shape.join(", ")}]`
+    : null;
+}
+
+function schemaLabel(schema: FeatureSchema | null, fallback: string) {
+  const shape = schemaShape(schema);
+  const dtype = typeof schema?.dtype === "string" ? schema.dtype : null;
+  if (!shape && !dtype) return fallback;
+  return [shape, dtype].filter(Boolean).join(" · ");
+}
+
+function inferActionRepresentation(schema: FeatureSchema | null, fallback: string) {
+  const declared = firstSchemaString(schema, [
+    "representation",
+    "action_representation",
+    "action_type",
+    "control_mode",
+  ]);
+  if (declared) return declared;
+  const names = asRecord(schema?.names);
+  const motors = names?.motors;
+  if (Array.isArray(motors) && motors.some((name) => typeof name === "string" && name.trim())) {
+    return "Joint action";
+  }
+  const flatNames = Array.isArray(schema?.names) ? schema.names : [];
+  if (flatNames.some((name) => typeof name === "string" && /eef|end.?effector/i.test(name))) {
+    return "EEF action · mode not declared";
+  }
+  return fallback;
+}
+
+function average(values: Array<number | null | undefined>) {
+  const finite = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return finite.length ? finite.reduce((total, value) => total + value, 0) / finite.length : null;
+}
+
+function formatDuration(totalSeconds: number) {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${remainder}s`;
+  if (minutes > 0) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+}
+
+function datasetName(path: string) {
+  return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+}
+
+function humanizeMetric(metric: string) {
+  const labels: Record<string, string> = {
+    visual_clarity: "Visual clarity",
+    smoothness: "Smoothness",
+    path_efficiency: "Path efficiency",
+    runtime: "Runtime",
+    actuator_saturation: "Actuator saturation",
+    sudden_change: "Sudden change",
+    state_action_alignment: "State-action alignment",
+    extreme_value: "Extreme value",
+    metadata_completeness: "Metadata completeness",
+  };
+  return labels[metric] ?? metric.replaceAll("_", " ").replace(/^\w/, (value) => value.toUpperCase());
+}
+
+function reportQualityMetrics(summary: CleaningSummary) {
+  const values = new Map<string, number[]>();
+  for (const result of summary.results) {
+    for (const [metric, score] of Object.entries(result.per_attribute_scores)) {
+      if (!Number.isFinite(score)) continue;
+      values.set(metric, [...(values.get(metric) ?? []), score]);
+    }
+  }
+  return [...values.entries()]
+    .map(([metric, scores]) => ({
+      metric,
+      label: humanizeMetric(metric),
+      score: Math.round((average(scores) ?? 0) * 100),
+    }))
+    .sort((left, right) => left.metric.localeCompare(right.metric));
+}
+
+function downloadCleaningReport(
+  project: Project,
+  episodes: Episode[],
+  summary: CleaningSummary,
+  filterSummary: FilterSummary | null,
+  signals: ReportSignals | null,
+  signalsError: unknown,
+) {
+  const payload = {
+    generated_at: new Date().toISOString(),
+    dataset: project.dataset,
+    episode_statistics: {
+      count: episodes.length,
+      duration_seconds: episodes.reduce((total, episode) => total + episode.duration_seconds, 0),
+      tasks: [...new Set(episodes.flatMap((episode) => episode.tasks).filter(Boolean))],
+    },
+    cleaning: summary,
+    filters: filterSummary,
+    signals: signals ?? {
+      available: false,
+      error: errorMessage(signalsError) ?? "signals unavailable",
+    },
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${datasetName(project.dataset.path)}-cleaning-report.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function CleaningReportDashboard({
+  copy,
+  project,
+  episodes,
+  summary,
+  filterSummary,
+  reportEpisodeIndex,
+  reportSignals,
+  reportSignalsPending,
+  reportSignalsError,
+  exportPending,
+  exportError,
+  exportedResult,
+  onInspect,
+  onReportEpisodeChange,
+  onSelect,
+  onDownload,
+  onExportClean,
+}: {
+  copy: Translation;
+  project: Project;
+  episodes: Episode[];
+  summary: CleaningSummary;
+  filterSummary: FilterSummary | null;
+  reportEpisodeIndex: number | null;
+  reportSignals: ReportSignals | null;
+  reportSignalsPending: boolean;
+  reportSignalsError: unknown;
+  exportPending: boolean;
+  exportError: unknown;
+  exportedResult: ExportResult | null;
+  onInspect: () => void;
+  onReportEpisodeChange: (episodeIndex: number) => void;
+  onSelect: (episodeIndex: number) => void;
+  onDownload: () => void;
+  onExportClean: () => void;
+}) {
+  const notDeclared = copy.report.notDeclared;
+  const action = featureSchema(project, "action");
+  const observation = featureSchema(project, "observation.state");
+  const timestamp = featureSchema(project, "timestamp");
+  const totalDuration = episodes.reduce((total, episode) => total + episode.duration_seconds, 0);
+  const scoredAverage = average(summary.results.map((result) => result.score));
+  const overallScore = scoredAverage === null ? null : Math.round(scoredAverage * 100);
+  const sortedResults = [...summary.results].sort((left, right) => {
+    if (left.score === null) return right.score === null ? left.episode_index - right.episode_index : 1;
+    if (right.score === null) return -1;
+    return left.score - right.score || left.episode_index - right.episode_index;
+  });
+  const statuses: Array<{ status: CleaningStatus; count: number }> = [
+    { status: "passed", count: summary.passed_count },
+    { status: "excluded", count: summary.excluded_count },
+    { status: "review", count: summary.review_count },
+  ];
+  const tasks = [...new Set(episodes.flatMap((episode) => episode.tasks).filter(Boolean))];
+  const durations = episodes.map((episode) => episode.duration_seconds).sort((left, right) => left - right);
+  const medianDuration = durations.length
+    ? durations[Math.floor((durations.length - 1) / 2)]
+    : 0;
+  const cameraFeatures = project.dataset.video_keys
+    .map((key) => ({ key, schema: featureSchema(project, key) }))
+    .filter(({ schema }) => schema !== null);
+  const firstCameraShape = schemaShape(cameraFeatures[0]?.schema ?? null);
+  const cameraSummary = cameraFeatures.length
+    ? `${cameraFeatures.length} RGB${firstCameraShape ? ` · ${firstCameraShape.replaceAll(/[\[\],]/g, " ").trim().replaceAll(/\s+/g, " × ")}` : ""}`
+    : "0";
+  const translation = firstSchemaString(action, ["translation", "translation_order", "position_order"]);
+  const rotation = firstSchemaString(action, ["rotation", "rotation_representation"]);
+  const quaternionOrder = firstSchemaString(action, ["quaternion_order", "quaternion_convention"]);
+  const coordinateFrame = firstSchemaString(action, ["coordinate_frame", "frame"]);
+  const timestampUnit = firstSchemaString(timestamp, ["unit", "units"]);
+  const metrics = reportQualityMetrics(summary);
+  const visualMetrics = metrics.filter(({ metric }) =>
+    /visual|clarity|time|sync|metadata|runtime/i.test(metric),
+  ).slice(0, 3);
+  const motionMetrics = metrics.filter(({ metric }) =>
+    !visualMetrics.some((visual) => visual.metric === metric),
+  ).slice(0, 3);
+  const recommendations = [
+    summary.review_count > 0 ? copy.report.reviewEpisodes(summary.review_count) : null,
+    summary.excluded_count > 0 ? copy.report.excludeEpisodes(summary.excluded_count) : null,
+    !coordinateFrame || !quaternionOrder ? copy.report.declareSemantics : null,
+  ].filter((value): value is string => Boolean(value));
+
+  const contractRows = [
+    [copy.report.actionRepresentation, inferActionRepresentation(action, notDeclared)],
+    [copy.report.actionShape, schemaLabel(action, notDeclared)],
+    [copy.report.translation, translation ?? notDeclared],
+    [copy.report.rotation, rotation ?? notDeclared],
+    [copy.report.quaternionOrder, quaternionOrder ?? notDeclared],
+    [copy.report.coordinateFrame, coordinateFrame ?? notDeclared],
+    [copy.report.observationState, schemaLabel(observation, notDeclared)],
+    [
+      copy.report.timestamp,
+      timestamp ? `${schemaLabel(timestamp, notDeclared)}${timestampUnit ? ` · ${timestampUnit}` : ""}` : notDeclared,
+    ],
+  ];
+
+  return (
+    <section className="cleaning-report-dashboard">
+      <header className="report-page-header">
+        <div>
+          <div className="report-title-line">
+            <h2>{copy.report.title}</h2>
+            <strong>{datasetName(project.dataset.path)}</strong>
+            <span>{copy.report.pipelineComplete}</span>
+          </div>
+          <p>{copy.report.analyzed(summary.total)} · {project.dataset.format} {project.dataset.version}</p>
+        </div>
+        <div className="report-page-actions">
+          <button type="button" className="secondary" onClick={onInspect}>{copy.report.inspectEpisodes}</button>
+          <button type="button" className="secondary" onClick={onDownload}>{copy.report.exportReport}</button>
+          <button type="button" disabled={exportPending || summary.passed_count === 0} onClick={onExportClean}>
+            {exportPending ? copy.viewer.exporting : copy.report.exportCleanDataset}
+          </button>
+        </div>
+      </header>
+
+      {exportedResult && (
+        <p className="report-export-success">
+          {copy.viewer.exportedPrefix} {exportedResult.episode_count} {copy.viewer.episodeCountSuffix} {exportedResult.output_path}
+        </p>
+      )}
+      <OperationError error={exportError} />
+
+      <div className="report-snapshot">
+        <ReportMetric label={copy.report.episodes} value={project.dataset.total_episodes.toLocaleString()} />
+        <ReportMetric label={copy.report.frames} value={project.dataset.total_frames.toLocaleString()} />
+        <ReportMetric label={copy.report.duration} value={formatDuration(totalDuration)} />
+        <ReportMetric label={copy.report.rate} value={`${project.dataset.fps} Hz`} />
+        <ReportMetric label={copy.report.sourceFormat} value={`${project.dataset.format} · ${project.dataset.version}`} />
+        <ReportMetric
+          label={copy.report.overallScore}
+          value={overallScore === null ? copy.quality.notScored : `${overallScore} / 100`}
+          accent={overallScore !== null}
+        />
+      </div>
+
+      <section className="report-card report-distribution">
+        <div className="report-section-heading">
+          <div>
+            <h3>{copy.report.qualityDistribution}</h3>
+            <p>{copy.report.scoreHint}</p>
+          </div>
+          <div className="report-legend">
+            {statuses.map(({ status, count }) => (
+              <span className={status} key={status}>{statusLabel(status, copy)} <b>{count}</b></span>
+            ))}
+          </div>
+        </div>
+        <div className="report-score-chart">
+          <div aria-hidden="true" className="score-axis">
+            <span>100</span><span>75</span><span>50</span><span>25</span><span>0</span>
+          </div>
+          <div className="score-bars" role="list" aria-label={copy.cleaningSummary.scoreChart}>
+            {sortedResults.map((result) => {
+              const score = result.score ?? 0;
+              return (
+                <button
+                  aria-label={`${episodeLabel(result.episode_index)} score ${Math.round(score * 100)} status ${statusLabel(result.status, copy)}`}
+                  className={`score-bar ${result.status}`}
+                  key={result.episode_index}
+                  onClick={() => onSelect(result.episode_index)}
+                  style={{ "--bar-height": `${Math.max(5, Math.round(score * 100))}%` } as CSSProperties}
+                  type="button"
+                >
+                  <i />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="report-status-strip">
+          {statuses.map(({ status, count }) => {
+            const results = summary.results
+              .filter((result) => result.status === status)
+              .sort((left, right) => left.episode_index - right.episode_index);
+            const visible = results.slice(0, 6);
+            return (
+              <div className={`report-status-group ${status}`} key={status}>
+                <strong>{statusLabel(status, copy).toUpperCase()} {count}</strong>
+                <span>
+                  {visible.map((result) => (
+                    <button
+                      key={result.episode_index}
+                      type="button"
+                      aria-label={`${compactEpisodeLabel(result.episode_index)} ${statusLabel(status, copy)}`}
+                      onClick={() => onSelect(result.episode_index)}
+                    >
+                      {compactEpisodeLabel(result.episode_index)}
+                    </button>
+                  ))}
+                  {results.length > visible.length && <small>+{results.length - visible.length}</small>}
+                  {results.length === 0 && <small>—</small>}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <ReportSignalCharts
+        copy={copy}
+        episodes={episodes}
+        selectedEpisodeIndex={reportEpisodeIndex}
+        signals={reportSignals}
+        pending={reportSignalsPending}
+        error={reportSignalsError}
+        onEpisodeChange={onReportEpisodeChange}
+      />
+
+      <div className="report-detail-grid">
+        <section className="report-card">
+          <h3>{copy.report.dataContract}</h3>
+          <dl className="report-definition-list">
+            {contractRows.map(([label, value]) => (
+              <div key={label}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+
+        <section className="report-card">
+          <h3>{copy.report.taskAndSensors}</h3>
+          <span className="report-overline">{copy.report.taskDescription}</span>
+          <p className="report-task">{tasks[0] ?? copy.report.noTask}</p>
+          {tasks.length > 1 && <small className="report-more-tasks">+{tasks.length - 1} more task descriptions</small>}
+          <dl className="report-definition-list">
+            <div><dt>{copy.report.robot}</dt><dd>{project.dataset.robot_type || notDeclared}</dd></div>
+            <div><dt>{copy.report.cameras}</dt><dd>{cameraSummary}</dd></div>
+            <div title={project.dataset.video_keys.join(", ")}>
+              <dt>{copy.report.streams}</dt>
+              <dd>{project.dataset.video_keys.length ? project.dataset.video_keys.join(", ") : notDeclared}</dd>
+            </div>
+            <div>
+              <dt>{copy.report.episodeLength}</dt>
+              <dd>
+                {durations.length
+                  ? `${medianDuration.toFixed(1)}s median · ${durations[0].toFixed(1)}–${durations[durations.length - 1].toFixed(1)}s range`
+                  : notDeclared}
+              </dd>
+            </div>
+          </dl>
+        </section>
+      </div>
+
+      <section className="report-card report-findings">
+        <h3>{copy.report.qualityFindings}</h3>
+        <div className="report-findings-grid">
+          <ReportMetricGroup title={copy.report.visualTemporal} metrics={visualMetrics} />
+          <ReportMetricGroup title={copy.report.motionControl} metrics={motionMetrics} />
+          <div className="report-recommendations">
+            <h4>{copy.report.recommendedActions}</h4>
+            {(recommendations.length ? recommendations : [copy.report.noActions]).map((recommendation, index) => (
+              <p key={recommendation}>
+                <span className={index === 1 ? "danger" : index === 0 ? "warning" : ""} aria-hidden="true">•</span>
+                {recommendation}
+              </p>
+            ))}
+          </div>
+        </div>
+        <footer>
+          Report schema v1.0 · {filterSummary?.stages.length ?? 0} checks · {summary.scorer_version} · local
+        </footer>
+      </section>
+    </section>
+  );
+}
+
+const reportChartColors = ["#62aaf3", "#ef7f8c", "#75d7a4", "#f0bf68"];
+const reportChartWidth = 640;
+const reportChartHeight = 250;
+const reportChartPlot = { left: 48, top: 18, right: 624, bottom: 214 };
+
+function ReportSignalCharts({
+  copy,
+  episodes,
+  selectedEpisodeIndex,
+  signals,
+  pending,
+  error,
+  onEpisodeChange,
+}: {
+  copy: Translation;
+  episodes: Episode[];
+  selectedEpisodeIndex: number | null;
+  signals: ReportSignals | null;
+  pending: boolean;
+  error: unknown;
+  onEpisodeChange: (episodeIndex: number) => void;
+}) {
+  const unavailable = {
+    no_named_gripper_dimensions: copy.report.noNamedGripperDimensions,
+    no_gripper_samples: copy.report.noGripperSamples,
+  }[signals?.gripper_unavailable_reason ?? ""];
+  const episodeSelect = (
+    <label className="report-signal-controls">
+      <span>{copy.report.reportEpisode}</span>
+      <select
+        aria-label={copy.report.reportEpisode}
+        disabled={!episodes.length}
+        value={selectedEpisodeIndex ?? ""}
+        onChange={(event) => onEpisodeChange(Number(event.target.value))}
+      >
+        {[...episodes]
+          .sort((left, right) => left.episode_index - right.episode_index)
+          .map((episode) => (
+            <option key={episode.episode_index} value={episode.episode_index}>
+              {episodeLabel(episode.episode_index)}
+            </option>
+          ))}
+      </select>
+    </label>
+  );
+  return (
+    <section className="report-card report-signals">
+      <div className="report-section-heading">
+        <div>
+          <h3>{copy.report.datasetSignals}</h3>
+          <p>{copy.report.timeSeconds} · {copy.report.durationSeconds}</p>
+        </div>
+      </div>
+      <div className="report-signal-grid">
+        <div className="report-signal-panel">
+          <div className="report-signal-chart-header">
+            <h4>{copy.report.gripperCurve}</h4>
+            {episodeSelect}
+          </div>
+          {pending && !signals ? (
+            <div className="report-chart-empty">{copy.report.loadingSignals}</div>
+          ) : error && !signals ? (
+            <div className="report-chart-empty error">{copy.report.signalsError}</div>
+          ) : signals ? (
+            signals.gripper_series.length ? (
+              <GripperCurveChart copy={copy} series={signals.gripper_series} />
+            ) : (
+              <div className="report-chart-empty">
+                {unavailable ?? copy.report.noGripperSamples}
+              </div>
+            )
+          ) : null}
+        </div>
+        <div className="report-signal-panel">
+          <h4>{copy.report.durationDistribution}</h4>
+          {pending && !signals ? (
+            <div className="report-chart-empty">{copy.report.loadingSignals}</div>
+          ) : error && !signals ? (
+            <div className="report-chart-empty error">{copy.report.signalsError}</div>
+          ) : signals ? (
+            <EpisodeDurationChart copy={copy} signals={signals} />
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GripperCurveChart({
+  copy,
+  series,
+}: {
+  copy: Translation;
+  series: ReportGripperSeries[];
+}) {
+  const points = series.flatMap((item) => item.points);
+  const [minX, maxX] = chartExtent(points.map((point) => point.timestamp), false);
+  const [minY, maxY] = chartExtent(points.map((point) => point.value), true);
+  const xTicks = chartTicks(minX, maxX);
+  const yTicks = chartTicks(minY, maxY);
+  return (
+    <>
+      <svg
+        aria-label={copy.report.gripperCurve}
+        className="report-chart"
+        role="img"
+        viewBox={`0 0 ${reportChartWidth} ${reportChartHeight}`}
+      >
+        <title>{copy.report.gripperCurve}</title>
+        <desc>{`${series.length} gripper action series over ${maxX.toFixed(2)} seconds`}</desc>
+        <ChartGrid
+          xTicks={xTicks}
+          yTicks={yTicks}
+          minX={minX}
+          maxX={maxX}
+          minY={minY}
+          maxY={maxY}
+        />
+        {series.map((item, index) => (
+          <path
+            d={chartLinePath(item, minX, maxX, minY, maxY)}
+            fill="none"
+            key={`${item.dimension_index}-${item.label}`}
+            stroke={reportChartColors[index % reportChartColors.length]}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="2.4"
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+        <text className="report-chart-axis-label" x="336" y="246">{copy.report.timeSeconds}</text>
+        <text className="report-chart-axis-label" transform="rotate(-90 12 116)" x="12" y="116">
+          {copy.report.actionValue}
+        </text>
+      </svg>
+      <div className="report-chart-legend">
+        {series.map((item, index) => (
+          <span key={`${item.dimension_index}-${item.label}`}>
+            <i style={{ background: reportChartColors[index % reportChartColors.length] }} />
+            {item.label}
+          </span>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function EpisodeDurationChart({
+  copy,
+  signals,
+}: {
+  copy: Translation;
+  signals: ReportSignals;
+}) {
+  const rows = signals.episode_durations;
+  const maxDuration = Math.max(
+    signals.mean_episode_duration_seconds,
+    ...rows.map((row) => row.duration_seconds),
+    1,
+  );
+  const yTicks = chartTicks(0, maxDuration);
+  const plotWidth = reportChartPlot.right - reportChartPlot.left;
+  const slot = plotWidth / Math.max(rows.length, 1);
+  const barWidth = Math.max(1, Math.min(18, slot * 0.72));
+  const meanY = chartScaleY(signals.mean_episode_duration_seconds, 0, maxDuration);
+  const labelEvery = Math.max(1, Math.ceil(rows.length / 8));
+  return (
+    <>
+      <svg
+        aria-label={copy.report.durationDistribution}
+        className="report-chart"
+        role="img"
+        viewBox={`0 0 ${reportChartWidth} ${reportChartHeight}`}
+      >
+        <title>{copy.report.durationDistribution}</title>
+        <desc>{`${rows.length} episodes; ${copy.report.meanDuration(signals.mean_episode_duration_seconds)}`}</desc>
+        {yTicks.map((tick) => {
+          const y = chartScaleY(tick, 0, maxDuration);
+          return (
+            <g key={tick}>
+              <line className="report-chart-gridline" x1={reportChartPlot.left} x2={reportChartPlot.right} y1={y} y2={y} />
+              <text className="report-chart-tick" textAnchor="end" x={reportChartPlot.left - 7} y={y + 4}>{tick.toFixed(1)}</text>
+            </g>
+          );
+        })}
+        {rows.map((row, index) => {
+          const x = reportChartPlot.left + slot * index + (slot - barWidth) / 2;
+          const y = chartScaleY(row.duration_seconds, 0, maxDuration);
+          return (
+            <g key={row.episode_index}>
+              <rect
+                fill="#4e9ff3"
+                height={Math.max(1, reportChartPlot.bottom - y)}
+                rx="2"
+                width={barWidth}
+                x={x}
+                y={y}
+              />
+              {(index % labelEvery === 0 || index === rows.length - 1) && (
+                <text className="report-chart-tick" textAnchor="middle" x={x + barWidth / 2} y={reportChartPlot.bottom + 16}>
+                  {row.episode_index}
+                </text>
+              )}
+            </g>
+          );
+        })}
+        <line
+          className="report-chart-mean"
+          x1={reportChartPlot.left}
+          x2={reportChartPlot.right}
+          y1={meanY}
+          y2={meanY}
+        />
+        <text className="report-chart-mean-label" textAnchor="end" x={reportChartPlot.right} y={Math.max(12, meanY - 7)}>
+          {copy.report.meanDuration(signals.mean_episode_duration_seconds)}
+        </text>
+        <text className="report-chart-axis-label" x="336" y="246">{copy.report.episodeIndex}</text>
+        <text className="report-chart-axis-label" transform="rotate(-90 12 116)" x="12" y="116">
+          {copy.report.durationSeconds}
+        </text>
+      </svg>
+      <p className="report-chart-summary">
+        {rows.length} {copy.report.episodes.toLowerCase()} · {copy.report.meanDuration(signals.mean_episode_duration_seconds)}
+      </p>
+    </>
+  );
+}
+
+function ChartGrid({
+  xTicks,
+  yTicks,
+  minX,
+  maxX,
+  minY,
+  maxY,
+}: {
+  xTicks: number[];
+  yTicks: number[];
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}) {
+  return (
+    <>
+      {yTicks.map((tick) => {
+        const y = chartScaleY(tick, minY, maxY);
+        return (
+          <g key={`y-${tick}`}>
+            <line className="report-chart-gridline" x1={reportChartPlot.left} x2={reportChartPlot.right} y1={y} y2={y} />
+            <text className="report-chart-tick" textAnchor="end" x={reportChartPlot.left - 7} y={y + 4}>{tick.toFixed(2)}</text>
+          </g>
+        );
+      })}
+      {xTicks.map((tick) => {
+        const x = chartScaleX(tick, minX, maxX);
+        return (
+          <text className="report-chart-tick" key={`x-${tick}`} textAnchor="middle" x={x} y={reportChartPlot.bottom + 16}>
+            {tick.toFixed(1)}
+          </text>
+        );
+      })}
+    </>
+  );
+}
+
+function chartExtent(values: number[], padded: boolean): [number, number] {
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return [0, 1];
+  const lower = Math.min(...finite);
+  const upper = Math.max(...finite);
+  if (lower === upper) {
+    const padding = Math.max(1, Math.abs(lower) * 0.1);
+    return [lower - padding, upper + padding];
+  }
+  const padding = padded ? (upper - lower) * 0.08 : 0;
+  return [lower - padding, upper + padding];
+}
+
+function chartTicks(minimum: number, maximum: number) {
+  return Array.from({ length: 5 }, (_, index) => minimum + ((maximum - minimum) * index) / 4);
+}
+
+function chartScaleX(value: number, minimum: number, maximum: number) {
+  return reportChartPlot.left
+    + ((value - minimum) / Math.max(maximum - minimum, Number.EPSILON))
+    * (reportChartPlot.right - reportChartPlot.left);
+}
+
+function chartScaleY(value: number, minimum: number, maximum: number) {
+  return reportChartPlot.bottom
+    - ((value - minimum) / Math.max(maximum - minimum, Number.EPSILON))
+    * (reportChartPlot.bottom - reportChartPlot.top);
+}
+
+function chartLinePath(
+  series: ReportGripperSeries,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+) {
+  return series.points
+    .map((point, index) => {
+      const x = chartScaleX(point.timestamp, minX, maxX);
+      const y = chartScaleY(point.value, minY, maxY);
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
+function ReportMetric({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div className={accent ? "accent" : ""}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ReportMetricGroup({
+  title,
+  metrics,
+}: {
+  title: string;
+  metrics: Array<{ metric: string; label: string; score: number }>;
+}) {
+  return (
+    <div className="report-metric-group">
+      <h4>{title}</h4>
+      {metrics.length ? metrics.map(({ metric, label, score }) => (
+        <p key={metric}><span>{label}</span><strong>{score}</strong></p>
+      )) : <p><span>Not evaluated</span><strong>—</strong></p>}
     </div>
   );
 }
@@ -432,42 +1838,78 @@ function summarizeCleaning(summary: CleaningSummary): CleaningSummary {
 }
 
 function EpisodeNavigation({
+  copy,
   episodes,
+  visibleEpisodes,
   qualityByEpisode,
   selected,
+  checkedEpisodeIndexes,
   searchQuery,
   activeFindingFilters,
+  filterSummary,
+  activeFilterStage,
+  enabledFilterStages,
+  taskSuccessEnabled,
+  kinematicsConfigured,
+  weights,
   onSearchChange,
   onToggleFindingFilter,
+  onOpenFilter,
+  onWeightChange,
+  onToggleChecked,
+  onToggleGroupChecked,
   onSelect,
 }: {
+  copy: Translation;
   episodes: Episode[];
+  visibleEpisodes: Episode[];
   qualityByEpisode: Map<number, EpisodeQualityResult>;
   selected: number | null;
+  checkedEpisodeIndexes: Set<number>;
   searchQuery: string;
   activeFindingFilters: string[];
+  filterSummary: FilterSummary | null;
+  activeFilterStage: FilterStageId | null;
+  enabledFilterStages: FilterStageId[];
+  taskSuccessEnabled: boolean;
+  kinematicsConfigured: boolean;
+  weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
+  onOpenFilter: (stageId: FilterStageId) => void;
+  onWeightChange: (key: string, value: number) => void;
+  onToggleChecked: (episodeIndex: number) => void;
+  onToggleGroupChecked: (episodeIndexes: number[]) => void;
   onSelect: (episodeIndex: number) => void;
 }) {
-  const visibleEpisodes = episodes.filter((episode) =>
-    episodeMatchesFilters(episode, qualityByEpisode.get(episode.episode_index), searchQuery, activeFindingFilters),
-  );
+  const [collapsedStatusFolders, setCollapsedStatusFolders] = useState<CleaningStatus[]>([]);
   if (qualityByEpisode.size === 0) {
     return (
       <>
         <SidebarFilters
+          copy={copy}
           searchQuery={searchQuery}
           activeFindingFilters={activeFindingFilters}
+          filterSummary={filterSummary}
+          activeFilterStage={activeFilterStage}
+          enabledFilterStages={enabledFilterStages}
+          taskSuccessEnabled={taskSuccessEnabled}
+          kinematicsConfigured={kinematicsConfigured}
+          weights={weights}
           onSearchChange={onSearchChange}
           onToggleFindingFilter={onToggleFindingFilter}
+          onOpenFilter={onOpenFilter}
+          onWeightChange={onWeightChange}
         />
         {visibleEpisodes.map((episode) => (
           <EpisodeRow
             key={episode.episode_index}
             episode={episode}
+            copy={copy}
             quality={null}
             active={episode.episode_index === selected}
+            checked={checkedEpisodeIndexes.has(episode.episode_index)}
+            onToggleChecked={() => onToggleChecked(episode.episode_index)}
             onSelect={() => onSelect(episode.episode_index)}
           />
         ))}
@@ -475,12 +1917,14 @@ function EpisodeNavigation({
     );
   }
   const groups: Array<{ status: CleaningStatus; label: string; episodes: Episode[] }> = [
-    { status: "review", label: "待审查", episodes: [] },
-    { status: "excluded", label: "排除", episodes: [] },
-    { status: "passed", label: "通过", episodes: [] },
+    { status: "review", label: copy.status.review, episodes: [] },
+    { status: "excluded", label: copy.status.excluded, episodes: [] },
+    { status: "passed", label: copy.status.passed, episodes: [] },
   ];
-  for (const episode of episodes) {
-    if (!visibleEpisodes.includes(episode)) continue;
+  const folderEpisodes = hasOnlyDefaultSidebarFilters(activeFindingFilters)
+    ? episodes.filter((episode) => episodeMatchesSearchQuery(episode, searchQuery))
+    : visibleEpisodes;
+  for (const episode of folderEpisodes) {
     const quality = qualityByEpisode.get(episode.episode_index);
     const group = groups.find((item) => item.status === quality?.status);
     if (group) group.episodes.push(episode);
@@ -488,29 +1932,144 @@ function EpisodeNavigation({
   return (
     <>
       <SidebarFilters
+        copy={copy}
         searchQuery={searchQuery}
         activeFindingFilters={activeFindingFilters}
+        filterSummary={filterSummary}
+        activeFilterStage={activeFilterStage}
+        enabledFilterStages={enabledFilterStages}
+        taskSuccessEnabled={taskSuccessEnabled}
+        kinematicsConfigured={kinematicsConfigured}
+        weights={weights}
         onSearchChange={onSearchChange}
         onToggleFindingFilter={onToggleFindingFilter}
+        onOpenFilter={onOpenFilter}
+        onWeightChange={onWeightChange}
       />
       {groups.map((group) => (
-        <section className="episode-folder" key={group.status}>
-          <div className="folder-heading">
-            <span>{group.label}</span>
-            <small>{group.episodes.length}</small>
-          </div>
-          {group.episodes.map((episode) => (
+        <StatusEpisodeFolder
+          key={group.status}
+          group={group}
+          copy={copy}
+          qualityByEpisode={qualityByEpisode}
+          selected={selected}
+          checkedEpisodeIndexes={checkedEpisodeIndexes}
+          collapsed={collapsedStatusFolders.includes(group.status)}
+          onToggleCollapsed={() =>
+            setCollapsedStatusFolders((current) =>
+              current.includes(group.status)
+                ? current.filter((status) => status !== group.status)
+                : [...current, group.status],
+            )
+          }
+          onToggleChecked={onToggleChecked}
+          onToggleGroupChecked={onToggleGroupChecked}
+          onSelect={onSelect}
+        />
+      ))}
+    </>
+  );
+}
+
+function StatusEpisodeFolder({
+  group,
+  copy,
+  qualityByEpisode,
+  selected,
+  checkedEpisodeIndexes,
+  collapsed,
+  onToggleCollapsed,
+  onToggleChecked,
+  onToggleGroupChecked,
+  onSelect,
+}: {
+  group: { status: CleaningStatus; label: string; episodes: Episode[] };
+  copy: Translation;
+  qualityByEpisode: Map<number, EpisodeQualityResult>;
+  selected: number | null;
+  checkedEpisodeIndexes: Set<number>;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+  onToggleChecked: (episodeIndex: number) => void;
+  onToggleGroupChecked: (episodeIndexes: number[]) => void;
+  onSelect: (episodeIndex: number) => void;
+}) {
+  const episodeIndexes = group.episodes.map((episode) => episode.episode_index);
+  const checkedCount = episodeIndexes.filter((episodeIndex) => checkedEpisodeIndexes.has(episodeIndex)).length;
+  const allChecked = episodeIndexes.length > 0 && checkedCount === episodeIndexes.length;
+  const partiallyChecked = checkedCount > 0 && !allChecked;
+  return (
+    <section className="episode-folder">
+      <div className="folder-heading">
+        <button
+          type="button"
+          className={`folder-toggle ${collapsed ? "" : "expanded"}`}
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${group.label} folder`}
+          onClick={onToggleCollapsed}
+        >
+          <span aria-hidden="true">▸</span>
+          <strong>{group.label}</strong>
+        </button>
+        <div className="folder-actions">
+          <FolderSelectionCheckbox
+            label={group.label}
+            checked={allChecked}
+            indeterminate={partiallyChecked}
+            disabled={episodeIndexes.length === 0}
+            onChange={() => onToggleGroupChecked(episodeIndexes)}
+          />
+          <small>{group.episodes.length}</small>
+        </div>
+      </div>
+      {collapsed
+        ? null
+        : group.episodes.map((episode) => (
             <EpisodeRow
               key={episode.episode_index}
               episode={episode}
+              copy={copy}
               quality={qualityByEpisode.get(episode.episode_index) ?? null}
               active={episode.episode_index === selected}
+              checked={checkedEpisodeIndexes.has(episode.episode_index)}
+              onToggleChecked={() => onToggleChecked(episode.episode_index)}
               onSelect={() => onSelect(episode.episode_index)}
             />
           ))}
-        </section>
-      ))}
-    </>
+    </section>
+  );
+}
+
+function FolderSelectionCheckbox({
+  label,
+  checked,
+  indeterminate,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  indeterminate: boolean;
+  disabled: boolean;
+  onChange: () => void;
+}) {
+  const checkboxRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (checkboxRef.current) {
+      checkboxRef.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+  return (
+    <label className="folder-check">
+      <input
+        ref={checkboxRef}
+        type="checkbox"
+        aria-label={`${checked ? "Clear all" : "Select all"} visible ${label} episodes for export`}
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+      />
+    </label>
   );
 }
 
@@ -519,43 +2078,79 @@ function episodeMatchesFilters(
   quality: EpisodeQualityResult | undefined,
   query: string,
   activeFilters: string[],
+  filterSummary: FilterSummary | null,
 ) {
+  if (!episodeMatchesSearchQuery(episode, query)) return false;
+  if (hasOnlyDefaultSidebarFilters(activeFilters)) return true;
+  if (activeFilters.length === 0 || (!quality && !filterSummary)) return true;
+  return activeFilters.every((filter) => {
+    if (isFilterStageId(filter)) {
+      const stage = filterSummary?.episodes
+        .find((item) => item.episode_index === episode.episode_index)
+        ?.stage_status[filter];
+      return Boolean(stage && !stage.skipped_reason && stage.count > 0);
+    }
+    return Boolean(quality?.findings.some((finding) => finding.code === filter));
+  });
+}
+
+function episodeMatchesSearchQuery(episode: Episode, query: string) {
   const normalizedQuery = query.trim().toLowerCase();
   const text = [
     compactEpisodeLabel(episode.episode_index),
     episodeLabel(episode.episode_index),
     episode.tasks.join(" "),
+    ...(episode.subtasks ?? []).flatMap((subtask) => [subtask.prompt, subtask.skill ?? ""]),
   ].join(" ").toLowerCase();
   if (normalizedQuery && !text.includes(normalizedQuery)) return false;
-  if (activeFilters.length === 0) return true;
-  return activeFilters.every((filter) => quality?.findings.some((finding) => finding.code === filter));
+  return true;
 }
 
 function SidebarFilters({
+  copy,
   searchQuery,
   activeFindingFilters,
+  filterSummary,
+  activeFilterStage,
+  enabledFilterStages,
+  taskSuccessEnabled,
+  kinematicsConfigured,
+  weights,
   onSearchChange,
   onToggleFindingFilter,
+  onOpenFilter,
+  onWeightChange,
 }: {
+  copy: Translation;
   searchQuery: string;
   activeFindingFilters: string[];
+  filterSummary: FilterSummary | null;
+  activeFilterStage: FilterStageId | null;
+  enabledFilterStages: FilterStageId[];
+  taskSuccessEnabled: boolean;
+  kinematicsConfigured: boolean;
+  weights: Record<string, number>;
   onSearchChange: (value: string) => void;
   onToggleFindingFilter: (code: string) => void;
+  onOpenFilter: (stageId: FilterStageId) => void;
+  onWeightChange: (key: string, value: number) => void;
 }) {
+  const counts = new Map((filterSummary?.stages ?? []).map((stage) => [stage.id, stage]));
+  const [expandedWeightStage, setExpandedWeightStage] = useState<QualityRuleId | null>(null);
   return (
     <div className="sidebar-tools">
       <label className="search-box">
-        <span>搜索 / 筛选</span>
+        <span>{copy.filters.search}</span>
         <input
-          aria-label="搜索 / 筛选"
+          aria-label={copy.filters.search}
           value={searchQuery}
           onChange={(event) => onSearchChange(event.target.value)}
           placeholder="#000184"
         />
       </label>
       <div className="filter-box">
-        <span>筛选器</span>
-        {findingFilters.map((filter) => (
+        <span>{copy.filters.filters}</span>
+        {findingFilters(copy).map((filter) => (
           <label key={filter.code}>
             <input
               type="checkbox"
@@ -565,65 +2160,901 @@ function SidebarFilters({
             {filter.label}
           </label>
         ))}
+        {dataFilters(copy).map((filter) => {
+          const stage = filter.stageId ? counts.get(filter.stageId) : undefined;
+          const configured =
+            filter.id === "kinematic_consistency"
+              ? kinematicsConfigured
+              : filter.id === "orientation_alignment"
+              ? false
+              : filter.id === "task_success"
+              ? taskSuccessEnabled
+              : true;
+          const checked = activeFindingFilters.includes(filter.code);
+          const ruleEnabled =
+            filter.id === "task_success"
+              ? taskSuccessEnabled
+              : filter.stageId
+              ? enabledFilterStages.includes(filter.stageId)
+              : false;
+          const badge =
+            !configured && (filter.id === "task_success" || filter.id === "kinematic_consistency" || filter.id === "orientation_alignment")
+              ? copy.filters.notConfigured
+              : stage?.skipped_reason
+              ? copy.filters.notConfigured
+              : String(stage?.count ?? 0);
+          const weight = weights[filter.id] ?? 1;
+          const weightEnabled = ruleEnabled && configured;
+          const expanded = expandedWeightStage === filter.id;
+          return (
+            <div className={`filter-row ${activeFilterStage === filter.id ? "active" : ""}`} key={filter.id}>
+              <div className="filter-row-main">
+                <label>
+                  <input
+                    type="checkbox"
+                    aria-label={filter.label}
+                    checked={checked}
+                    disabled={!configured}
+                    onChange={() => onToggleFindingFilter(filter.code)}
+                  />
+                  <button
+                    type="button"
+                    className="filter-link"
+                    disabled={!filter.stageId}
+                    onClick={() => {
+                      if (filter.stageId) onOpenFilter(filter.stageId);
+                    }}
+                  >
+                    {filter.label}
+                  </button>
+                </label>
+                <button
+                  type="button"
+                  className={`filter-expand-toggle ${expanded ? "expanded" : ""}`}
+                  aria-label={`${expanded ? "Collapse" : "Expand"} ${filter.label} weight`}
+                  aria-expanded={expanded}
+                  onClick={() => setExpandedWeightStage((current) => (current === filter.id ? null : filter.id))}
+                >
+                  <span aria-hidden="true">▸</span>
+                </button>
+                <small>{badge}</small>
+              </div>
+              {expanded ? (
+                <div className="filter-weight-panel">
+                  <input
+                    aria-label={`${filter.label} weight`}
+                    type="range"
+                    min="0.25"
+                    max="3"
+                    step="0.25"
+                    value={weight}
+                    disabled={!weightEnabled}
+                    onChange={(event) => onWeightChange(filter.id, Number(event.target.value))}
+                  />
+                  <strong>{weight.toFixed(2)}x</strong>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
 function EpisodeRow({
+  copy,
   episode,
   quality,
   active,
+  checked,
+  onToggleChecked,
   onSelect,
 }: {
+  copy: Translation;
   episode: Episode;
   quality: EpisodeQualityResult | null;
   active: boolean;
+  checked: boolean;
+  onToggleChecked: () => void;
   onSelect: () => void;
 }) {
+  const label = episodeLabel(episode.episode_index);
   return (
-    <button className={`episode-row ${active ? "active" : ""}`} onClick={onSelect}>
-      <span>
-        <strong>{quality ? compactEpisodeLabel(episode.episode_index) : episodeLabel(episode.episode_index)}</strong>
-        <small>
-          {quality
-            ? `${scoreLabel(quality.score)} · ${statusLabel(quality.status)} · ${quality.findings.length} issues`
-            : `${episode.length} frames · ${episode.duration_seconds.toFixed(1)} s`}
-        </small>
-      </span>
-      <b>›</b>
-    </button>
+    <div className={`episode-row-shell ${active ? "active" : ""}`}>
+      <label className="episode-check">
+        <input
+          type="checkbox"
+          aria-label={copy.exportPanel.toggleEpisode(label)}
+          checked={checked}
+          onChange={onToggleChecked}
+        />
+      </label>
+      <button className="episode-row" onClick={onSelect}>
+        <span>
+          <strong>{quality ? compactEpisodeLabel(episode.episode_index) : label}</strong>
+          <small>
+            {quality
+              ? `${scoreLabel(quality.score, copy)} · ${statusLabel(quality.status, copy)} · ${quality.findings.length} ${copy.quality.issues}`
+              : `${episode.length} ${copy.viewer.frames} · ${episode.duration_seconds.toFixed(1)} s`}
+          </small>
+        </span>
+        <b>›</b>
+      </button>
+    </div>
   );
 }
 
-function QualityReport({
-  quality,
+function FilterDetailView({
+  copy,
+  projectId,
+  detail,
   pending,
+  error,
+  onUrdfUpload,
+  onConfigSave,
+  configSaving,
+}: {
+  copy: Translation;
+  projectId: string;
+  detail: FilterDetail | null;
+  pending: boolean;
+  error: Error | null;
+  onUrdfUpload: (file: File) => void;
+  onConfigSave: (config: Partial<FilterConfig>) => void;
+  configSaving: boolean;
+}) {
+  if (pending) {
+    return <div className="viewer-placeholder"><h3>{copy.filterDetail.loading}</h3></div>;
+  }
+  if (error) {
+    return <div className="viewer-placeholder"><h3>{copy.filterDetail.unavailable}</h3><p>{error.message}</p></div>;
+  }
+  if (!detail) {
+    return <div className="viewer-placeholder"><h3>{copy.filterDetail.select}</h3></div>;
+  }
+  return (
+    <div className="filter-detail-page">
+      <div className="filter-detail-header">
+        <div>
+          <span className="eyebrow">{copy.filterDetail.eyebrow}</span>
+          <h3>{detail.title}</h3>
+        </div>
+        <span className={`filter-status ${detail.status}`}>
+          {detail.status === "passed" ? copy.status.passed : detail.status === "review" ? copy.status.review : copy.status.skipped}
+        </span>
+      </div>
+      {detail.stage_id === "kinematic_consistency" && (
+        <KinematicConfigStrip
+          copy={copy}
+          detail={detail}
+          onUrdfUpload={onUrdfUpload}
+          onConfigSave={onConfigSave}
+          saving={configSaving}
+        />
+      )}
+      {detail.stage_id === "visual_quality" && detail.visual_quality ? (
+        <VisualQualityPanel copy={copy} projectId={projectId} detail={detail} />
+      ) : detail.stage_id === "orientation_alignment" ? (
+        <OrientationPanel detail={detail} />
+      ) : detail.stage_id === "metadata_completeness" ? (
+        <MetadataCompletenessPanel copy={copy} detail={detail} />
+      ) : (
+        <>
+          <SignalChart detail={detail} />
+          <FilterRows copy={copy} detail={detail} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function VisualQualityPanel({
+  copy,
+  projectId,
+  detail,
+}: {
+  copy: Translation;
+  projectId: string;
+  detail: FilterDetail;
+}) {
+  const evidence = detail.visual_quality!;
+  const [camera, setCamera] = useState("all");
+  const [issue, setIssue] = useState("all");
+  const [metricsOpen, setMetricsOpen] = useState(false);
+  const [preview, setPreview] = useState<{ url: string; alt: string; frame: number } | null>(null);
+  const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
+  const cameras = [...new Set(evidence.incidents.map((incident) => incident.camera))].sort();
+  const issues = [...new Set(evidence.incidents.map((incident) => incident.issue))].sort();
+  const incidents = evidence.incidents.filter(
+    (incident) =>
+      (camera === "all" || incident.camera === camera)
+      && (issue === "all" || incident.issue === issue),
+  );
+  const issueRate = evidence.sampled_frame_count
+    ? ((evidence.issue_sample_count / evidence.sampled_frame_count) * 100).toFixed(1)
+    : "0.0";
+  const summary = detail.status === "skipped"
+    ? copy.filterDetail.visualSystemIssue
+    : detail.status === "passed" && evidence.issue_sample_count
+      ? copy.filterDetail.visualPassWithIssues(evidence.issue_sample_count)
+      : detail.status === "review"
+        ? copy.filterDetail.visualReviewSummary(evidence.issue_sample_count)
+        : copy.filterDetail.visualClean;
+  const systemIssues = detail.table_rows.filter((row) =>
+    ["video_missing", "decode_failed"].includes(String(row.issue ?? "")),
+  );
+
+  return (
+    <div className="visual-quality-panel">
+      <section className={`visual-quality-summary ${detail.status}`}>
+        <div>
+          <span className="eyebrow">{copy.filterDetail.visualEvidence}</span>
+          <strong>{summary}</strong>
+        </div>
+        <div className="visual-quality-metrics">
+          <div><b>{copy.filterDetail.visualIssueIntervals(evidence.incidents.length)}</b><small>{copy.filterDetail.visualTimeline}</small></div>
+          <div><b>{copy.filterDetail.visualAffectedCameras(evidence.affected_camera_count, evidence.camera_count)}</b><small>{copy.filterDetail.visualCamera}</small></div>
+          <div><b>{copy.filterDetail.visualSampledFrames(evidence.sampled_frame_count)}</b><small>{evidence.episode_frame_count} total</small></div>
+          <div><b>{copy.filterDetail.visualFlaggedRate(issueRate)}</b><small>{evidence.issue_sample_count} flagged</small></div>
+        </div>
+      </section>
+
+      {evidence.incidents.length > 0 && (
+        <section className="visual-issue-timeline" aria-label={copy.filterDetail.visualTimeline}>
+          <div className="visual-section-heading">
+            <strong>{copy.filterDetail.visualTimeline}</strong>
+            <small>0–{formatSeconds(evidence.episode_duration_seconds)}</small>
+          </div>
+          <div className="visual-timeline-track">
+            {evidence.incidents.map((incident) => {
+              const duration = Math.max(evidence.episode_duration_seconds, 0.001);
+              const left = Math.min(100, Math.max(0, incident.start_timestamp / duration * 100));
+              const width = Math.max(
+                0.8,
+                (incident.end_timestamp - incident.start_timestamp) / duration * 100,
+              );
+              return (
+                <button
+                  key={incident.id}
+                  type="button"
+                  className={`visual-timeline-marker issue-${incident.issue}`}
+                  style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}
+                  title={`${visualIssueLabel(copy, incident.issue)} · ${formatSeconds(incident.start_timestamp)}`}
+                  aria-label={`${visualIssueLabel(copy, incident.issue)} ${formatSeconds(incident.start_timestamp)}`}
+                  onClick={() => document
+                    .getElementById(`visual-incident-${safeDomId(incident.id)}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "nearest" })}
+                />
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {evidence.incidents.length > 0 && (
+        <div className="visual-evidence-toolbar">
+          <label>
+            <span>{copy.filterDetail.visualCamera}</span>
+            <select value={camera} onChange={(event) => setCamera(event.target.value)}>
+              <option value="all">{copy.filterDetail.visualAllCameras}</option>
+              {cameras.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>{copy.filterDetail.visualIssueType}</span>
+            <select value={issue} onChange={(event) => setIssue(event.target.value)}>
+              <option value="all">{copy.filterDetail.visualAllIssues}</option>
+              {issues.map((name) => (
+                <option key={name} value={name}>{visualIssueLabel(copy, name)}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+
+      {systemIssues.map((row, index) => (
+        <div className="visual-system-issue" key={`${String(row.camera)}-${index}`}>
+          <strong>{copy.filterDetail.visualSystemIssue}</strong>
+          <span>{String(row.camera ?? "-")} · {visualIssueLabel(copy, String(row.issue ?? ""))}</span>
+        </div>
+      ))}
+
+      {evidence.incidents.length === 0 && systemIssues.length === 0 ? (
+        <div className="visual-clean-state">
+          <strong>{copy.filterDetail.visualClean}</strong>
+          <span>{copy.filterDetail.visualSampledFrames(evidence.sampled_frame_count)} · {evidence.camera_count} cameras</span>
+        </div>
+      ) : evidence.incidents.length > 0 ? (
+        <div className="visual-incident-grid">
+          {incidents.map((incident) => (
+            <VisualIncidentCard
+              key={incident.id}
+              copy={copy}
+              projectId={projectId}
+              episodeIndex={detail.episode_index}
+              incident={incident}
+              failedImages={failedImages}
+              onImageError={(url) => setFailedImages((current) => new Set(current).add(url))}
+              onPreview={setPreview}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {Object.keys(evidence.metrics).length > 0 && <section className="visual-metrics-disclosure">
+        <button
+          type="button"
+          aria-label={copy.filterDetail.visualMetrics}
+          aria-expanded={metricsOpen}
+          onClick={() => setMetricsOpen((open) => !open)}
+        >
+          <span>{copy.filterDetail.visualMetrics}</span>
+          <span>{metricsOpen ? "−" : "+"}</span>
+        </button>
+        {metricsOpen && <VisualMetricsCharts detail={detail} />}
+      </section>}
+
+      {preview && (
+        <div className="visual-lightbox" role="dialog" aria-modal="true" aria-label={preview.alt}>
+          <button type="button" onClick={() => setPreview(null)}>{copy.filterDetail.visualClosePreview}</button>
+          <img src={preview.url} alt={preview.alt} />
+          <strong>{copy.filterDetail.visualFrame} {preview.frame}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VisualIncidentCard({
+  copy,
+  projectId,
+  episodeIndex,
+  incident,
+  failedImages,
+  onImageError,
+  onPreview,
+}: {
+  copy: Translation;
+  projectId: string;
+  episodeIndex: number;
+  incident: VisualQualityIncident;
+  failedImages: Set<string>;
+  onImageError: (url: string) => void;
+  onPreview: (preview: { url: string; alt: string; frame: number }) => void;
+}) {
+  return (
+    <article
+      className={`visual-incident-card issue-${incident.issue}`}
+      id={`visual-incident-${safeDomId(incident.id)}`}
+    >
+      <header>
+        <div>
+          <span className="visual-issue-pill">{visualIssueLabel(copy, incident.issue)}</span>
+          <strong>{incident.camera}</strong>
+        </div>
+        <small>{incident.sample_count} {copy.filterDetail.visualSamples}</small>
+      </header>
+      <div className="visual-incident-range">
+        <b>
+          {incident.start_frame === incident.end_frame
+            ? `${copy.filterDetail.visualFrame} ${incident.start_frame}`
+            : `${copy.filterDetail.visualFrame} ${incident.start_frame}–${incident.end_frame}`}
+        </b>
+        <span>
+          {formatSeconds(incident.start_timestamp)}
+          {incident.end_timestamp > incident.start_timestamp
+            ? `–${formatSeconds(incident.end_timestamp)}`
+            : ""}
+        </span>
+      </div>
+      <div className="visual-evidence-strip">
+        {incident.representative_frames.map((frame) => {
+          const url = visualEvidenceUrl(projectId, episodeIndex, incident.camera, frame.frame, 640);
+          const alt = `${visualIssueLabel(copy, incident.issue)} evidence at frame ${frame.frame} from ${incident.camera}`;
+          return (
+            <button
+              type="button"
+              className="visual-evidence-image"
+              key={`${frame.frame}-${frame.timestamp}`}
+              onClick={() => onPreview({
+                url: visualEvidenceUrl(projectId, episodeIndex, incident.camera, frame.frame, 1600),
+                alt,
+                frame: frame.frame,
+              })}
+            >
+              {failedImages.has(url) ? (
+                <span>{copy.filterDetail.visualImageUnavailable}</span>
+              ) : (
+                <img src={url} alt={alt} onError={() => onImageError(url)} />
+              )}
+              <small>{copy.filterDetail.visualFrame} {frame.frame}</small>
+            </button>
+          );
+        })}
+      </div>
+      <footer>
+        <span>{copy.filterDetail.visualObserved}: <b>{String(incident.worst_value)}</b></span>
+        <span>{copy.filterDetail.visualThreshold}: <b>{String(incident.threshold)}</b></span>
+      </footer>
+    </article>
+  );
+}
+
+function VisualMetricsCharts({ detail }: { detail: FilterDetail }) {
+  const evidence = detail.visual_quality!;
+  const thresholds = detail.thresholds.visual_quality ?? {};
+  const definitions: Array<{
+    key: "sharpness" | "brightness" | "contrast";
+    thresholds: number[];
+  }> = [
+    { key: "sharpness", thresholds: [thresholds.blur_laplacian].filter(Number.isFinite) },
+    { key: "brightness", thresholds: [thresholds.dark_mean, thresholds.bright_mean].filter(Number.isFinite) },
+    { key: "contrast", thresholds: [thresholds.low_contrast_std].filter(Number.isFinite) },
+  ];
+  return (
+    <div className="visual-camera-charts">
+      {Object.entries(evidence.metrics).map(([camera, samples]) => (
+        <section key={camera}>
+          <strong>{camera}</strong>
+          <div className="visual-metric-grid">
+            {definitions.map((definition) => (
+              <VisualMetricChart
+                key={definition.key}
+                label={definition.key}
+                metric={definition.key}
+                samples={samples}
+                duration={evidence.episode_duration_seconds}
+                thresholds={definition.thresholds}
+              />
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function VisualMetricChart({
+  label,
+  metric,
+  samples,
+  duration,
+  thresholds,
+}: {
+  label: string;
+  metric: "sharpness" | "brightness" | "contrast";
+  samples: VisualQualityMetricSample[];
+  duration: number;
+  thresholds: number[];
+}) {
+  const values = samples
+    .map((sample) => sample[metric])
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  const domain = [...values, ...thresholds];
+  const min = Math.min(...domain, 0);
+  const max = Math.max(...domain, 1);
+  const span = Math.max(max - min, 1e-9);
+  const y = (value: number) => 108 - ((value - min) / span) * 92;
+  const points = samples
+    .filter((sample) => sample[metric] !== null)
+    .map((sample) => {
+      const x = 8 + sample.timestamp / Math.max(duration, 0.001) * 704;
+      return `${x.toFixed(1)},${y(sample[metric] as number).toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <div className="visual-metric-chart">
+      <span>{label}</span>
+      <svg viewBox="0 0 720 120" role="img" aria-label={`${label} over time`}>
+        <rect x="0" y="0" width="720" height="120" rx="8" />
+        {thresholds.map((threshold) => (
+          <line
+            className="visual-threshold-line"
+            key={threshold}
+            x1="0"
+            x2="720"
+            y1={y(threshold)}
+            y2={y(threshold)}
+          />
+        ))}
+        <polyline className="visual-metric-line" points={points} />
+      </svg>
+    </div>
+  );
+}
+
+function visualEvidenceUrl(
+  projectId: string,
+  episodeIndex: number,
+  camera: string,
+  frame: number,
+  width: number,
+) {
+  return `/api/projects/${projectId}/episodes/${episodeIndex}/visual-quality/frame?camera=${encodeURIComponent(camera)}&frame=${frame}&width=${width}`;
+}
+
+function visualIssueLabel(copy: Translation, issue: string) {
+  return copy.filterDetail.visualIssueLabels[issue] ?? issue;
+}
+
+function formatSeconds(value: number) {
+  return `${value.toFixed(value >= 10 ? 1 : 2)}s`;
+}
+
+function safeDomId(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-");
+}
+
+function KinematicConfigStrip({
+  copy,
+  detail,
+  onUrdfUpload,
+  onConfigSave,
+  saving,
+}: {
+  copy: Translation;
+  detail: FilterDetail;
+  onUrdfUpload: (file: File) => void;
+  onConfigSave: (config: Partial<FilterConfig>) => void;
+  saving: boolean;
+}) {
+  const parameters = detail.parameters as Record<string, unknown>;
+  const [endEffectorLink, setEndEffectorLink] = useState("");
+  const [jointNames, setJointNames] = useState("");
+  const [jointStateIndices, setJointStateIndices] = useState("");
+  const [eefPositionIndices, setEefPositionIndices] = useState("");
+  const [positionTolerance, setPositionTolerance] = useState("0.05");
+  const [resolveTcpOffset, setResolveTcpOffset] = useState(true);
+
+  useEffect(() => {
+    setEndEffectorLink(String(parameters.end_effector_link ?? ""));
+    setJointNames((parameters.joint_names as string[] | undefined)?.join(", ") ?? "");
+    setJointStateIndices((parameters.joint_state_indices as number[] | undefined)?.join(", ") ?? "");
+    setEefPositionIndices((parameters.eef_position_indices as number[] | undefined)?.join(", ") ?? "");
+    setPositionTolerance(String(parameters.position_tolerance ?? 0.05));
+    setResolveTcpOffset(Boolean(parameters.resolve_tcp_offset ?? true));
+  }, [parameters]);
+
+  const save = () => {
+    onConfigSave({
+      kinematics: {
+        urdf_path: (parameters.urdf_path as string | null | undefined) ?? null,
+        end_effector_link: endEffectorLink.trim() || null,
+        joint_names: parseStringList(jointNames),
+        joint_state_indices: parseNumberList(jointStateIndices),
+        eef_position_indices: parseNumberList(eefPositionIndices),
+        position_tolerance: Number(positionTolerance) || 0.05,
+        resolve_tcp_offset: resolveTcpOffset,
+      },
+    });
+  };
+
+  return (
+    <div className="kinematic-config">
+      <label className="file-button">
+        <span>{copy.kinematics.importUrdf}</span>
+        <input
+          aria-label={copy.kinematics.importUrdf}
+          type="file"
+          accept=".urdf"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onUrdfUpload(file);
+          }}
+        />
+      </label>
+      <label>
+        <span>{copy.kinematics.endEffectorLink}</span>
+        <input
+          aria-label={copy.kinematics.endEffectorLink}
+          value={endEffectorLink}
+          onChange={(event) => setEndEffectorLink(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>{copy.kinematics.jointNames}</span>
+        <input
+          aria-label={copy.kinematics.jointNames}
+          value={jointNames}
+          onChange={(event) => setJointNames(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>{copy.kinematics.jointStateIndices}</span>
+        <input
+          aria-label={copy.kinematics.jointStateIndices}
+          value={jointStateIndices}
+          onChange={(event) => setJointStateIndices(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>{copy.kinematics.eefPositionIndices}</span>
+        <input
+          aria-label={copy.kinematics.eefPositionIndices}
+          value={eefPositionIndices}
+          onChange={(event) => setEefPositionIndices(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>{copy.kinematics.tolerance}</span>
+        <input
+          aria-label={copy.kinematics.positionTolerance}
+          type="number"
+          step="0.01"
+          value={positionTolerance}
+          onChange={(event) => setPositionTolerance(event.target.value)}
+        />
+      </label>
+      <label className="inline-toggle">
+        <input
+          aria-label={copy.kinematics.tcpOffset}
+          type="checkbox"
+          checked={resolveTcpOffset}
+          onChange={(event) => setResolveTcpOffset(event.target.checked)}
+        />
+        <span>{copy.kinematics.tcpOffset}</span>
+      </label>
+      <button type="button" className="secondary compact" onClick={save} disabled={saving}>
+        {saving ? copy.kinematics.saving : copy.kinematics.saveConfig}
+      </button>
+    </div>
+  );
+}
+
+function parseStringList(value: string) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function parseNumberList(value: string) {
+  return value
+    .split(",")
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isFinite(item));
+}
+
+function SignalChart({ detail }: { detail: FilterDetail }) {
+  const entries = Object.entries(detail.series).slice(0, 3);
+  const threshold = Object.entries(detail.thresholds)[0]?.[1] ?? {};
+  return (
+    <div className="filter-chart">
+      <div className="chart-labels">
+        {entries.map(([name]) => <span key={name}>{name}</span>)}
+        {Object.keys(threshold).map((name) => <b key={name}>{name}</b>)}
+      </div>
+      <svg viewBox="0 0 720 260" role="img" aria-label={`${detail.title} visualization`}>
+        <rect x="0" y="0" width="720" height="260" rx="8" />
+        <g className="grid">
+          {Array.from({ length: 6 }, (_, index) => <line key={`h-${index}`} x1="0" x2="720" y1={index * 52} y2={index * 52} />)}
+          {Array.from({ length: 9 }, (_, index) => <line key={`v-${index}`} y1="0" y2="260" x1={index * 90} x2={index * 90} />)}
+        </g>
+        {entries.map(([name, values], index) => (
+          <polyline key={name} className={`series series-${index}`} points={polylinePoints(values, 720, 220, 20)} />
+        ))}
+        {detail.table_rows.slice(0, 12).map((row, index) => (
+          <line
+            className="flag-line"
+            key={index}
+            x1={Math.min(700, Number(row.frame ?? 0) * 4)}
+            x2={Math.min(700, Number(row.frame ?? 0) * 4)}
+            y1="20"
+            y2="240"
+          />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function OrientationPanel({ detail }: { detail: FilterDetail }) {
+  return (
+    <div className="orientation-panel">
+      <div className="axis-scene">
+        <span className="axis x">x</span>
+        <span className="axis y">y</span>
+        <span className="axis z">z</span>
+      </div>
+      <SignalChart detail={detail} />
+    </div>
+  );
+}
+
+type MetadataInspectionRow = {
+  kind?: string;
+  check?: string;
+  scope?: string;
+  status?: string;
+  label?: string;
+  expected?: string;
+  value?: string;
+  detail?: string | null;
+};
+
+function metadataInspectionRows(detail: FilterDetail): MetadataInspectionRow[] {
+  return detail.table_rows.filter((row) => row.kind === "inspection") as MetadataInspectionRow[];
+}
+
+function metadataInspectionLabel(copy: Translation, row: MetadataInspectionRow) {
+  const check = String(row.check ?? "");
+  return copy.filterDetail.metadataChecks[check] ?? row.label ?? check;
+}
+
+function metadataInspectionStatus(copy: Translation, status: string | undefined) {
+  if (status === "warning") return copy.filterDetail.metadataStatusWarning;
+  if (status === "info") return copy.filterDetail.metadataStatusInfo;
+  return copy.filterDetail.metadataStatusPassed;
+}
+
+function MetadataCompletenessPanel({
+  copy,
+  detail,
+}: {
+  copy: Translation;
+  detail: FilterDetail;
+}) {
+  const rows = metadataInspectionRows(detail);
+  const summary = (detail.parameters.summary ?? {}) as {
+    passed?: number;
+    total_checks?: number;
+    warnings?: number;
+    infos?: number;
+  };
+  const passed = summary.passed ?? rows.filter((row) => row.status === "passed").length;
+  const total = summary.total_checks ?? rows.length;
+  const allPassed = detail.findings.length === 0;
+
+  return (
+    <div className="metadata-inspection-panel">
+      <div className="metadata-inspection-summary">
+        <strong>{copy.filterDetail.metadataSummary(passed, total)}</strong>
+        <small>{allPassed ? copy.filterDetail.metadataAllPassed : copy.quality.issuesFound(detail.findings.length)}</small>
+      </div>
+      <div className="metadata-inspection-table">
+        <div className="metadata-inspection-header">
+          <span>{copy.filterDetail.metadataCheck}</span>
+          <span>{copy.filterDetail.metadataScope}</span>
+          <span>{copy.filterDetail.metadataExpected}</span>
+          <span>{copy.filterDetail.metadataActual}</span>
+          <span>{copy.status.passed}</span>
+        </div>
+        {rows.map((row) => (
+          <div className="metadata-inspection-row" key={String(row.check)}>
+            <strong>{metadataInspectionLabel(copy, row)}</strong>
+            <span>
+              {row.scope === "dataset"
+                ? copy.filterDetail.metadataScopeDataset
+                : copy.filterDetail.metadataScopeEpisode}
+            </span>
+            <span>{String(row.expected ?? "-")}</span>
+            <span>
+              {String(row.value ?? "-")}
+              {row.detail ? <small>{`${copy.filterDetail.metadataDetail}: ${row.detail}`}</small> : null}
+            </span>
+            <span className={`inspection-status ${row.status ?? "passed"}`}>
+              {metadataInspectionStatus(copy, row.status)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FilterRows({ copy, detail }: { copy: Translation; detail: FilterDetail }) {
+  const rows = detail.table_rows.slice(0, 8);
+  return (
+    <div className="filter-table">
+      {rows.length === 0 ? (
+        <p>{detail.skipped_reason ? copy.filterDetail.needsConfig : copy.filterDetail.noFlaggedFrames}</p>
+      ) : (
+        rows.map((row, index) => (
+          <div key={index}>
+            <span>frame {String(row.frame ?? "-")}</span>
+            <strong>{String(row.dimension ?? row.source ?? row.issue ?? row.status ?? row.camera ?? "-")}</strong>
+            <small>
+              {Object.entries(row)
+                .filter(([key]) => key !== "frame")
+                .slice(0, 4)
+                .map(([key, value]) => `${key}: ${String(value)}`)
+                .join(" · ")}
+            </small>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function polylinePoints(values: number[], width: number, height: number, top: number) {
+  if (values.length === 0) return "";
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(max - min, 1e-9);
+  return values
+    .map((value, index) => {
+      const x = values.length === 1 ? 0 : (index / (values.length - 1)) * width;
+      const y = top + height - ((value - min) / span) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function QualityReport({
+  copy,
+  quality,
+  filterDetail,
+  filterPending,
+  pending,
+  rerunPending,
+  requiresRerun,
   onDecision,
   onAddToPipeline,
+  onOpenFilter,
 }: {
+  copy: Translation;
   quality: EpisodeQualityResult | null;
+  filterDetail: FilterDetail | null;
+  filterPending: boolean;
   pending: boolean;
+  rerunPending: boolean;
+  requiresRerun: boolean;
   onDecision: (status: "passed" | "excluded") => void;
   onAddToPipeline: () => void;
+  onOpenFilter: (stageId: FilterStageId) => void;
 }) {
+  if (filterDetail || filterPending) {
+    return (
+      <FilterReport
+        copy={copy}
+        detail={filterDetail}
+        filterPending={filterPending}
+        quality={quality}
+        decisionPending={pending}
+        rerunPending={rerunPending}
+        onDecision={onDecision}
+        onAddToPipeline={onAddToPipeline}
+      />
+    );
+  }
   return (
     <aside className="quality-panel">
       <div className="panel-heading">
-        <span>Quality Report</span>
+        <span>{copy.quality.report}</span>
       </div>
       {!quality ? (
         <div className="quality-empty">
-          <strong>Not scored</strong>
-          <p>Run the cleaning pipeline to classify episodes.</p>
+          <strong>{copy.quality.notScored}</strong>
+          <p>{copy.quality.runPipeline}</p>
         </div>
       ) : (
         <div className="quality-body">
+          {requiresRerun && (
+            <div className="finding">
+              <strong>{copy.quality.rerunRequired}</strong>
+              <p>{copy.quality.rerunExplanation}</p>
+            </div>
+          )}
           <div className="quality-score">
-            <span>{scoreLabel(quality.score)}</span>
-            <small>{statusLabel(quality.status)} · {quality.source}</small>
+            <span>{scoreLabel(quality.score, copy)}</span>
+            <small>{statusLabel(quality.status, copy)}{copy.quality.sourceSeparator}{quality.source}</small>
           </div>
           <div className="score-list">
+            <div>
+              <span>{copy.quality.dataQuality}</span>
+              <strong>
+                {quality.data_quality_score === null
+                  ? copy.quality.notEvaluated
+                  : Math.round(quality.data_quality_score * 100)}
+              </strong>
+            </div>
+            <div>
+              <span>{copy.quality.taskSuccess}</span>
+              <strong>
+                {quality.task_success_score === null
+                  ? copy.quality.notEvaluated
+                  : Math.round(quality.task_success_score * 100)}
+              </strong>
+            </div>
             {Object.entries(quality.per_attribute_scores).map(([name, value]) => (
               <div key={name}>
                 <span>{name.replaceAll("_", " ")}</span>
@@ -632,22 +3063,139 @@ function QualityReport({
             ))}
           </div>
           <div className="finding-list">
-            <h3>发现 {quality.findings.length} 个问题</h3>
+            <h3>{copy.quality.issuesFound(quality.findings.length)}</h3>
             {quality.findings.length === 0 ? (
-              <p>No quality findings.</p>
+              <p>{copy.quality.noFindings}</p>
             ) : (
-              quality.findings.map((finding) => (
-                <div className="finding" key={`${finding.code}-${finding.message}`}>
-                  {finding.message}
-                </div>
-              ))
+              quality.findings.map((finding) => {
+                const stageId = filterStageForFindingCode(finding.code);
+                return stageId ? (
+                  <button
+                    type="button"
+                    className="finding finding-button"
+                    key={`${finding.code}-${finding.message}`}
+                    onClick={() => onOpenFilter(stageId)}
+                  >
+                    {finding.message}
+                  </button>
+                ) : (
+                  <div className="finding" key={`${finding.code}-${finding.message}`}>
+                    {finding.message}
+                  </div>
+                );
+              })
             )}
           </div>
           <div className="review-actions">
-            <button disabled={pending} onClick={() => onDecision("passed")}>通过</button>
-            <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>排除</button>
+            {quality.status !== "passed" && (
+              <button disabled={pending} onClick={() => onDecision("passed")}>{copy.status.passed}</button>
+            )}
+            {quality.status !== "excluded" && (
+              <button className="secondary danger" disabled={pending} onClick={() => onDecision("excluded")}>{copy.status.excluded}</button>
+            )}
             <button className="secondary span-all" disabled={pending} onClick={onAddToPipeline}>
-              加入清洗 Pipeline
+              {rerunPending ? copy.viewer.cleaningSelected : copy.quality.rerunEpisode}
+            </button>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function FilterReport({
+  copy,
+  detail,
+  filterPending,
+  quality,
+  decisionPending,
+  rerunPending,
+  onDecision,
+  onAddToPipeline,
+}: {
+  copy: Translation;
+  detail: FilterDetail | null;
+  filterPending: boolean;
+  quality: EpisodeQualityResult | null;
+  decisionPending: boolean;
+  rerunPending: boolean;
+  onDecision: (status: "passed" | "excluded") => void;
+  onAddToPipeline: () => void;
+}) {
+  return (
+    <aside className="quality-panel">
+      <div className="panel-heading">
+        <span>{copy.filterDetail.detail}</span>
+      </div>
+      {filterPending || !detail ? (
+        <div className="quality-empty"><strong>{copy.filterDetail.loadingShort}</strong></div>
+      ) : (
+        <div className="quality-body">
+          <div className="quality-score">
+            <span>{detail.status === "review" ? copy.status.review : detail.status === "passed" ? copy.status.passed : copy.status.skipped}</span>
+            <small>{detail.title}</small>
+          </div>
+          {detail.stage_id === "metadata_completeness" ? (
+            <>
+              <div className="score-list">
+                {Object.entries((detail.parameters.summary ?? {}) as Record<string, number>).map(([name, value]) => (
+                  <div key={name}>
+                    <span>{name.replaceAll("_", " ")}</span>
+                    <strong>{String(value)}</strong>
+                  </div>
+                ))}
+              </div>
+              <div className="finding-list">
+                <h3>{copy.quality.issuesFound(detail.findings.length)}</h3>
+                {detail.findings.length === 0 ? (
+                  <p>{copy.filterDetail.metadataAllPassed}</p>
+                ) : (
+                  detail.findings.map((finding) => (
+                    <div className="finding" key={`${finding.code}-${finding.message}`}>{finding.message}</div>
+                  ))
+                )}
+              </div>
+              <details className="metadata-config-details">
+                <summary>{copy.filterDetail.metadataConfig}</summary>
+                <div className="score-list">
+                  {Object.entries(detail.parameters)
+                    .filter(([name]) => name !== "summary")
+                    .map(([name, value]) => (
+                      <div key={name}>
+                        <span>{name.replaceAll("_", " ")}</span>
+                        <strong>{Array.isArray(value) ? value.join(", ") || "-" : String(value ?? "-")}</strong>
+                      </div>
+                    ))}
+                </div>
+              </details>
+            </>
+          ) : (
+            <>
+              <div className="score-list">
+                {Object.entries(detail.parameters).map(([name, value]) => (
+                  <div key={name}>
+                    <span>{name.replaceAll("_", " ")}</span>
+                    <strong>{Array.isArray(value) ? value.join(", ") || "-" : String(value ?? "-")}</strong>
+                  </div>
+                ))}
+              </div>
+              <div className="finding-list">
+                <h3>{copy.quality.issuesFound(detail.findings.length)}</h3>
+                {detail.findings.map((finding) => (
+                  <div className="finding" key={`${finding.code}-${finding.message}`}>{finding.message}</div>
+                ))}
+              </div>
+            </>
+          )}
+          <div className="review-actions">
+            {quality && quality.status !== "passed" && (
+              <button disabled={decisionPending} onClick={() => onDecision("passed")}>{copy.status.passed}</button>
+            )}
+            {quality && quality.status !== "excluded" && (
+              <button className="secondary danger" disabled={decisionPending} onClick={() => onDecision("excluded")}>{copy.status.excluded}</button>
+            )}
+            <button className="secondary span-all" disabled={decisionPending} onClick={onAddToPipeline}>
+              {rerunPending ? copy.viewer.cleaningSelected : copy.quality.rerunEpisode}
             </button>
           </div>
         </div>
@@ -657,9 +3205,11 @@ function QualityReport({
 }
 
 function VlmSettingsPanel({
+  copy,
   settings,
   onChange,
 }: {
+  copy: Translation;
   settings: VlmSettings;
   onChange: (settings: VlmSettings) => void;
 }) {
@@ -669,14 +3219,14 @@ function VlmSettingsPanel({
       <label className="checkbox-row">
         <input
           type="checkbox"
-          aria-label="启用 VLM"
+          aria-label={copy.vlm.enable}
           checked={settings.enabled}
           onChange={(event) => update({ enabled: event.target.checked })}
         />
-        启用 VLM
+        {copy.vlm.enable}
       </label>
       <label>
-        <span>Provider</span>
+        <span>{copy.vlm.provider}</span>
         <select
           aria-label="VLM Provider"
           value={settings.provider}
@@ -688,15 +3238,15 @@ function VlmSettingsPanel({
         </select>
       </label>
       <label>
-        <span>Model</span>
+        <span>{copy.vlm.model}</span>
         <input
-          aria-label="VLM 模型"
+          aria-label={copy.vlm.modelAria}
           value={settings.model}
           onChange={(event) => update({ model: event.target.value })}
         />
       </label>
       <label>
-        <span>API Base URL</span>
+        <span>{copy.vlm.apiBaseUrl}</span>
         <input
           aria-label="VLM API Base URL"
           placeholder="https://api.openai.com/v1"
@@ -705,17 +3255,20 @@ function VlmSettingsPanel({
         />
       </label>
       <label>
-        <span>API Key</span>
+        <span>{copy.vlm.apiKey}</span>
         <input
           aria-label="VLM API Key"
           type="password"
-          placeholder="Use env var if blank"
+          placeholder={settings.api_key_configured ? copy.vlm.apiKeyConfiguredPlaceholder : copy.vlm.apiKeyPlaceholder}
           value={settings.api_key ?? ""}
           onChange={(event) => update({ api_key: event.target.value || null })}
         />
+        {settings.api_key_configured && !settings.api_key ? (
+          <small>{copy.vlm.apiKeyConfigured}</small>
+        ) : null}
       </label>
       <label>
-        <span>Sample Frames</span>
+        <span>{copy.vlm.sampleFrames}</span>
         <input
           aria-label="VLM Sample Frames"
           type="number"
@@ -726,7 +3279,7 @@ function VlmSettingsPanel({
         />
       </label>
       <label>
-        <span>Prompt</span>
+        <span>{copy.vlm.prompt}</span>
         <textarea
           aria-label="VLM Prompt"
           value={settings.prompt}

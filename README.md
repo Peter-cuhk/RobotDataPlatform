@@ -67,6 +67,7 @@ tests/                 后端和 reader 测试
 - Node.js 20+
 - pnpm 10+ / 11+
 - 推荐浏览器：Chrome / Chromium
+- Pinocchio 4.x，用于运动学一致性筛选；pip 包名是 `pin`，Python import 名是 `pinocchio`
 - 如果使用 OpenAI-compatible VLM 评分，需要安装 `ffmpeg`
 
 如果没有 pnpm，可以安装：
@@ -92,6 +93,14 @@ python3 -m venv .venv
 pnpm install
 .venv/bin/python scripts/download_sample.py
 ```
+
+`.[dev]` 会安装后端、测试依赖和 Pinocchio。若你只想手动补装运动学一致性依赖，可以执行：
+
+```bash
+.venv/bin/python -m pip install 'pin>=4,<5'
+```
+
+平台内置了 lightweight LeRobot reader，默认环境不需要额外安装官方 `lerobot` Python 包；官方 writer 仅在当前环境已安装且版本兼容时自动使用，否则会走本地 fallback。
 
 下载完成后，样例数据会在：
 

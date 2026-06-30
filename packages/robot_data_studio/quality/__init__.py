@@ -9,6 +9,15 @@ from .models import (
     VlmSettings,
 )
 from .scorer import EpisodeQualityScorer
+from .filter_models import (
+    FilterConfig,
+    FilterConfigPatch,
+    FilterDetail,
+    FilterKinematicsConfig,
+    FilterRun,
+    FilterSummary,
+    FilterVisualQualityConfig,
+)
 
 __all__ = [
     "CleaningConfig",
@@ -17,6 +26,13 @@ __all__ = [
     "EpisodeDecisionRequest",
     "EpisodeQualityResult",
     "EpisodeQualityScorer",
+    "FilterConfig",
+    "FilterConfigPatch",
+    "FilterDetail",
+    "FilterKinematicsConfig",
+    "FilterRun",
+    "FilterSummary",
+    "FilterVisualQualityConfig",
     "QualityFinding",
     "VlmEvaluation",
     "VlmSettings",

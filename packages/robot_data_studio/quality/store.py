@@ -7,7 +7,7 @@ from robot_data_studio.lerobot.models import EpisodeSummary
 
 from .models import CleaningConfig, CleaningSummary, EpisodeQualityResult, VlmSettings, utc_now
 
-SCORER_VERSION = "score_lerobot_episodes-compatible-v1"
+SCORER_VERSION = "quality-rules-v2"
 
 
 class CleaningStateStore:
@@ -36,7 +36,7 @@ class VlmSettingsStore:
 
     def save(self, settings: VlmSettings) -> VlmSettings:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(settings.model_dump(mode="json"), indent=2))
+        self.path.write_text(json.dumps(settings.__dict__, indent=2))
         return settings
 
 

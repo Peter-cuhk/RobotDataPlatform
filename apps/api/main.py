@@ -1,7 +1,9 @@
+import asyncio
+import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from robot_data_studio.formats import UnsupportedDatasetFormat
 from robot_data_studio.projects.models import CleaningRunRequest, CreateProjectRequest, ExportRequest, Project
@@ -11,8 +13,14 @@ from robot_data_studio.quality import (
     CleaningSummary,
     EpisodeDecisionRequest,
     EpisodeQualityResult,
+    FilterConfig,
+    FilterConfigPatch,
+    FilterDetail,
+    FilterRun,
+    FilterSummary,
     VlmSettings,
 )
+from robot_data_studio.reports import ReportSignals
 from robot_data_studio.viewer import create_episode_recording
 
 
@@ -56,6 +64,50 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
+    @app.get(
+        "/api/projects/{project_id}/report-signals",
+        response_model=ReportSignals,
+    )
+    def report_signals(
+        project_id: str,
+        episode_index: int = Query(ge=0),
+    ) -> ReportSignals:
+        try:
+            return service.report_signals(project_id, episode_index)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get(
+        "/api/projects/{project_id}/episodes/{episode_index}/visual-quality/frame",
+        response_class=Response,
+    )
+    def visual_quality_frame(
+        project_id: str,
+        episode_index: int,
+        camera: str = Query(min_length=1),
+        frame: int = Query(ge=0),
+        width: int = Query(default=640, ge=160, le=1600),
+    ) -> Response:
+        try:
+            content = service.visual_quality_frame(
+                project_id,
+                episode_index,
+                camera,
+                frame,
+                width,
+            )
+            return Response(
+                content=content,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.post(
         "/api/projects/{project_id}/episodes/{episode_index}/recording",
         status_code=201,
@@ -69,10 +121,23 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
+    @app.post("/api/projects/{project_id}/episodes/{episode_index}/recording/warm")
+    def warm_recording(project_id: str, episode_index: int) -> dict[str, str]:
+        try:
+            service.reader(project_id).episode(episode_index)
+            return {"status": "warmed"}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
     @app.post("/api/projects/{project_id}/exports", status_code=201)
     def export(project_id: str, request: ExportRequest) -> dict[str, str | int]:
         try:
-            output = service.export_dataset(project_id, request.format, request.episode_indexes)
+            output = service.export_dataset(
+                project_id,
+                request.format,
+                request.episode_indexes,
+                request.options.output_dir,
+            )
             return {
                 "output_path": str(output.output_path),
                 "report_path": str(output.report_path),
@@ -81,7 +146,7 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             }
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
-        except UnsupportedDatasetFormat as error:
+        except (UnsupportedDatasetFormat, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post(
@@ -103,6 +168,114 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             return service.cleaning_summary(project_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/projects/{project_id}/filters/runs",
+        status_code=201,
+        response_model=FilterRun,
+    )
+    def run_filters(project_id: str) -> FilterRun:
+        try:
+            return service.run_filters(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/pipeline/runs/stream")
+    async def stream_pipeline(project_id: str, request: CleaningRunRequest) -> StreamingResponse:
+        try:
+            service.project(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        async def event_generator():
+            queue: asyncio.Queue[dict] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def emit(payload: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+            def cleaning_progress(completed: int, total: int) -> None:
+                emit({"event": "progress", "phase": "cleaning", "completed": completed, "total": total})
+
+            def filters_progress(completed: int, total: int) -> None:
+                emit({"event": "progress", "phase": "filters", "completed": completed, "total": total})
+
+            async def run_work() -> None:
+                try:
+                    cleaning, filters = await asyncio.to_thread(
+                        service.run_pipeline,
+                        project_id,
+                        request,
+                        cleaning_progress,
+                        filters_progress,
+                    )
+                    emit(
+                        {
+                            "event": "done",
+                            "cleaning": cleaning.model_dump(mode="json"),
+                            "filters": filters.model_dump(mode="json"),
+                        }
+                    )
+                except Exception as error:  # noqa: BLE001 - surfaced to client via SSE
+                    emit({"event": "error", "message": str(error)})
+
+            task = asyncio.create_task(run_work())
+            try:
+                while True:
+                    payload = await queue.get()
+                    event_name = payload.get("event", "message")
+                    data = json.dumps(payload, ensure_ascii=False)
+                    yield f"event: {event_name}\ndata: {data}\n\n"
+                    if event_name in ("done", "error"):
+                        break
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @app.get("/api/projects/{project_id}/filters", response_model=FilterSummary)
+    def filters(project_id: str) -> FilterSummary:
+        try:
+            return service.filter_summary(project_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get(
+        "/api/projects/{project_id}/filters/{stage_id}/episodes/{episode_index}",
+        response_model=FilterDetail,
+    )
+    def filter_detail(project_id: str, stage_id: str, episode_index: int) -> FilterDetail:
+        try:
+            return service.filter_detail(project_id, stage_id, episode_index)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.patch("/api/projects/{project_id}/filters/config", response_model=FilterConfig)
+    def update_filter_config(project_id: str, request: FilterConfigPatch) -> FilterConfig:
+        try:
+            return service.update_filter_config(project_id, request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/filters/kinematics/urdf", status_code=201)
+    async def upload_filter_urdf(
+        project_id: str,
+        request: Request,
+        filename: str = Query(default="robot.urdf"),
+    ) -> dict[str, str]:
+        try:
+            return service.save_filter_urdf(project_id, filename, await request.body())
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}/vlm-settings", response_model=VlmSettings)
     def vlm_settings(project_id: str) -> VlmSettings:

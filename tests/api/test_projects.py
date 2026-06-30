@@ -1,12 +1,17 @@
 from pathlib import Path
 
+import json
 import h5py
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
+from robot_data_studio.quality.models import DEFAULT_VLM_PROMPT
+from robot_data_studio.quality.filter_service import DatasetFilterService
+from tests.lerobot.test_reader import write_agibot_v2_episode_fixture
 
 
 SAMPLE = Path("data/samples/lerobot-pusht").resolve()
+ALOHA_SAMPLE = Path("data/samples/aloha_static_coffee").resolve()
 
 
 def test_import_dataset_and_list_episodes(tmp_path: Path) -> None:
@@ -20,6 +25,24 @@ def test_import_dataset_and_list_episodes(tmp_path: Path) -> None:
     episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=2")
     assert episodes.status_code == 200
     assert [item["episode_index"] for item in episodes.json()] == [0, 1]
+
+
+def test_import_agibot_v2_dataset_exposes_subtasks(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    sample = write_agibot_v2_episode_fixture(tmp_path / "agibot-one-episode")
+
+    response = client.post("/api/projects", json={"path": str(sample), "format_hint": "lerobot_v2_1"})
+
+    assert response.status_code == 201
+    project = response.json()
+    assert project["dataset"]["version"] == "v2.1"
+    episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=1")
+    assert episodes.status_code == 200
+    episode = episodes.json()[0]
+    assert episode["tasks"] == ["Clear the desktop"]
+    assert episode["subtasks"][0]["prompt"] == "Put the pen into the pen holder."
+    assert episode["subtasks"][0]["start_seconds"] == 0.0
+    assert episode["subtasks"][1]["skill"] == "Rotation"
 
 
 def test_import_dataset_requires_non_empty_path(tmp_path: Path) -> None:
@@ -51,6 +74,108 @@ def test_get_episode_frames(tmp_path: Path) -> None:
     assert response.json()[0]["action"] == [233.0, 71.0]
 
 
+def test_get_report_signals_returns_dynamic_gripper_and_duration_data(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(ALOHA_SAMPLE)},
+    ).json()
+
+    response = client.get(
+        f"/api/projects/{project['id']}/report-signals",
+        params={"episode_index": 0},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["episode_index"] == 0
+    assert [row["episode_index"] for row in payload["episode_durations"]] == list(
+        range(project["dataset"]["total_episodes"])
+    )
+    assert payload["mean_episode_duration_seconds"] > 0
+    assert [series["label"] for series in payload["gripper_series"]] == [
+        "left_gripper",
+        "right_gripper",
+    ]
+    assert payload["gripper_series"][0]["points"][0].keys() == {
+        "timestamp",
+        "value",
+    }
+    missing = client.get(
+        f"/api/projects/{project['id']}/report-signals",
+        params={"episode_index": 9999},
+    )
+    assert missing.status_code == 404
+
+
+def test_get_visual_quality_evidence_frame_validates_and_decodes_source_video(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sample = write_agibot_v2_episode_fixture(tmp_path / "agibot-evidence")
+    video = (
+        sample
+        / "videos"
+        / "chunk-000"
+        / "observation.images.top_head"
+        / "episode_000000.mp4"
+    )
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    captured = []
+
+    def fake_extract(path: Path, timestamp: float, width: int) -> bytes:
+        captured.append((path, timestamp, width))
+        return b"jpeg"
+
+    monkeypatch.setattr(
+        "robot_data_studio.projects.service.extract_video_frame_jpeg",
+        fake_extract,
+        raising=False,
+    )
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(sample), "format_hint": "lerobot_v2_1"},
+    ).json()
+    url = f"/api/projects/{project['id']}/episodes/0/visual-quality/frame"
+
+    response = client.get(
+        url,
+        params={
+            "camera": "observation.images.top_head",
+            "frame": 2,
+            "width": 640,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"jpeg"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert captured == [(video, 2 / 30, 640)]
+    assert client.get(url, params={"camera": "unknown", "frame": 0}).status_code == 404
+    assert (
+        client.get(
+            url,
+            params={"camera": "observation.images.top_head", "frame": 4},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            url,
+            params={
+                "camera": "observation.images.top_head",
+                "frame": 0,
+                "width": 1601,
+            },
+        ).status_code
+        == 422
+    )
+
+
 def test_generate_rerun_recording(tmp_path: Path) -> None:
     client = TestClient(create_app(artifact_root=tmp_path))
     project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
@@ -61,6 +186,44 @@ def test_generate_rerun_recording(tmp_path: Path) -> None:
     body = response.json()
     assert body["recording_url"].endswith(".rrd")
     assert (tmp_path / body["recording_url"].split("/")[-1]).stat().st_size > 0
+
+
+def test_warm_recording_validates_episode_without_building_artifact(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(SAMPLE)},
+    ).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/episodes/0/recording/warm",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "warmed"}
+    assert list(tmp_path.glob("*.rrd")) == []
+
+
+def test_aloha_static_coffee_exposes_all_video_views_and_generates_recording(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(ALOHA_SAMPLE)}).json()
+
+    episodes = client.get(f"/api/projects/{project['id']}/episodes?limit=1")
+
+    assert episodes.status_code == 200
+    video_files = episodes.json()[0]["video_files"]
+    assert set(video_files) == {
+        "observation.images.cam_high",
+        "observation.images.cam_left_wrist",
+        "observation.images.cam_low",
+        "observation.images.cam_right_wrist",
+    }
+
+    response = client.post(f"/api/projects/{project['id']}/episodes/0/recording")
+
+    assert response.status_code == 201
+    artifact = tmp_path / response.json()["recording_url"].split("/")[-1]
+    assert artifact.stat().st_size > 0
 
 
 def test_export_episode_to_act_hdf5(tmp_path: Path) -> None:
@@ -79,6 +242,47 @@ def test_export_episode_to_act_hdf5(tmp_path: Path) -> None:
         assert file["action"].shape == (161, 2)
         assert file["observations/qpos"].shape == (161, 2)
         assert file.attrs["sim"] is True or file.attrs["sim"] == 1
+
+
+def test_export_episode_to_user_selected_output_directory(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    output_dir = tmp_path / "user-exports"
+
+    response = client.post(
+        f"/api/projects/{project['id']}/exports",
+        json={
+            "episode_indexes": [0],
+            "format": "act_hdf5",
+            "options": {"output_dir": str(output_dir)},
+        },
+    )
+
+    assert response.status_code == 201
+    output_path = Path(response.json()["output_path"])
+    assert output_path.exists()
+    assert output_path.parent == output_dir
+    assert Path(response.json()["report_path"]).parent == output_dir
+
+
+def test_export_episode_normalizes_quoted_output_directory(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    output_dir = tmp_path / "quoted exports"
+
+    response = client.post(
+        f"/api/projects/{project['id']}/exports",
+        json={
+            "episode_indexes": [0],
+            "format": "act_hdf5",
+            "options": {"output_dir": f" '{output_dir}' "},
+        },
+    )
+
+    assert response.status_code == 201
+    output_path = Path(response.json()["output_path"])
+    assert output_path.exists()
+    assert output_path.parent == output_dir
 
 
 def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
@@ -102,29 +306,109 @@ def test_run_cleaning_pipeline_and_fetch_summary(tmp_path: Path) -> None:
         "pass_threshold": 0.85,
         "review_threshold": 0.65,
         "overwrite_manual": False,
+        "enabled_filter_stages": [
+            "visual_quality",
+            "sudden_change",
+            "state_action_alignment",
+            "extreme_value",
+            "kinematic_consistency",
+            "orientation_alignment",
+            "metadata_completeness",
+        ],
+        "quality_weights": {
+            "visual_quality": 1.5,
+            "sudden_change": 1.5,
+            "state_action_alignment": 1.5,
+            "extreme_value": 2.0,
+            "kinematic_consistency": 2.0,
+            "orientation_alignment": 1.0,
+            "task_success": 2.0,
+        },
         "vlm": {
             "enabled": False,
             "provider": "OpenAI",
             "model": "gpt-4o-mini",
             "api_base_url": None,
-            "prompt": (
-                "You are an automated robot episode evaluator. Return only JSON with "
-                "success, score, and reason. Judge whether the task was successfully "
-                "completed from the visual evidence."
-            ),
+            "api_key_configured": False,
+            "prompt": DEFAULT_VLM_PROMPT,
             "sample_frames": 4,
         },
     }
     first_result = summary["results"][0]
     assert first_result["episode_index"] == 0
     assert 0 <= first_result["score"] <= 1
+    assert first_result["data_quality_score"] == first_result["score"]
+    assert first_result["task_success_score"] is None
     assert first_result["source"] == "auto"
-    assert "smoothness" in first_result["per_attribute_scores"]
+    assert "sudden_change" in first_result["per_attribute_scores"]
 
     stored = client.get(f"/api/projects/{project['id']}/cleaning")
 
     assert stored.status_code == 200
     assert stored.json()["total"] == 206
+
+
+def test_run_cleaning_accepts_enabled_filters_and_quality_weights(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={
+            "pass_threshold": 0.8,
+            "review_threshold": 0.6,
+            "enabled_filter_stages": ["sudden_change", "state_action_alignment"],
+            "quality_weights": {
+                "sudden_change": 1.0,
+                "state_action_alignment": 2.5,
+                "task_success": 2.0,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    config = response.json()["summary"]["config"]
+    assert config["enabled_filter_stages"] == ["sudden_change", "state_action_alignment"]
+    assert config["quality_weights"]["state_action_alignment"] == 2.5
+    assert config["quality_weights"]["task_success"] == 2.0
+
+
+def test_run_cleaning_can_score_only_selected_episodes(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65, "episode_indexes": [0]},
+    )
+
+    assert response.status_code == 201
+    results = response.json()["summary"]["results"]
+    scored = [result for result in results if result["status"] != "unscored"]
+
+    assert [result["episode_index"] for result in scored] == [0]
+    assert len(results) == 206
+
+
+def test_selected_cleaning_rerun_preserves_existing_dataset_scores(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    initial = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    ).json()["summary"]
+
+    selected = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.95, "review_threshold": 0.9, "episode_indexes": [0]},
+    )
+
+    assert selected.status_code == 201
+    summary = selected.json()["summary"]
+    assert summary["total"] == 206
+    assert summary["unscored_count"] == 0
+    assert summary["results"][1] == initial["results"][1]
+    assert summary["results"][205] == initial["results"][205]
 
 
 def test_manual_episode_decision_is_persisted_and_preserved_by_rerun(tmp_path: Path) -> None:
@@ -172,7 +456,18 @@ def test_cleaning_rerun_can_overwrite_manual_decisions(tmp_path: Path) -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/cleaning/runs",
-        json={"pass_threshold": 0.1, "review_threshold": 0.05, "overwrite_manual": True},
+        json={
+            "pass_threshold": 0.1,
+            "review_threshold": 0.05,
+            "overwrite_manual": True,
+            "enabled_filter_stages": [
+                "sudden_change",
+                "state_action_alignment",
+                "extreme_value",
+                "kinematic_consistency",
+                "orientation_alignment",
+            ],
+        },
     )
 
     assert response.status_code == 201
@@ -206,6 +501,7 @@ def test_project_vlm_settings_are_persisted_without_returning_api_key(tmp_path: 
         "provider": "OpenAI",
         "model": "gpt-4o-mini",
         "api_base_url": "http://localhost:11434/v1",
+        "api_key_configured": True,
         "prompt": "Return JSON. Task: {task}",
         "sample_frames": 6,
     }
@@ -215,3 +511,141 @@ def test_project_vlm_settings_are_persisted_without_returning_api_key(tmp_path: 
 
     assert stored.status_code == 200
     assert stored.json() == body
+
+
+def test_saved_vlm_api_key_is_used_when_cleaning_runs_without_key(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    client.patch(
+        f"/api/projects/{project['id']}/vlm-settings",
+        json={
+            "enabled": True,
+            "provider": "OpenAI",
+            "model": "gpt-4o-mini",
+            "api_base_url": "http://localhost:11434/v1",
+            "api_key": "secret-key",
+            "prompt": "Return JSON. Task: {task}",
+            "sample_frames": 6,
+        },
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={
+            "pass_threshold": 0.8,
+            "review_threshold": 0.6,
+            "vlm": {
+                "enabled": True,
+                "provider": "OpenAI",
+                "model": "gpt-4o-mini",
+                "api_base_url": "http://localhost:11434/v1",
+                "prompt": "Return JSON. Task: {task}",
+                "sample_frames": 6,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    first_result = response.json()["summary"]["results"][0]
+    messages = [finding["message"] for finding in first_result["findings"]]
+    assert "Set OPENAI_API_KEY or enter an API key to use OpenAI VLM scoring." not in messages
+
+
+def _parse_sse_events(text: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    for frame in text.split("\n\n"):
+        if not frame.strip():
+            continue
+        name = "message"
+        data_line = ""
+        for line in frame.split("\n"):
+            if line.startswith("event:"):
+                name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_line += line[len("data:"):].strip()
+        if data_line:
+            events.append((name, json.loads(data_line)))
+    return events
+
+
+def test_pipeline_stream_emits_progress_and_done_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    summary_calls = 0
+    original_summary = DatasetFilterService.summary
+
+    def counted_summary(self, *args, **kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        return original_summary(self, *args, **kwargs)
+
+    monkeypatch.setattr(DatasetFilterService, "summary", counted_summary)
+
+    response = client.post(
+        f"/api/projects/{project['id']}/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    progress_events = [data for name, data in events if name == "progress"]
+    cleaning_progress = [data for data in progress_events if data["phase"] == "cleaning"]
+    filters_progress = [data for data in progress_events if data["phase"] == "filters"]
+
+    assert cleaning_progress, "expected cleaning progress events"
+    assert filters_progress, "expected filters progress events"
+    assert cleaning_progress[0]["completed"] == 1
+    assert cleaning_progress[-1]["completed"] == cleaning_progress[-1]["total"] == 206
+    assert filters_progress[-1]["completed"] == filters_progress[-1]["total"] == 206 * 2
+    completed = [data["completed"] for data in cleaning_progress]
+    assert completed == sorted(completed)
+
+    done_events = [data for name, data in events if name == "done"]
+    assert len(done_events) == 1
+    payload = done_events[0]
+    assert payload["cleaning"]["status"] == "succeeded"
+    assert payload["cleaning"]["summary"]["total"] == 206
+    assert payload["filters"]["status"] == "succeeded"
+    assert payload["filters"]["summary"]["total_episodes"] == 206
+    assert summary_calls == 1
+
+
+def test_selected_pipeline_stream_runs_filters_only_for_selected_episode(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65, "episode_indexes": [0]},
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    progress_events = [data for name, data in events if name == "progress"]
+    filters_progress = [data for data in progress_events if data["phase"] == "filters"]
+    cleaning_progress = [data for data in progress_events if data["phase"] == "cleaning"]
+    done_events = [data for name, data in events if name == "done"]
+
+    assert filters_progress[-1]["completed"] == filters_progress[-1]["total"] == 2
+    assert cleaning_progress[-1]["completed"] == cleaning_progress[-1]["total"] == 1
+    payload = done_events[0]
+    assert payload["filters"]["summary"]["total_episodes"] == 1
+    assert [episode["episode_index"] for episode in payload["filters"]["summary"]["episodes"]] == [0]
+    assert payload["cleaning"]["summary"]["total"] == 206
+
+
+def test_pipeline_stream_returns_404_for_unknown_project(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+
+    response = client.post(
+        "/api/projects/does-not-exist/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    )
+
+    assert response.status_code == 404
