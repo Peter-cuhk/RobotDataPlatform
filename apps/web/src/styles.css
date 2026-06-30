@@ -966,6 +966,39 @@ button:disabled { cursor: wait; opacity: .55; }
 }
 .viewer-placeholder h3 { margin: 22px 0 4px; color: #c5d0dc; }
 .viewer-placeholder p { margin: 0; }
+.filter-detail-shell {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #0b1016;
+}
+.episode-issue-tabs {
+  min-width: 0;
+  display: flex;
+  gap: 6px;
+  padding: 10px 18px 0;
+  overflow-x: auto;
+  border-bottom: 1px solid #25303c;
+}
+.episode-issue-tabs button {
+  flex: 0 0 auto;
+  padding: 8px 12px 9px;
+  color: #91a1b2;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  font-size: 11px;
+  font-weight: 800;
+}
+.episode-issue-tabs button:hover { color: #dce8f4; background: #121c27; }
+.episode-issue-tabs button:focus-visible { outline: 2px solid #5fa8ff; outline-offset: -2px; }
+.episode-issue-tabs button.active {
+  color: #e5f1ff;
+  background: #142438;
+  border-bottom-color: #5fa8ff;
+}
 .filter-detail-page {
   height: 100%;
   display: grid;

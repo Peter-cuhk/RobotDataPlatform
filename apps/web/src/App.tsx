@@ -124,6 +124,20 @@ function filterStageForFindingCode(code: string): FilterStageId | null {
   return stagesByFindingCode[code] ?? null;
 }
 
+function issueTabsForQuality(
+  quality: EpisodeQualityResult | null,
+  filterSummary: FilterSummary | null,
+) {
+  const labels = new Map(filterSummary?.stages.map((stage) => [stage.id, stage.label]) ?? []);
+  const seen = new Set<FilterStageId>();
+  return (quality?.findings ?? []).flatMap((finding) => {
+    const stageId = filterStageForFindingCode(finding.code);
+    if (!stageId || seen.has(stageId)) return [];
+    seen.add(stageId);
+    return [{ stageId, label: labels.get(stageId) ?? humanizeMetric(stageId) }];
+  });
+}
+
 function clampPanelWidth(width: number) {
   return Math.min(maxQualityPanelWidth, Math.max(minQualityPanelWidth, width));
 }
@@ -444,6 +458,10 @@ export default function App() {
     [episodesQuery.data, selected],
   );
   const selectedQuality = selected === null ? null : qualityByEpisode.get(selected) ?? null;
+  const selectedIssueTabs = useMemo(
+    () => issueTabsForQuality(selectedQuality, filterSummary),
+    [filterSummary, selectedQuality],
+  );
   const filterDetailQuery = useQuery({
     queryKey: ["filter-detail", project?.id, activeFilterStage, selected],
     queryFn: () => getFilterDetail(project!.id, activeFilterStage!, selected!),
@@ -847,16 +865,34 @@ export default function App() {
                     }
                   />
                 ) : activeFilterStage ? (
-                  <FilterDetailView
-                    copy={copy}
-                    projectId={project.id}
-                    detail={selectedFilterDetail}
-                    pending={filterDetailQuery.isLoading}
-                    error={filterDetailQuery.error}
-                    onUrdfUpload={(file) => urdfUploadMutation.mutate(file)}
-                    onConfigSave={(config) => filterConfigMutation.mutate(config)}
-                    configSaving={filterConfigMutation.isPending}
-                  />
+                  <div className="filter-detail-shell">
+                    {selectedIssueTabs.length > 0 && (
+                      <div className="episode-issue-tabs" role="tablist" aria-label="Episode issues">
+                        {selectedIssueTabs.map((tab) => (
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={tab.stageId === activeFilterStage}
+                            className={tab.stageId === activeFilterStage ? "active" : ""}
+                            key={tab.stageId}
+                            onClick={() => setActiveFilterStage(tab.stageId)}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <FilterDetailView
+                      copy={copy}
+                      projectId={project.id}
+                      detail={selectedFilterDetail}
+                      pending={filterDetailQuery.isLoading}
+                      error={filterDetailQuery.error}
+                      onUrdfUpload={(file) => urdfUploadMutation.mutate(file)}
+                      onConfigSave={(config) => filterConfigMutation.mutate(config)}
+                      configSaving={filterConfigMutation.isPending}
+                    />
+                  </div>
                 ) : recordingUrl ? (
                   <RerunViewer recordingUrl={recordingUrl} />
                 ) : replayReady && selected !== null ? (

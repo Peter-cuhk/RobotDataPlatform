@@ -1559,6 +1559,86 @@ test("opens the matching filter detail view from a quality issue card", async ()
   );
 });
 
+test("switches between issue details for the selected episode", async () => {
+  const user = userEvent.setup();
+  const summary = cleaningSummary();
+  summary.results[0] = {
+    ...summary.results[0],
+    findings: [
+      {
+        code: "visual_quality",
+        severity: "warn",
+        message: "Visual quality issues require review. Count: 2.",
+      },
+      {
+        code: "video_missing",
+        severity: "warn",
+        message: "A camera stream is missing.",
+      },
+      {
+        code: "action_jump",
+        severity: "warn",
+        message: "Sudden motion or action changes require review. Count: 1.",
+      },
+      {
+        code: "time_sync",
+        severity: "warn",
+        message: "Timestamp synchronization requires review. Count: 1.",
+      },
+      {
+        code: "vlm_failed",
+        severity: "warn",
+        message: "VLM semantic check failed.",
+      },
+    ],
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("state_action_alignment"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", {
+    name: "Visual quality issues require review. Count: 2.",
+  }));
+
+  expect(await screen.findByRole("tab", { name: "Visual quality", selected: true })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "Sudden change", selected: false })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "Time sync", selected: false })).toBeInTheDocument();
+  expect(screen.getAllByRole("tab")).toHaveLength(3);
+
+  await user.click(screen.getByRole("tab", { name: "Time sync" }));
+
+  expect(await screen.findByRole("heading", { name: "Time sync" })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "Time sync", selected: true })).toBeInTheDocument();
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/filters/state_action_alignment/episodes/0",
+    expect.any(Object),
+  );
+});
+
 test("hides manual decision buttons in filter detail before cleaning has run", async () => {
   const user = userEvent.setup();
   const fetch = vi
