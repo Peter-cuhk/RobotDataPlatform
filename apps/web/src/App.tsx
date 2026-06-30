@@ -1516,6 +1516,25 @@ function ReportSignalCharts({
     no_named_gripper_dimensions: copy.report.noNamedGripperDimensions,
     no_gripper_samples: copy.report.noGripperSamples,
   }[signals?.gripper_unavailable_reason ?? ""];
+  const episodeSelect = (
+    <label className="report-signal-controls">
+      <span>{copy.report.reportEpisode}</span>
+      <select
+        aria-label={copy.report.reportEpisode}
+        disabled={!episodes.length}
+        value={selectedEpisodeIndex ?? ""}
+        onChange={(event) => onEpisodeChange(Number(event.target.value))}
+      >
+        {[...episodes]
+          .sort((left, right) => left.episode_index - right.episode_index)
+          .map((episode) => (
+            <option key={episode.episode_index} value={episode.episode_index}>
+              {episodeLabel(episode.episode_index)}
+            </option>
+          ))}
+      </select>
+    </label>
+  );
   return (
     <section className="report-card report-signals">
       <div className="report-section-heading">
@@ -1523,46 +1542,38 @@ function ReportSignalCharts({
           <h3>{copy.report.datasetSignals}</h3>
           <p>{copy.report.timeSeconds} · {copy.report.durationSeconds}</p>
         </div>
-        <label className="report-signal-controls">
-          <span>{copy.report.reportEpisode}</span>
-          <select
-            aria-label={copy.report.reportEpisode}
-            disabled={!episodes.length}
-            value={selectedEpisodeIndex ?? ""}
-            onChange={(event) => onEpisodeChange(Number(event.target.value))}
-          >
-            {[...episodes]
-              .sort((left, right) => left.episode_index - right.episode_index)
-              .map((episode) => (
-                <option key={episode.episode_index} value={episode.episode_index}>
-                  {episodeLabel(episode.episode_index)}
-                </option>
-              ))}
-          </select>
-        </label>
       </div>
-      {pending && !signals ? (
-        <div className="report-chart-empty">{copy.report.loadingSignals}</div>
-      ) : error && !signals ? (
-        <div className="report-chart-empty error">{copy.report.signalsError}</div>
-      ) : signals ? (
-        <div className="report-signal-grid">
-          <div className="report-signal-panel">
-            <h4>{copy.report.gripperCurve} · {episodeLabel(signals.episode_index)}</h4>
-            {signals.gripper_series.length ? (
+      <div className="report-signal-grid">
+        <div className="report-signal-panel">
+          <div className="report-signal-chart-header">
+            <h4>{copy.report.gripperCurve}</h4>
+            {episodeSelect}
+          </div>
+          {pending && !signals ? (
+            <div className="report-chart-empty">{copy.report.loadingSignals}</div>
+          ) : error && !signals ? (
+            <div className="report-chart-empty error">{copy.report.signalsError}</div>
+          ) : signals ? (
+            signals.gripper_series.length ? (
               <GripperCurveChart copy={copy} series={signals.gripper_series} />
             ) : (
               <div className="report-chart-empty">
                 {unavailable ?? copy.report.noGripperSamples}
               </div>
-            )}
-          </div>
-          <div className="report-signal-panel">
-            <h4>{copy.report.durationDistribution}</h4>
-            <EpisodeDurationChart copy={copy} signals={signals} />
-          </div>
+            )
+          ) : null}
         </div>
-      ) : null}
+        <div className="report-signal-panel">
+          <h4>{copy.report.durationDistribution}</h4>
+          {pending && !signals ? (
+            <div className="report-chart-empty">{copy.report.loadingSignals}</div>
+          ) : error && !signals ? (
+            <div className="report-chart-empty error">{copy.report.signalsError}</div>
+          ) : signals ? (
+            <EpisodeDurationChart copy={copy} signals={signals} />
+          ) : null}
+        </div>
+      </div>
     </section>
   );
 }

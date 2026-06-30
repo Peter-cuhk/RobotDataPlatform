@@ -355,6 +355,21 @@ button:disabled { cursor: wait; opacity: .55; }
   font-size: 11px;
   font-weight: 800;
 }
+.report-signal-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+}
+.report-signal-chart-header h4 {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+.report-signal-chart-header .report-signal-controls {
+  flex-shrink: 0;
+}
 .report-chart {
   display: block;
   width: 100%;
