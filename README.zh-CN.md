@@ -2,9 +2,21 @@
 
 **[English](README.md)** | **简体中文**
 
+<p align="center">
+  <img src="docs/assets/rds-logo.png" alt="Robot Data Studio logo" width="280" />
+</p>
+
 Robot Data Studio（RDS）是一个 **local-first** 的机器人数据集检查、清洗、审查、回放与格式转换工作台。它面向训练前的数据质检：把本地数据集导入进来，看清每个 episode 的质量，用 Rerun 回放视频与状态/action，筛出坏数据，并导出为下游训练框架可用的格式。
 
 **RDS 不会修改你的源数据集。** 生成的 Rerun 录制、清洗状态、导出文件和报告都写入项目根目录下的 `.rds-artifacts/`。
+
+## 界面预览
+
+<p align="center">
+  <img src="docs/assets/workspace-overview.png" alt="Robot Data Studio 工作区概览" width="960" />
+</p>
+
+*工作区概览：导入数据集、检查 episode、在 Rerun 中回放多路相机视频、运行质量流水线并导出干净数据，全部在同一个浏览器界面完成。*
 
 ## 产品优势
 

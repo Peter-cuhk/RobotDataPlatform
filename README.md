@@ -2,9 +2,21 @@
 
 **English** | **[简体中文](README.zh-CN.md)**
 
+<p align="center">
+  <img src="docs/assets/rds-logo.png" alt="Robot Data Studio logo" width="280" />
+</p>
+
 Robot Data Studio (RDS) is a **local-first** workbench for inspecting, cleaning, reviewing, replaying, and converting robot datasets. It focuses on pre-training data QA: import a local dataset, understand each episode’s quality, replay video and state/action with Rerun, filter bad data, and export to formats your downstream training stack can use.
 
 **RDS does not modify your source dataset.** Generated Rerun recordings, cleaning state, exports, and reports are written under `.rds-artifacts/` at the project root.
+
+## Preview
+
+<p align="center">
+  <img src="docs/assets/workspace-overview.png" alt="Robot Data Studio workspace overview" width="960" />
+</p>
+
+*Workspace overview: import a dataset, inspect episodes, replay multi-camera video in Rerun, run the quality pipeline, and export clean data—all from one browser UI.*
 
 ## Why RDS
 
