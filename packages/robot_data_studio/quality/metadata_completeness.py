@@ -473,10 +473,14 @@ def inspection_summary(rows: list[dict[str, object]]) -> dict[str, int]:
 def analyze_metadata_completeness(
     reader: DatasetAdapter,
     config: MetadataCompletenessConfig | None = None,
+    episode_indexes: list[int] | None = None,
 ) -> MetadataCompletenessResult:
     config = config or MetadataCompletenessConfig()
     metadata = reader.metadata()
     episodes = reader.list_episodes()
+    if episode_indexes is not None:
+        selected = set(episode_indexes)
+        episodes = [episode for episode in episodes if episode.episode_index in selected]
     result = MetadataCompletenessResult(
         episode_findings={episode.episode_index: [] for episode in episodes},
         table_rows={episode.episode_index: [] for episode in episodes},

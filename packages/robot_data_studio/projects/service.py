@@ -29,6 +29,7 @@ from robot_data_studio.quality.filter_service import (
 from robot_data_studio.quality.models import utc_now
 from robot_data_studio.quality.store import CleaningStateStore, VlmSettingsStore, build_summary
 from robot_data_studio.quality.visual_quality import extract_video_frame_jpeg
+from robot_data_studio.reports import ReportSignals, build_report_signals
 
 from .models import Project
 
@@ -59,13 +60,17 @@ class ProjectService:
         project = Project(id=uuid4().hex[:12], dataset=reader.metadata())
         self.project_artifact_dir(project.id).mkdir(parents=True, exist_ok=True)
         self._projects[project.id] = (project, reader)
-        return project
+        self._remember_filter_config(project.id, self.filter_config(project.id))
+        return self.project(project.id)
 
     def project(self, project_id: str) -> Project:
         return self._entry(project_id)[0]
 
     def reader(self, project_id: str) -> DatasetAdapter:
         return self._entry(project_id)[1]
+
+    def report_signals(self, project_id: str, episode_index: int) -> ReportSignals:
+        return build_report_signals(self.reader(project_id), episode_index)
 
     def export_dataset(
         self,
@@ -158,7 +163,10 @@ class ProjectService:
             if result.source == "manual"
         }
         if filter_summary is None:
-            filter_summary = self.run_filters(project_id).summary
+            filter_summary = self.run_filters(
+                project_id,
+                enabled_filter_stages=scoring_config.enabled_filter_stages,
+            ).summary
         results = self._scorer.score_dataset(
             reader,
             scoring_config,
@@ -180,6 +188,10 @@ class ProjectService:
                 else result
                 for result in results
             ]
+        if episode_indexes is not None and previous is not None:
+            by_index = {result.episode_index: result for result in previous.results}
+            by_index.update({result.episode_index: result for result in results})
+            results = list(by_index.values())
         summary = build_summary(episodes, results, scoring_config, self._scorer.scorer_version)
         self._cleaning_store(project_id).save(summary)
         return CleaningRun(run_id=uuid4().hex[:12], status="succeeded", summary=summary)
@@ -191,7 +203,13 @@ class ProjectService:
         cleaning_progress: ProgressCallback | None = None,
         filters_progress: ProgressCallback | None = None,
     ) -> tuple[CleaningRun, FilterRun]:
-        filters = self.run_filters(project_id, on_progress=filters_progress)
+        episode_indexes = getattr(config, "episode_indexes", None)
+        filters = self.run_filters(
+            project_id,
+            on_progress=filters_progress,
+            enabled_filter_stages=config.enabled_filter_stages,
+            episode_indexes=episode_indexes,
+        )
         cleaning = self.run_cleaning(
             project_id,
             config,
@@ -230,14 +248,27 @@ class ProjectService:
         return updated
 
     def run_filters(
-        self, project_id: str, on_progress: ProgressCallback | None = None
+        self,
+        project_id: str,
+        on_progress: ProgressCallback | None = None,
+        enabled_filter_stages: list[str] | None = None,
+        episode_indexes: list[int] | None = None,
     ) -> FilterRun:
         self.project(project_id)
-        result = self._filter_service(project_id).run(on_progress=on_progress)
-        self._filter_summary_store(project_id).write_text(
-            result.summary.model_dump_json(indent=2),
-            encoding="utf-8",
+        filter_config = self.filter_config(project_id)
+        if enabled_filter_stages is not None:
+            filter_config = filter_config.model_copy(
+                update={"enabled_filter_stages": enabled_filter_stages}
+            )
+        result = DatasetFilterService(self.reader(project_id), filter_config).run(
+            on_progress=on_progress,
+            episode_indexes=episode_indexes,
         )
+        if episode_indexes is None:
+            self._filter_summary_store(project_id).write_text(
+                result.summary.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
         return result
 
     def filter_summary(self, project_id: str) -> FilterSummary:
@@ -320,6 +351,7 @@ class ProjectService:
             )
         updated = config.model_copy(update=update)
         self._save_filter_config(project_id, updated)
+        self._remember_filter_config(project_id, updated)
         return updated
 
     def save_filter_urdf(self, project_id: str, filename: str, content: bytes) -> dict[str, str]:
@@ -332,7 +364,9 @@ class ProjectService:
         output.write_bytes(content)
         config = self.filter_config(project_id)
         updated_kinematics = config.kinematics.model_copy(update={"urdf_path": str(output)})
-        self._save_filter_config(project_id, config.model_copy(update={"kinematics": updated_kinematics}))
+        updated = config.model_copy(update={"kinematics": updated_kinematics})
+        self._save_filter_config(project_id, updated)
+        self._remember_filter_config(project_id, updated)
         return {"filename": safe_name, "path": str(output)}
 
     def _entry(self, project_id: str) -> tuple[Project, DatasetAdapter]:
@@ -391,3 +425,7 @@ class ProjectService:
         path = self._filter_config_store(project_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config.model_dump(mode="json"), indent=2), encoding="utf-8")
+
+    def _remember_filter_config(self, project_id: str, config: FilterConfig) -> None:
+        project, reader = self._entry(project_id)
+        self._projects[project_id] = (project.model_copy(update={"filter_config": config}), reader)

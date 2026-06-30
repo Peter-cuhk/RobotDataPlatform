@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 from collections import Counter
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -59,6 +62,15 @@ STAGE_LABELS: dict[FilterStageId, str] = {
 }
 
 ProgressCallback = Callable[[int, int], None]
+VisualSampleCacheKey = tuple[Path, float, float]
+
+
+@dataclass(frozen=True)
+class _VisualSampleJob:
+    key: VisualSampleCacheKey
+    path: Path
+    start_seconds: float
+    duration_seconds: float
 
 
 def infer_gripper_indices(reader: DatasetAdapter) -> list[int]:
@@ -74,15 +86,44 @@ class DatasetFilterService:
     def __init__(self, reader: DatasetAdapter, config: FilterConfig) -> None:
         self.reader = reader
         self.config = config
-        self._sampled_video_cache: dict[tuple[Path, float, float], list[np.ndarray]] = {}
+        self._sampled_video_cache: dict[VisualSampleCacheKey, list[np.ndarray]] = {}
         self._episode_frame_cache: dict[int, list] = {}
+        self._visual_sample_executor: ThreadPoolExecutor | None = None
+        self._pending_visual_sample_jobs: deque[_VisualSampleJob] = deque()
+        self._visual_sample_futures: dict[
+            VisualSampleCacheKey,
+            Future[list[np.ndarray]],
+        ] = {}
 
-    def run(self, on_progress: ProgressCallback | None = None) -> FilterRun:
-        summary = self.summary(on_progress=on_progress)
+    def _is_stage_enabled(self, stage_id: FilterStageId) -> bool:
+        return stage_id in self.config.enabled_filter_stages
+
+    @staticmethod
+    def _disabled_stage_status() -> EpisodeFilterStageStatus:
+        return EpisodeFilterStageStatus(
+            count=0,
+            status="skipped",
+            score=None,
+            skipped_reason="disabled",
+        )
+
+    def run(
+        self,
+        on_progress: ProgressCallback | None = None,
+        episode_indexes: list[int] | None = None,
+    ) -> FilterRun:
+        summary = self.summary(on_progress=on_progress, episode_indexes=episode_indexes)
         return FilterRun(run_id=uuid4().hex[:12], status="succeeded", summary=summary)
 
-    def summary(self, on_progress: ProgressCallback | None = None) -> FilterSummary:
+    def summary(
+        self,
+        on_progress: ProgressCallback | None = None,
+        episode_indexes: list[int] | None = None,
+    ) -> FilterSummary:
         episodes = self.reader.list_episodes()
+        if episode_indexes is not None:
+            selected = set(episode_indexes)
+            episodes = [episode for episode in episodes if episode.episode_index in selected]
         total_episodes = len(episodes)
         total_units = total_episodes * 2
         load_progress: ProgressCallback | None = None
@@ -90,7 +131,8 @@ class DatasetFilterService:
             def load_progress(completed: int, _total: int) -> None:
                 on_progress(completed, total_units)
         states_by_episode, actions_by_episode, integrity_by_episode = self._episode_arrays(
-            on_progress=load_progress
+            on_progress=load_progress,
+            episode_indexes=episode_indexes,
         )
         reference = self._reference_arrays(states_by_episode, actions_by_episode)
         reference_stats = {
@@ -101,43 +143,51 @@ class DatasetFilterService:
             "state": self._extreme_bounds(reference["state"]),
             "action": self._extreme_bounds(reference["action"]),
         }
-        metadata_result = analyze_metadata_completeness(
-            self.reader,
-            self.config.metadata_completeness,
-        )
+        metadata_result = None
+        if self._is_stage_enabled("metadata_completeness"):
+            metadata_result = analyze_metadata_completeness(
+                self.reader,
+                self.config.metadata_completeness,
+                episode_indexes,
+            )
         episode_summaries = []
         totals = {stage_id: 0 for stage_id in STAGE_LABELS}
-        for index, episode in enumerate(episodes, start=1):
-            states = states_by_episode[episode.episode_index]
-            actions = actions_by_episode[episode.episode_index]
-            integrity_findings = integrity_by_episode[episode.episode_index]
-            status = (
-                self._integrity_failed_statuses()
-                if integrity_findings
-                else self._stage_statuses(
-                    episode,
-                    states,
-                    actions,
-                    reference,
-                    reference_stats,
-                    extreme_bounds,
+        self._start_visual_sampling_jobs(episodes, integrity_by_episode)
+        try:
+            for index, episode in enumerate(episodes, start=1):
+                states = states_by_episode[episode.episode_index]
+                actions = actions_by_episode[episode.episode_index]
+                integrity_findings = integrity_by_episode[episode.episode_index]
+                status = (
+                    self._integrity_failed_statuses()
+                    if integrity_findings
+                    else self._stage_statuses(
+                        episode,
+                        states,
+                        actions,
+                        reference,
+                        reference_stats,
+                        extreme_bounds,
+                    )
                 )
-            )
-            status["metadata_completeness"] = self._metadata_completeness_status(
-                metadata_result,
-                episode.episode_index,
-            )
-            for stage_id, item in status.items():
-                totals[stage_id] += item.count
-            episode_summaries.append(
-                EpisodeFilterSummary(
-                    episode_index=episode.episode_index,
-                    stage_status=status,
-                    critical_findings=integrity_findings,
+                status["metadata_completeness"] = (
+                    self._metadata_completeness_status(metadata_result, episode.episode_index)
+                    if metadata_result is not None
+                    else self._disabled_stage_status()
                 )
-            )
-            if on_progress is not None:
-                on_progress(total_episodes + index, total_units)
+                for stage_id, item in status.items():
+                    totals[stage_id] += item.count
+                episode_summaries.append(
+                    EpisodeFilterSummary(
+                        episode_index=episode.episode_index,
+                        stage_status=status,
+                        critical_findings=integrity_findings,
+                    )
+                )
+                if on_progress is not None:
+                    on_progress(total_episodes + index, total_units)
+        finally:
+            self._shutdown_visual_sampling_jobs()
         stages = [
             FilterStageSummary(
                 id=stage_id,
@@ -190,7 +240,9 @@ class DatasetFilterService:
         raise ValueError(f"Unsupported filter stage: {stage_id}")
 
     def _episode_arrays(
-        self, on_progress: ProgressCallback | None = None
+        self,
+        on_progress: ProgressCallback | None = None,
+        episode_indexes: list[int] | None = None,
     ) -> tuple[
         dict[int, np.ndarray],
         dict[int, np.ndarray],
@@ -200,6 +252,9 @@ class DatasetFilterService:
         actions_by_episode = {}
         integrity_by_episode = {}
         episodes = self.reader.list_episodes()
+        if episode_indexes is not None:
+            selected = set(episode_indexes)
+            episodes = [episode for episode in episodes if episode.episode_index in selected]
         total = len(episodes)
         for completed, episode in enumerate(episodes, start=1):
             frames = self._read_episode_frames(episode.episode_index)
@@ -355,79 +410,89 @@ class DatasetFilterService:
         reference_stats: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
         extreme_bounds: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> dict[FilterStageId, EpisodeFilterStageStatus]:
-        if reference_stats is None:
-            reference_stats = {
-                "state": self._normalization_stats(reference["state"]),
-                "action": self._normalization_stats(reference["action"]),
-            }
+        statuses: dict[FilterStageId, EpisodeFilterStageStatus] = {
+            stage_id: self._disabled_stage_status()
+            for stage_id in STAGE_LABELS
+            if not self._is_stage_enabled(stage_id)
+        }
         if extreme_bounds is None:
             extreme_bounds = {
                 "state": self._extreme_bounds(reference["state"]),
                 "action": self._extreme_bounds(reference["action"]),
             }
-        normalized_states = self._normalize_with_stats(states, reference_stats["state"])
-        normalized_actions = self._normalize_with_stats(actions, reference_stats["action"])
-        sudden_states = self._without_indices(
-            normalized_states,
-            self.config.gripper_indices,
-        )
-        sudden_actions = self._without_indices(
-            normalized_actions,
-            self.config.gripper_indices,
-        )
-        sudden = sorted(
-            set(
-                detect_sudden_changes(
-                    sudden_states, self._sudden_config()
-                ).flagged_frames
+        if self._is_stage_enabled("visual_quality"):
+            statuses["visual_quality"] = self._visual_quality_status(episode, states, actions)
+        if self._is_stage_enabled("sudden_change"):
+            if reference_stats is None:
+                reference_stats = {
+                    "state": self._normalization_stats(reference["state"]),
+                    "action": self._normalization_stats(reference["action"]),
+                }
+            normalized_states = self._normalize_with_stats(states, reference_stats["state"])
+            normalized_actions = self._normalize_with_stats(actions, reference_stats["action"])
+            sudden_states = self._without_indices(
+                normalized_states,
+                self.config.gripper_indices,
             )
-            | set(
-                detect_sudden_changes(
-                    sudden_actions, self._sudden_config()
-                ).flagged_frames
+            sudden_actions = self._without_indices(
+                normalized_actions,
+                self.config.gripper_indices,
             )
-        )
-        time_sync = analyze_time_sync(
-            episode,
-            self._read_episode_frames(episode.episode_index),
-            self.reader.metadata().fps,
-            self.config.time_sync,
-        )
-        extreme = detect_extreme_values(
-            {"state": states, "action": actions},
-            self._extreme_config(),
-            reference_values_by_key=reference,
-            reference_bounds_by_key=extreme_bounds,
-        )
-        return {
-            "visual_quality": self._visual_quality_status(episode, states, actions),
-            "sudden_change": self._count_status(
+            sudden = sorted(
+                set(
+                    detect_sudden_changes(
+                        sudden_states, self._sudden_config()
+                    ).flagged_frames
+                )
+                | set(
+                    detect_sudden_changes(
+                        sudden_actions, self._sudden_config()
+                    ).flagged_frames
+                )
+            )
+            statuses["sudden_change"] = self._count_status(
                 len(sudden),
                 len(states),
                 critical_rate=0.02,
                 critical=False,
-            ),
-            "state_action_alignment": self._count_status(
+            )
+        if self._is_stage_enabled("state_action_alignment"):
+            time_sync = analyze_time_sync(
+                episode,
+                self._read_episode_frames(episode.episode_index),
+                self.reader.metadata().fps,
+                self.config.time_sync,
+            )
+            statuses["state_action_alignment"] = self._count_status(
                 time_sync.issue_count,
                 max(len(states), 1),
                 critical_rate=0.05,
                 critical=False,
                 score=time_sync.score,
-            ),
-            "extreme_value": self._count_status(
+            )
+        if self._is_stage_enabled("extreme_value"):
+            extreme = detect_extreme_values(
+                {"state": states, "action": actions},
+                self._extreme_config(),
+                reference_values_by_key=reference,
+                reference_bounds_by_key=extreme_bounds,
+            )
+            statuses["extreme_value"] = self._count_status(
                 len(extreme.flagged_frames),
                 len(states),
                 critical_rate=0.01,
                 critical=True,
-            ),
-            "kinematic_consistency": self._kinematic_status(states),
-            "orientation_alignment": EpisodeFilterStageStatus(
+            )
+        if self._is_stage_enabled("kinematic_consistency"):
+            statuses["kinematic_consistency"] = self._kinematic_status(states)
+        if self._is_stage_enabled("orientation_alignment"):
+            statuses["orientation_alignment"] = EpisodeFilterStageStatus(
                 count=0,
                 status="skipped",
                 score=None,
                 skipped_reason="not_configured",
-            ),
-        }
+            )
+        return statuses
 
     def _visual_quality_status(
         self,
@@ -458,6 +523,110 @@ class DatasetFilterService:
             severity=severity,
         )
 
+    def _start_visual_sampling_jobs(
+        self,
+        episodes: list,
+        integrity_by_episode: dict[int, list[FilterFinding]],
+    ) -> None:
+        if not self._is_stage_enabled("visual_quality"):
+            return
+        jobs: list[_VisualSampleJob] = []
+        seen: set[VisualSampleCacheKey] = set()
+        for episode in episodes:
+            if integrity_by_episode.get(episode.episode_index):
+                continue
+            video_files = getattr(episode, "video_files", {}) or {}
+            for camera, relative_path in video_files.items():
+                path = self.reader.root / relative_path
+                if not path.is_file():
+                    continue
+                key, start_seconds, duration_seconds = self._visual_sample_bounds(
+                    episode,
+                    camera,
+                    path,
+                )
+                if key in seen or key in self._sampled_video_cache:
+                    continue
+                seen.add(key)
+                jobs.append(
+                    _VisualSampleJob(
+                        key=key,
+                        path=path,
+                        start_seconds=start_seconds,
+                        duration_seconds=duration_seconds,
+                    )
+                )
+        if not jobs:
+            return
+        max_workers = min(self.config.visual_quality.max_parallel_video_decodes, len(jobs))
+        self._pending_visual_sample_jobs = deque(jobs)
+        self._visual_sample_executor = ThreadPoolExecutor(max_workers=max_workers)
+        for _ in range(max_workers):
+            self._submit_next_visual_sampling_job()
+
+    def _submit_next_visual_sampling_job(self) -> None:
+        if self._visual_sample_executor is None or not self._pending_visual_sample_jobs:
+            return
+        job = self._pending_visual_sample_jobs.popleft()
+        self._visual_sample_futures[job.key] = self._visual_sample_executor.submit(
+            sample_video_frames,
+            job.path,
+            self.config.visual_quality,
+            start_seconds=job.start_seconds,
+            duration_seconds=job.duration_seconds,
+        )
+
+    def _shutdown_visual_sampling_jobs(self) -> None:
+        if self._visual_sample_executor is not None:
+            self._visual_sample_executor.shutdown(wait=False, cancel_futures=True)
+        self._visual_sample_executor = None
+        self._pending_visual_sample_jobs.clear()
+        self._visual_sample_futures.clear()
+
+    def _visual_sample_bounds(
+        self,
+        episode,
+        camera: str,
+        path: Path,
+    ) -> tuple[VisualSampleCacheKey, float, float]:
+        start_seconds = float(episode.video_start_seconds.get(camera, 0.0))
+        end_seconds = float(
+            episode.video_end_seconds.get(
+                camera,
+                start_seconds + episode.duration_seconds,
+            )
+        )
+        duration_seconds = max(0.0, end_seconds - start_seconds)
+        return (path, start_seconds, duration_seconds), start_seconds, duration_seconds
+
+    def _sample_video_frames_cached(
+        self,
+        key: VisualSampleCacheKey,
+        path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+    ) -> list[np.ndarray]:
+        frames = self._sampled_video_cache.get(key)
+        if frames is not None:
+            return frames
+        future = self._visual_sample_futures.get(key)
+        if future is not None:
+            try:
+                frames = future.result()
+            finally:
+                self._visual_sample_futures.pop(key, None)
+                self._submit_next_visual_sampling_job()
+            self._sampled_video_cache[key] = frames
+            return frames
+        frames = sample_video_frames(
+            path,
+            self.config.visual_quality,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+        )
+        self._sampled_video_cache[key] = frames
+        return frames
+
     def _visual_quality_result(
         self,
         episode,
@@ -482,24 +651,17 @@ class DatasetFilterService:
                 combined.issue_counts["video_missing"] = combined.issue_counts.get("video_missing", 0) + 1
                 continue
             existing_videos += 1
-            start_seconds = float(episode.video_start_seconds.get(camera, 0.0))
-            end_seconds = float(
-                episode.video_end_seconds.get(
-                    camera,
-                    start_seconds + episode.duration_seconds,
-                )
+            cache_key, start_seconds, duration_seconds = self._visual_sample_bounds(
+                episode,
+                camera,
+                path,
             )
-            duration_seconds = max(0.0, end_seconds - start_seconds)
-            cache_key = (path, start_seconds, duration_seconds)
-            frames = self._sampled_video_cache.get(cache_key)
-            if frames is None:
-                frames = sample_video_frames(
-                    path,
-                    config,
-                    start_seconds=start_seconds,
-                    duration_seconds=duration_seconds,
-                )
-                self._sampled_video_cache[cache_key] = frames
+            frames = self._sample_video_frames_cached(
+                cache_key,
+                path,
+                start_seconds,
+                duration_seconds,
+            )
             if not frames:
                 combined.rows.append(
                     _visual_row(None, None, camera, "decode_failed", "unavailable", "decodable")
@@ -1096,6 +1258,8 @@ class DatasetFilterService:
         )
 
     def _default_stage_status(self, stage_id: FilterStageId) -> FilterStatus:
+        if not self._is_stage_enabled(stage_id):
+            return "skipped"
         if stage_id == "kinematic_consistency" and self._default_skipped_reason(stage_id):
             return "skipped"
         if stage_id == "orientation_alignment":
@@ -1103,6 +1267,8 @@ class DatasetFilterService:
         return "passed"
 
     def _default_skipped_reason(self, stage_id: FilterStageId) -> str | None:
+        if not self._is_stage_enabled(stage_id):
+            return "disabled"
         if stage_id == "kinematic_consistency":
             if importlib.util.find_spec("pinocchio") is None:
                 return "backend_missing"

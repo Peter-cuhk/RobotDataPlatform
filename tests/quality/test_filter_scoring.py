@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -194,6 +196,49 @@ class SharedVideoReader(SpikeReader):
         )
 
 
+class MultiCameraVideoReader(SpikeReader):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+
+    def metadata(self) -> DatasetMetadata:
+        metadata = super().metadata()
+        return metadata.model_copy(
+            update={
+                "video_keys": [
+                    "observation.images.cam_high",
+                    "observation.images.cam_wrist",
+                ]
+            }
+        )
+
+    def list_episodes(self, limit: int | None = None) -> list[EpisodeSummary]:
+        episodes = [self.episode(0), self.episode(1)]
+        return episodes[:limit] if limit is not None else episodes
+
+    def episode(self, episode_index: int) -> EpisodeSummary:
+        episode = super().episode(episode_index)
+        high = f"videos/high-{episode_index}.mp4"
+        wrist = f"videos/wrist-{episode_index}.mp4"
+        return episode.model_copy(
+            update={
+                "episode_index": episode_index,
+                "video_files": {
+                    "observation.images.cam_high": high,
+                    "observation.images.cam_wrist": wrist,
+                },
+                "video_start_seconds": {
+                    "observation.images.cam_high": 0.0,
+                    "observation.images.cam_wrist": 0.0,
+                },
+                "video_end_seconds": {
+                    "observation.images.cam_high": episode.duration_seconds,
+                    "observation.images.cam_wrist": episode.duration_seconds,
+                },
+            }
+        )
+
+
 def test_visual_quality_samples_each_episode_segment_from_shared_video(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -214,10 +259,82 @@ def test_visual_quality_samples_each_episode_segment_from_shared_video(
 
     DatasetFilterService(SharedVideoReader(tmp_path), FilterConfig()).summary()
 
-    assert calls == [
+    assert sorted(calls, key=lambda item: item[1]) == [
         (video_path, 0.0, 2.02),
         (video_path, 2.02, 2.02),
     ]
+
+
+def test_visual_quality_samples_videos_with_bounded_parallelism(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    for name in ["high-0.mp4", "wrist-0.mp4", "high-1.mp4", "wrist-1.mp4"]:
+        (videos / name).write_bytes(b"fake video")
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    calls: list[Path] = []
+
+    def sample_once(path: Path, _config, *, start_seconds: float, duration_seconds: float):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(path)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return [np.zeros((120, 160, 3), dtype=np.uint8)]
+
+    monkeypatch.setattr(
+        "robot_data_studio.quality.filter_service.sample_video_frames",
+        sample_once,
+    )
+
+    config = FilterConfig(
+        visual_quality=FilterConfig().visual_quality.model_copy(
+            update={"max_parallel_video_decodes": 2}
+        )
+    )
+    DatasetFilterService(MultiCameraVideoReader(tmp_path), config).summary()
+
+    assert max_active == 2
+    assert sorted(path.name for path in calls) == [
+        "high-0.mp4",
+        "high-1.mp4",
+        "wrist-0.mp4",
+        "wrist-1.mp4",
+    ]
+
+
+def test_disabled_filter_stages_skip_visual_quality_sampling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video_path = tmp_path / "videos" / "shared.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"fake video")
+    calls: list[tuple[Path, float, float]] = []
+
+    def sample_once(path: Path, _config, *, start_seconds: float, duration_seconds: float):
+        calls.append((path, start_seconds, duration_seconds))
+        return [np.zeros((120, 160, 3), dtype=np.uint8)]
+
+    monkeypatch.setattr(
+        "robot_data_studio.quality.filter_service.sample_video_frames",
+        sample_once,
+    )
+
+    config = FilterConfig(enabled_filter_stages=["sudden_change", "extreme_value"])
+    summary = DatasetFilterService(SharedVideoReader(tmp_path), config).summary()
+
+    assert calls == []
+    assert summary.episodes[0].stage_status["visual_quality"].status == "skipped"
+    assert summary.episodes[0].stage_status["visual_quality"].skipped_reason == "disabled"
+    assert summary.episodes[0].stage_status["sudden_change"].status in {"passed", "review"}
 
 
 def test_visual_quality_detail_exposes_real_episode_frames_and_incidents(

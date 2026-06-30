@@ -21,6 +21,14 @@ def _checkerboard() -> np.ndarray:
     return np.repeat(pattern[:, :, None], 3, axis=2)
 
 
+def test_visual_quality_parallel_decode_config_defaults_and_bounds() -> None:
+    assert FilterVisualQualityConfig().max_parallel_video_decodes == 4
+    with pytest.raises(ValueError):
+        FilterVisualQualityConfig(max_parallel_video_decodes=0)
+    with pytest.raises(ValueError):
+        FilterVisualQualityConfig(max_parallel_video_decodes=9)
+
+
 def test_clear_high_contrast_frames_pass_visual_quality() -> None:
     result = analyze_sampled_frames(
         [_checkerboard(), np.roll(_checkerboard(), 1, axis=1)],

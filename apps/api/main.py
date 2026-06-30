@@ -20,6 +20,7 @@ from robot_data_studio.quality import (
     FilterSummary,
     VlmSettings,
 )
+from robot_data_studio.reports import ReportSignals
 from robot_data_studio.viewer import create_episode_recording
 
 
@@ -64,6 +65,19 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.get(
+        "/api/projects/{project_id}/report-signals",
+        response_model=ReportSignals,
+    )
+    def report_signals(
+        project_id: str,
+        episode_index: int = Query(ge=0),
+    ) -> ReportSignals:
+        try:
+            return service.report_signals(project_id, episode_index)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get(
         "/api/projects/{project_id}/episodes/{episode_index}/visual-quality/frame",
         response_class=Response,
     )
@@ -104,6 +118,14 @@ def create_app(artifact_root: str | Path = ".rds-artifacts") -> FastAPI:
             output = service.artifact_root / filename
             create_episode_recording(service.reader(project_id), episode_index, output)
             return {"recording_url": f"/api/artifacts/{filename}"}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/episodes/{episode_index}/recording/warm")
+    def warm_recording(project_id: str, episode_index: int) -> dict[str, str]:
+        try:
+            service.reader(project_id).episode(episode_index)
+            return {"status": "warmed"}
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 

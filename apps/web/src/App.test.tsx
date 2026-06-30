@@ -72,6 +72,8 @@ async function clearDefaultSidebarFilters(user: ReturnType<typeof userEvent.setu
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   installMemoryStorage();
   window.localStorage.clear();
 });
@@ -388,6 +390,36 @@ test("normalizes quoted output folders before exporting", async () => {
   );
 });
 
+test("shows export errors in the viewer instead of failing silently", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ detail: "Export output directory must be a directory" }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.type(await screen.findByLabelText("Output folder"), "data/samples/conversion_report.json");
+  await user.click(screen.getByRole("button", { name: "Export 1 episode" }));
+
+  expect(await screen.findByText("Export output directory must be a directory")).toBeInTheDocument();
+});
+
 test("resizes the quality report panel by dragging the workspace separator", async () => {
   const user = userEvent.setup();
   const fetch = vi
@@ -495,7 +527,7 @@ test("exports manually checked episodes without changing the inspected episode",
   );
 });
 
-test("shows the checked episode count as the main export count", async () => {
+test("shows the active export scope count as the main export count", async () => {
   const user = userEvent.setup();
   const fetch = vi
     .fn()
@@ -520,7 +552,7 @@ test("shows the checked episode count as the main export count", async () => {
   await user.click(screen.getByLabelText("Add Episode 000002 to export"));
 
   const exportCount = document.querySelector(".export-count");
-  expect(exportCount).toHaveTextContent("Episodes33 checked");
+  expect(exportCount).toHaveTextContent("Episodes11 in scope · 3 checked");
   expect(screen.getByRole("button", { name: "Export 1 episode" })).toBeInTheDocument();
 });
 
@@ -697,6 +729,44 @@ test("data filter checkboxes use filter summary when exporting current filtered 
   );
 });
 
+test("filtering episodes from the sidebar does not change enabled cleaning rules", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse());
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+
+  await user.click(filters.getByLabelText("Sudden change"));
+  expect(filters.getByLabelText("Sudden change")).not.toBeChecked();
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/projects/project-1/pipeline/runs/stream",
+    expect.objectContaining({
+      method: "POST",
+      body: expect.stringContaining('"enabled_filter_stages":["visual_quality","sudden_change","state_action_alignment","extreme_value","metadata_completeness"]'),
+    }),
+  );
+});
+
 test("runs cleaning and renders episode status folders", async () => {
   const user = userEvent.setup();
   vi.stubGlobal(
@@ -730,6 +800,223 @@ test("runs cleaning and renders episode status folders", async () => {
   expect(screen.getByText("Data quality")).toBeInTheDocument();
   expect(screen.getByText("Task success")).toBeInTheDocument();
   expect(screen.getByText("Not evaluated")).toBeInTheDocument();
+});
+
+test("opens a compact dataset cleaning report after a full pipeline run", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () =>
+        projectResponse({
+          total_episodes: 3,
+          total_frames: 421,
+          robot_type: "aloha",
+          features: {
+            "observation.state": { dtype: "float32", shape: [14] },
+            action: {
+              dtype: "float32",
+              shape: [14],
+              names: {
+                motors: [
+                  "left_waist",
+                  "left_shoulder",
+                  "left_elbow",
+                  "left_forearm_roll",
+                  "left_wrist_angle",
+                  "left_wrist_rotate",
+                  "left_gripper",
+                  "right_waist",
+                  "right_shoulder",
+                  "right_elbow",
+                  "right_forearm_roll",
+                  "right_wrist_angle",
+                  "right_wrist_rotate",
+                  "right_gripper",
+                ],
+              },
+            },
+          },
+        }),
+    })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => reportSignalsResponse(0, "left_gripper"),
+    })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "warmed" }) });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(await screen.findByRole("heading", { name: "Cleaning Report" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
+  const embeddedReport = document.querySelector(".viewer-stage .cleaning-report-dashboard");
+  expect(embeddedReport).not.toBeNull();
+  expect(within(embeddedReport as HTMLElement).getByText("Episodes")).toBeInTheDocument();
+  expect(within(embeddedReport as HTMLElement).getByText("Frames")).toBeInTheDocument();
+  expect(within(embeddedReport as HTMLElement).getByText("Duration")).toBeInTheDocument();
+  expect(within(embeddedReport as HTMLElement).getByText("Overall score")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Data Contract" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Task & Sensors" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Quality findings" })).toBeInTheDocument();
+  expect(screen.getByText("Joint action")).toBeInTheDocument();
+  expect(screen.getAllByText("[14] · float32")).toHaveLength(2);
+  expect(screen.getAllByText("Not declared").length).toBeGreaterThanOrEqual(2);
+  expect(screen.queryByText("Lowest score episodes")).not.toBeInTheDocument();
+
+  let statusStrip = document.querySelector(".report-status-strip");
+  expect(statusStrip).not.toBeNull();
+  expect(within(statusStrip as HTMLElement).getByRole("button", { name: /#000000/ })).toBeInTheDocument();
+  expect(within(statusStrip as HTMLElement).getByRole("button", { name: /#000001/ })).toBeInTheDocument();
+  expect(within(statusStrip as HTMLElement).getByRole("button", { name: /#000002/ })).toBeInTheDocument();
+  expect(document.querySelector(".workspace")).not.toBeNull();
+  expect(document.querySelector(".episode-panel")).not.toBeNull();
+  expect(document.querySelector(".quality-panel")).toBeNull();
+  expect(document.querySelector(".quality-resizer")).toBeNull();
+
+  await user.click(screen.getByRole("button", { name: "Inspect episodes" }));
+  expect(await screen.findByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "View report" }));
+  expect(await screen.findByRole("heading", { name: "Cleaning Report" })).toBeInTheDocument();
+
+  statusStrip = document.querySelector(".report-status-strip");
+  expect(statusStrip).not.toBeNull();
+  await user.click(within(statusStrip as HTMLElement).getByRole("button", { name: /#000000/ }));
+  expect(await screen.findByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "View report" }));
+  expect(await screen.findByRole("heading", { name: "Cleaning Report" })).toBeInTheDocument();
+});
+
+test("loads report signals and switches the gripper episode", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse({ total_episodes: 3, total_frames: 421 }),
+    })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => reportSignalsResponse(0, "left_gripper"),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => reportSignalsResponse(1, "right_gripper"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(await screen.findByRole("heading", { name: "Dataset Signals" })).toBeInTheDocument();
+  expect(screen.getByText("left_gripper")).toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "Gripper opening curve" })).toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "Episode duration distribution" })).toBeInTheDocument();
+  expect(screen.getAllByText("Mean 2.00s").length).toBeGreaterThan(0);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/projects/project-1/report-signals?episode_index=0",
+    expect.objectContaining({ headers: { "Content-Type": "application/json" } }),
+  );
+
+  await user.selectOptions(screen.getByRole("combobox", { name: "Report episode" }), "1");
+
+  expect(await screen.findByText("right_gripper")).toBeInTheDocument();
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/projects/project-1/report-signals?episode_index=1",
+    expect.objectContaining({ headers: { "Content-Type": "application/json" } }),
+  );
+});
+
+test("keeps the duration chart when named gripper data is unavailable", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse({ total_episodes: 3, total_frames: 421 }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+      .mockResolvedValueOnce(pipelineJsonResponse())
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ...reportSignalsResponse(0, "unused"),
+          gripper_series: [],
+          gripper_unavailable_reason: "no_named_gripper_dimensions",
+        }),
+      }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(
+    await screen.findByText("No named gripper action dimensions were found."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "Episode duration distribution" })).toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "Gripper opening curve" })).not.toBeInTheDocument();
+});
+
+test("includes the displayed signal values in the downloaded report", async () => {
+  const user = userEvent.setup();
+  let reportJson = "";
+  const blobMock = vi.fn((parts: BlobPart[]) => {
+    reportJson = String(parts[0] ?? "");
+    return {} as Blob;
+  });
+  const clickMock = vi
+    .spyOn(HTMLAnchorElement.prototype, "click")
+    .mockImplementation(() => undefined);
+  vi.stubGlobal("Blob", blobMock);
+  vi.stubGlobal("URL", {
+    createObjectURL: vi.fn(() => "blob:report"),
+    revokeObjectURL: vi.fn(),
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse({ total_episodes: 3, total_frames: 421 }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+      .mockResolvedValueOnce(pipelineJsonResponse())
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => reportSignalsResponse(0, "left_gripper"),
+      }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await screen.findByText("left_gripper");
+  await user.click(screen.getByRole("button", { name: "Export report" }));
+
+  const payload = JSON.parse(reportJson);
+  expect(payload.signals.episode_index).toBe(0);
+  expect(payload.signals.gripper_series[0].label).toBe("left_gripper");
+  expect(payload.signals.episode_durations).toHaveLength(3);
+  expect(clickMock).toHaveBeenCalledOnce();
+  clickMock.mockRestore();
 });
 
 test("marks saved results from an older scorer as requiring a rerun", async () => {
@@ -875,6 +1162,10 @@ test("checks visible episodes in a cleaning status folder for export", async () 
     .mockResolvedValueOnce(pipelineJsonResponse(summary))
     .mockResolvedValueOnce({
       ok: true,
+      json: async () => reportSignalsResponse(0, "left_gripper"),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
       json: async () => exportResult(1),
     });
   vi.stubGlobal("fetch", fetch);
@@ -1006,9 +1297,13 @@ test("advances to the next passed episode after excluding from the pass folder",
   const fetch = vi
     .fn()
     .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
-    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse({ total_episodes: 3 }) })
     .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
     .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => reportSignalsResponse(0, "left_gripper"),
+    })
     .mockResolvedValueOnce({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }) })
     .mockResolvedValueOnce({
       ok: true,
@@ -1021,6 +1316,7 @@ test("advances to the next passed episode after excluding from the pass folder",
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Inspect episodes" }));
   await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
   await user.click(await screen.findByRole("button", { name: "Exclude" }));
 
@@ -1045,9 +1341,13 @@ test("stays on the current episode when its status folder is emptied by the deci
   const fetch = vi
     .fn()
     .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
-    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse({ total_episodes: 3 }) })
     .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
     .mockResolvedValueOnce(pipelineJsonResponse(summary))
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => reportSignalsResponse(0, "left_gripper"),
+    })
     .mockResolvedValueOnce({ ok: true, json: async () => ({ recording_url: "/api/artifacts/episode-000000.rrd" }) })
     .mockResolvedValueOnce({
       ok: true,
@@ -1058,6 +1358,7 @@ test("stays on the current episode when its status folder is emptied by the deci
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Inspect episodes" }));
   await user.click(await screen.findByRole("button", { name: "Replay in Rerun" }));
   await user.click(await screen.findByRole("button", { name: "Exclude" }));
 
@@ -1208,6 +1509,139 @@ test("opens the visual quality detail view from the filter label", async () => {
   );
 });
 
+test("opens the matching filter detail view from a quality issue card", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse({
+      ...cleaningSummary(),
+      results: [
+        {
+          ...cleaningSummary().results[0],
+          findings: [
+            {
+              code: "visual_quality",
+              severity: "warn",
+              message: "Visual quality issues require review. Count: 4.",
+            },
+          ],
+        },
+        ...cleaningSummary().results.slice(1),
+      ],
+    }))
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Visual quality issues require review. Count: 4." }));
+
+  expect(await screen.findByRole("heading", { name: "Visual quality" })).toBeInTheDocument();
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/filters/visual_quality/episodes/0",
+    expect.any(Object),
+  );
+});
+
+test("hides manual decision buttons in filter detail before cleaning has run", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Visual quality" }));
+
+  expect(await screen.findByRole("heading", { name: "Visual quality" })).toBeInTheDocument();
+  const qualityPanel = document.querySelector(".quality-panel");
+  expect(qualityPanel).not.toBeNull();
+  expect(within(qualityPanel as HTMLElement).queryByRole("button", { name: "Pass" })).not.toBeInTheDocument();
+  expect(within(qualityPanel as HTMLElement).queryByRole("button", { name: "Exclude" })).not.toBeInTheDocument();
+  expect(within(qualityPanel as HTMLElement).getByRole("button", { name: "Rerun this episode" })).toBeInTheDocument();
+});
+
+test("marks the selected episode as passed from the filter detail quality panel", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...cleaningSummary().results[0],
+        status: "passed",
+        source: "manual",
+      }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Visual quality" }));
+
+  const qualityPanel = document.querySelector(".quality-panel");
+  expect(qualityPanel).not.toBeNull();
+  await user.click(within(qualityPanel as HTMLElement).getByRole("button", { name: "Pass" }));
+
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/api/projects/project-1/episodes/0/decision",
+    expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify({ status: "passed" }),
+    }),
+  );
+});
+
 test("opens the extreme value detail view from the filter label", async () => {
   const user = userEvent.setup();
   const fetch = vi
@@ -1314,6 +1748,38 @@ test("opens the kinematic consistency view with URDF configuration controls", as
   expect(screen.getByText(/Pinocchio/)).toBeInTheDocument();
 });
 
+test("restores configured kinematics from imported project filter config", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => formatsResponse(),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => projectResponse({ filter_config: configuredFilterConfigResponse() }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => episodesResponse(),
+      }),
+  );
+  renderApp();
+
+  await importDatasetForTest(user);
+
+  const sidebar = document.querySelector(".sidebar-tools");
+  expect(sidebar).not.toBeNull();
+  const filters = within(sidebar as HTMLElement);
+  expect(filters.getByLabelText("Kinematic consistency")).toBeChecked();
+  expect(filters.getByLabelText("Kinematic consistency")).toBeEnabled();
+  await user.click(filters.getByRole("button", { name: "Expand Kinematic consistency weight" }));
+  expect(filters.getByLabelText("Kinematic consistency weight")).toBeEnabled();
+});
+
 test("sends VLM settings when running cleaning", async () => {
   const user = userEvent.setup();
   const fetch = vi
@@ -1380,6 +1846,36 @@ test("sends VLM settings when running cleaning", async () => {
       }),
     }),
   );
+});
+
+test("does not overwrite saved VLM settings when running cleaning without local edits", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse());
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  const pipelineCall = fetch.mock.calls.find(([url]) => url === "/api/projects/project-1/pipeline/runs/stream");
+  expect(pipelineCall).toBeDefined();
+  const body = JSON.parse(pipelineCall?.[1]?.body as string);
+  expect(body).not.toHaveProperty("vlm");
+  expect(fetch).not.toHaveBeenCalledWith("/api/projects/project-1/vlm-settings", expect.any(Object));
 });
 
 test("shows all eight principles and keeps configurable checks off until configured", async () => {
@@ -1486,21 +1982,12 @@ test("sends selected cleaning rules and slider weights when running cleaning", a
           extreme_value: 2,
           metadata_completeness: 1,
         },
-        vlm: {
-          enabled: false,
-          provider: "OpenAI",
-          model: "gpt-4o-mini",
-          api_base_url: null,
-          prompt:
-            "You are an automated robot episode evaluator. Return only JSON with success, score, and reason. Judge whether the task was successfully completed from the visual evidence.",
-          sample_frames: 4,
-        },
       }),
     }),
   );
 });
 
-test("runs cleaning only for the selected episode from the viewer toolbar", async () => {
+test("runs cleaning only for the selected episode from the right quality panel", async () => {
   const user = userEvent.setup();
   const fetch = vi
     .fn()
@@ -1516,12 +2003,15 @@ test("runs cleaning only for the selected episode from the viewer toolbar", asyn
       ok: true,
       json: async () => episodesResponse(),
     })
+    .mockResolvedValueOnce(pipelineJsonResponse())
     .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
   renderApp();
 
   await importDatasetForTest(user);
-  await user.click(await screen.findByRole("button", { name: "Run selected episode" }));
+  expect(screen.queryByRole("button", { name: "Run selected episode" })).not.toBeInTheDocument();
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Rerun this episode" }));
 
   expect(fetch).toHaveBeenCalledWith(
     "/api/projects/project-1/pipeline/runs/stream",
@@ -1620,7 +2110,59 @@ test("loads saved VLM settings into the panel without exposing the API key", asy
   expect(screen.queryByDisplayValue("secret-key")).not.toBeInTheDocument();
 });
 
-test("shows three quality findings and can add the selected episode to cleaning pipeline", async () => {
+test("reloads saved VLM settings after a local edit has been saved", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => savedVlmSettingsResponse({ model: "initial-model" }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => savedVlmSettingsResponse({ model: "edited-model" }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => savedVlmSettingsResponse({ model: "server-reloaded-model" }),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(screen.getByRole("button", { name: "VLM settings" }));
+  expect(await screen.findByDisplayValue("initial-model")).toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText("VLM model"), { target: { value: "edited-model" } });
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/projects/project-1/vlm-settings",
+      expect.objectContaining({
+        method: "PATCH",
+        body: expect.stringContaining('"model":"edited-model"'),
+      }),
+    ),
+  );
+
+  await user.click(screen.getByRole("button", { name: "VLM settings" }));
+  await user.click(screen.getByRole("button", { name: "VLM settings" }));
+
+  expect(await screen.findByDisplayValue("server-reloaded-model")).toBeInTheDocument();
+});
+
+test("shows three quality findings and can rerun the selected episode", async () => {
   const user = userEvent.setup();
   const fetch = vi
     .fn()
@@ -1645,11 +2187,14 @@ test("shows three quality findings and can add the selected episode to cleaning 
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
   expect(await screen.findByText("3 issues found")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Add to cleaning Pipeline" }));
+  await user.click(screen.getByRole("button", { name: "Rerun this episode" }));
 
   expect(fetch).toHaveBeenCalledWith(
     "/api/projects/project-1/pipeline/runs/stream",
-    expect.objectContaining({ method: "POST" }),
+    expect.objectContaining({
+      method: "POST",
+      body: expect.stringContaining('"episode_indexes":[0]'),
+    }),
   );
 });
 
@@ -1665,7 +2210,7 @@ test("shows the selected episode ready-to-build view after running the pipeline"
       })
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => projectResponse(),
+        json: async () => projectResponse({ total_episodes: 3 }),
       })
       .mockResolvedValueOnce({
         ok: true,
@@ -1679,12 +2224,17 @@ test("shows the selected episode ready-to-build view after running the pipeline"
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
 
   expect(await screen.findByRole("heading", { name: "Episode 000000" })).toBeInTheDocument();
-  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
-  expect(screen.queryByRole("heading", { name: "Cleaning summary" })).not.toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Cleaning Report" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Rerun replay is ready to build" })).not.toBeInTheDocument();
 
   const viewerStage = document.querySelector(".viewer-stage");
   expect(viewerStage).not.toBeNull();
   expect(viewerStage).toHaveClass("viewer-stage-scroll");
+  expect(viewerStage?.querySelector(".cleaning-report-dashboard")).not.toBeNull();
+  expect(document.querySelector(".quality-panel")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Inspect episodes" }));
+  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(document.querySelector(".quality-panel")).not.toBeNull();
 });
 
 test("selecting an episode shows the ready-to-build placeholder without auto-building the replay", async () => {
@@ -1692,7 +2242,7 @@ test("selecting an episode shows the ready-to-build placeholder without auto-bui
   const fetch = vi
     .fn()
     .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
-    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse({ total_episodes: 3 }) })
     .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
     .mockResolvedValueOnce(pipelineJsonResponse());
   vi.stubGlobal("fetch", fetch);
@@ -1700,7 +2250,7 @@ test("selecting an episode shows the ready-to-build placeholder without auto-bui
 
   await importDatasetForTest(user);
   await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
-  expect(await screen.findByRole("heading", { name: "Rerun replay is ready to build" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Cleaning Report" })).toBeInTheDocument();
 
   const episodePanel = document.querySelector(".episode-panel");
   expect(episodePanel).not.toBeNull();
@@ -1807,6 +2357,53 @@ test("shows only valid manual decisions for passed and excluded episodes", async
   expect(screen.queryByRole("button", { name: "Exclude" })).not.toBeInTheDocument();
 });
 
+test("shows only valid manual decisions in the filter detail quality panel", async () => {
+  const user = userEvent.setup();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => formatsResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => projectResponse(),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => episodesResponse(),
+    })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "warmed" }) })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => filterDetailResponse("visual_quality"),
+    });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Visual quality" }));
+
+  let qualityPanel = document.querySelector(".quality-panel");
+  expect(qualityPanel).not.toBeNull();
+  expect(within(qualityPanel as HTMLElement).getByRole("button", { name: "Pass" })).toBeInTheDocument();
+  expect(within(qualityPanel as HTMLElement).getByRole("button", { name: "Exclude" })).toBeInTheDocument();
+
+  await user.click(screen.getAllByRole("button", { name: /#000002/ })[0]);
+  await user.click(await screen.findByRole("button", { name: "Visual quality" }));
+
+  qualityPanel = document.querySelector(".quality-panel");
+  expect(qualityPanel).not.toBeNull();
+  expect(within(qualityPanel as HTMLElement).queryByRole("button", { name: "Pass" })).not.toBeInTheDocument();
+  expect(within(qualityPanel as HTMLElement).getByRole("button", { name: "Exclude" })).toBeInTheDocument();
+});
+
 test("renders a progress line on the Run cleaning Pipeline button while streaming", async () => {
   const user = userEvent.setup();
   const encoder = new TextEncoder();
@@ -1818,8 +2415,7 @@ test("renders a progress line on the Run cleaning Pipeline button while streamin
       controllerRef.current = controller;
       controller.enqueue(
         encoder.encode(
-          `event: progress\ndata: ${JSON.stringify({ phase: "cleaning", completed: 1, total: 3 })}\n\n` +
-            `event: progress\ndata: ${JSON.stringify({ phase: "filters", completed: 3, total: 6 })}\n\n`,
+          `event: progress\ndata: ${JSON.stringify({ phase: "filters", completed: 3, total: 6 })}\n\n`,
         ),
       );
     },
@@ -1840,7 +2436,14 @@ test("renders a progress line on the Run cleaning Pipeline button while streamin
   await waitFor(() => expect(button.textContent).toContain("Cleaning"));
   const line = button.querySelector(".button-progress-line") as HTMLElement | null;
   expect(line).not.toBeNull();
-  await waitFor(() => expect(line).toHaveStyle({ left: "75%" }));
+  await waitFor(() => expect(line).toHaveStyle({ left: "25%" }));
+
+  controllerRef.current?.enqueue(
+    encoder.encode(
+      `event: progress\ndata: ${JSON.stringify({ phase: "cleaning", completed: 1, total: 3 })}\n\n`,
+    ),
+  );
+  await waitFor(() => expect(line).toHaveStyle({ left: "67%" }));
 
   controllerRef.current?.enqueue(
     encoder.encode(
@@ -1856,21 +2459,177 @@ test("renders a progress line on the Run cleaning Pipeline button while streamin
   expect(button.querySelector(".button-progress-line")).toBeNull();
 });
 
-function projectResponse(overrides: Partial<{ format: string; version: string }> = {}) {
+test("disables importing another dataset while cleaning is running", async () => {
+  const user = userEvent.setup();
+  const stream = new ReadableStream<Uint8Array>();
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce({ ok: true, body: stream });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(screen.getByRole("button", { name: "Import dataset" })).toBeDisabled();
+});
+
+test("shows dataset cleaning progress without making both cleaning buttons identical", async () => {
+  const user = userEvent.setup();
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(
+          `event: progress\ndata: ${JSON.stringify({ phase: "filters", completed: 1, total: 4 })}\n\n`,
+        ),
+      );
+    },
+  });
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce({ ok: true, body: stream });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+
+  expect(await screen.findByRole("button", { name: /Cleaning dataset/ })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Run selected episode" })).not.toBeInTheDocument();
+  expect(await screen.findByText("Cleaning 13%")).toBeInTheDocument();
+});
+
+test("uses the right panel as the only selected episode cleaning entry point while rerunning", async () => {
+  const user = userEvent.setup();
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(
+          `event: progress\ndata: ${JSON.stringify({ phase: "cleaning", completed: 1, total: 1 })}\n\n`,
+        ),
+      );
+    },
+  });
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => formatsResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => projectResponse() })
+    .mockResolvedValueOnce({ ok: true, json: async () => episodesResponse() })
+    .mockResolvedValueOnce(pipelineJsonResponse())
+    .mockResolvedValueOnce({ ok: true, body: stream });
+  vi.stubGlobal("fetch", fetch);
+  renderApp();
+
+  await importDatasetForTest(user);
+  expect(screen.queryByRole("button", { name: "Run selected episode" })).not.toBeInTheDocument();
+  await user.click(await screen.findByRole("button", { name: "Run cleaning Pipeline" }));
+  await user.click(await screen.findByRole("button", { name: "Rerun this episode" }));
+
+  expect(await screen.findByRole("button", { name: "Cleaning selected..." })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Run cleaning Pipeline" })).toBeDisabled();
+});
+
+function projectResponse(
+  overrides: Partial<{
+    format: string;
+    version: string;
+    total_episodes: number;
+    total_frames: number;
+    robot_type: string;
+    features: Record<string, unknown>;
+    filter_config: ReturnType<typeof configuredFilterConfigResponse>;
+  }> = {},
+) {
   return {
     id: "project-1",
     dataset: {
       path: "/tmp/pusht",
       format: overrides.format ?? "lerobot",
       version: overrides.version ?? "v3.0",
-      total_episodes: 206,
-      total_frames: 25650,
+      total_episodes: overrides.total_episodes ?? 206,
+      total_frames: overrides.total_frames ?? 25650,
       fps: 10,
-      robot_type: "unknown",
+      robot_type: overrides.robot_type ?? "unknown",
       video_keys: ["observation.image"],
       scalar_keys: ["observation.state", "action"],
-      features: {},
+      features: overrides.features ?? {},
     },
+    ...(overrides.filter_config ? { filter_config: overrides.filter_config } : {}),
+  };
+}
+
+function configuredFilterConfigResponse() {
+  return {
+    gripper_indices: [],
+    enabled_filter_stages: [
+      "visual_quality",
+      "sudden_change",
+      "state_action_alignment",
+      "extreme_value",
+      "kinematic_consistency",
+      "metadata_completeness",
+    ],
+    visual_quality: {
+      sample_fps: 2,
+      max_frames_per_video: 48,
+      max_parallel_video_decodes: 2,
+      sample_width: 320,
+      sample_height: 240,
+      blur_laplacian_threshold: 18,
+      dark_mean_threshold: 35,
+      bright_mean_threshold: 245,
+      dark_global_mean_threshold: 85,
+      dark_global_p75_threshold: 120,
+      bright_global_mean_threshold: 155,
+      bright_global_p75_threshold: 185,
+      low_contrast_std_threshold: 12,
+      freeze_mse_threshold: 1,
+      freeze_min_run: 4,
+    },
+    kinematics: {
+      urdf_path: "/tmp/test_robot.urdf",
+      end_effector_link: "tool0",
+      joint_names: ["joint0", "joint1"],
+      joint_state_indices: [0, 1],
+      eef_position_indices: [0, 1, 2],
+      position_tolerance: 0.05,
+      resolve_tcp_offset: true,
+    },
+    time_sync: {
+      timestamp_jitter_seconds: 0.01,
+      timestamp_jitter_ratio: 0.25,
+      duration_tolerance_seconds: 0.1,
+      video_boundary_tolerance_seconds: 0.1,
+    },
+    metadata_completeness: {
+      require_task_description: true,
+      require_camera_streams: true,
+      require_action: true,
+      require_observation_state: true,
+      require_timestamps: true,
+      min_episode_frames: 2,
+      require_monotonic_timestamps: true,
+    },
+  };
+}
+
+function savedVlmSettingsResponse(overrides: Partial<{ model: string }> = {}) {
+  return {
+    enabled: true,
+    provider: "OpenAI",
+    model: overrides.model ?? "qwen-vl-max",
+    api_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key_configured: true,
+    prompt: "Strictly review task completion: {task}",
+    sample_frames: 8,
   };
 }
 
@@ -2091,6 +2850,29 @@ function pipelineJsonResponse(
       cleaning: { run_id: "run-1", status: "succeeded", summary: cleaning },
       filters,
     }),
+  };
+}
+
+function reportSignalsResponse(episodeIndex: number, label: string) {
+  return {
+    episode_index: episodeIndex,
+    gripper_series: [
+      {
+        label,
+        dimension_index: 6,
+        points: [
+          { timestamp: 0, value: 0.1 },
+          { timestamp: 1, value: 0.8 },
+        ],
+      },
+    ],
+    episode_durations: [
+      { episode_index: 0, duration_seconds: 1 },
+      { episode_index: 1, duration_seconds: 2 },
+      { episode_index: 2, duration_seconds: 3 },
+    ],
+    mean_episode_duration_seconds: 2,
+    gripper_unavailable_reason: null,
   };
 }
 

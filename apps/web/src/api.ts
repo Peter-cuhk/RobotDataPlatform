@@ -14,6 +14,7 @@ export type DatasetMetadata = {
 export type Project = {
   id: string;
   dataset: DatasetMetadata;
+  filter_config?: FilterConfig | null;
 };
 
 export type FormatInfo = {
@@ -99,6 +100,28 @@ export type ExportResult = {
   report_path: string;
   format: string;
   episode_count: number;
+};
+
+export type ReportSignalPoint = {
+  timestamp: number;
+  value: number;
+};
+
+export type ReportGripperSeries = {
+  label: string;
+  dimension_index: number;
+  points: ReportSignalPoint[];
+};
+
+export type ReportSignals = {
+  episode_index: number;
+  gripper_series: ReportGripperSeries[];
+  episode_durations: Array<{
+    episode_index: number;
+    duration_seconds: number;
+  }>;
+  mean_episode_duration_seconds: number;
+  gripper_unavailable_reason: string | null;
 };
 
 export type VlmSettings = {
@@ -214,9 +237,11 @@ export type FilterRun = {
 
 export type FilterConfig = {
   gripper_indices: number[];
+  enabled_filter_stages?: FilterStageId[];
   visual_quality: {
     sample_fps: number;
     max_frames_per_video: number;
+    max_parallel_video_decodes: number;
     sample_width: number;
     sample_height: number;
     blur_laplacian_threshold: number;
@@ -285,9 +310,22 @@ export function listEpisodes(projectId: string) {
   return request<Episode[]>(`/api/projects/${projectId}/episodes?limit=500`);
 }
 
+export function getReportSignals(projectId: string, episodeIndex: number) {
+  return request<ReportSignals>(
+    `/api/projects/${projectId}/report-signals?episode_index=${episodeIndex}`,
+  );
+}
+
 export function createRecording(projectId: string, episodeIndex: number) {
   return request<{ recording_url: string }>(
     `/api/projects/${projectId}/episodes/${episodeIndex}/recording`,
+    { method: "POST" },
+  );
+}
+
+export function warmRecording(projectId: string, episodeIndex: number) {
+  return request<{ status: "warmed" }>(
+    `/api/projects/${projectId}/episodes/${episodeIndex}/recording/warm`,
     { method: "POST" },
   );
 }

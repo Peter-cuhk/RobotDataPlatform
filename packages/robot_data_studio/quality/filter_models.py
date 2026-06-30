@@ -14,6 +14,16 @@ FilterStageId = Literal[
     "orientation_alignment",
     "metadata_completeness",
 ]
+
+ALL_FILTER_STAGE_IDS: list[FilterStageId] = [
+    "visual_quality",
+    "sudden_change",
+    "state_action_alignment",
+    "extreme_value",
+    "kinematic_consistency",
+    "orientation_alignment",
+    "metadata_completeness",
+]
 FilterStatus = Literal["passed", "review", "skipped"]
 FilterSeverity = Literal["none", "warning", "critical"]
 
@@ -131,6 +141,7 @@ class MetadataCompletenessConfig(BaseModel):
 class FilterVisualQualityConfig(BaseModel):
     sample_fps: float = Field(default=2.0, gt=0)
     max_frames_per_video: int = Field(default=48, ge=1)
+    max_parallel_video_decodes: int = Field(default=4, ge=1, le=8)
     sample_width: int = Field(default=160, ge=16)
     sample_height: int = Field(default=120, ge=16)
     blur_laplacian_threshold: float = Field(default=18.0, ge=0)
@@ -154,6 +165,9 @@ class FilterTimeSyncConfig(BaseModel):
 
 class FilterConfig(BaseModel):
     gripper_indices: list[int] = Field(default_factory=list)
+    enabled_filter_stages: list[FilterStageId] = Field(
+        default_factory=lambda: ALL_FILTER_STAGE_IDS.copy()
+    )
     kinematics: FilterKinematicsConfig = Field(default_factory=FilterKinematicsConfig)
     visual_quality: FilterVisualQualityConfig = Field(default_factory=FilterVisualQualityConfig)
     time_sync: FilterTimeSyncConfig = Field(default_factory=FilterTimeSyncConfig)

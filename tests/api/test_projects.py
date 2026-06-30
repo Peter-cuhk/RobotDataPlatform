@@ -74,6 +74,42 @@ def test_get_episode_frames(tmp_path: Path) -> None:
     assert response.json()[0]["action"] == [233.0, 71.0]
 
 
+def test_get_report_signals_returns_dynamic_gripper_and_duration_data(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(ALOHA_SAMPLE)},
+    ).json()
+
+    response = client.get(
+        f"/api/projects/{project['id']}/report-signals",
+        params={"episode_index": 0},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["episode_index"] == 0
+    assert [row["episode_index"] for row in payload["episode_durations"]] == list(
+        range(project["dataset"]["total_episodes"])
+    )
+    assert payload["mean_episode_duration_seconds"] > 0
+    assert [series["label"] for series in payload["gripper_series"]] == [
+        "left_gripper",
+        "right_gripper",
+    ]
+    assert payload["gripper_series"][0]["points"][0].keys() == {
+        "timestamp",
+        "value",
+    }
+    missing = client.get(
+        f"/api/projects/{project['id']}/report-signals",
+        params={"episode_index": 9999},
+    )
+    assert missing.status_code == 404
+
+
 def test_get_visual_quality_evidence_frame_validates_and_decodes_source_video(
     tmp_path: Path,
     monkeypatch,
@@ -150,6 +186,22 @@ def test_generate_rerun_recording(tmp_path: Path) -> None:
     body = response.json()
     assert body["recording_url"].endswith(".rrd")
     assert (tmp_path / body["recording_url"].split("/")[-1]).stat().st_size > 0
+
+
+def test_warm_recording_validates_episode_without_building_artifact(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+    project = client.post(
+        "/api/projects",
+        json={"path": str(SAMPLE)},
+    ).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/episodes/0/recording/warm",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "warmed"}
+    assert list(tmp_path.glob("*.rrd")) == []
 
 
 def test_aloha_static_coffee_exposes_all_video_views_and_generates_recording(tmp_path: Path) -> None:
@@ -336,6 +388,27 @@ def test_run_cleaning_can_score_only_selected_episodes(tmp_path: Path) -> None:
 
     assert [result["episode_index"] for result in scored] == [0]
     assert len(results) == 206
+
+
+def test_selected_cleaning_rerun_preserves_existing_dataset_scores(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+    initial = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65},
+    ).json()["summary"]
+
+    selected = client.post(
+        f"/api/projects/{project['id']}/cleaning/runs",
+        json={"pass_threshold": 0.95, "review_threshold": 0.9, "episode_indexes": [0]},
+    )
+
+    assert selected.status_code == 201
+    summary = selected.json()["summary"]
+    assert summary["total"] == 206
+    assert summary["unscored_count"] == 0
+    assert summary["results"][1] == initial["results"][1]
+    assert summary["results"][205] == initial["results"][205]
 
 
 def test_manual_episode_decision_is_persisted_and_preserved_by_rerun(tmp_path: Path) -> None:
@@ -539,6 +612,32 @@ def test_pipeline_stream_emits_progress_and_done_events(
     assert payload["filters"]["status"] == "succeeded"
     assert payload["filters"]["summary"]["total_episodes"] == 206
     assert summary_calls == 1
+
+
+def test_selected_pipeline_stream_runs_filters_only_for_selected_episode(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/pipeline/runs/stream",
+        json={"pass_threshold": 0.85, "review_threshold": 0.65, "episode_indexes": [0]},
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    progress_events = [data for name, data in events if name == "progress"]
+    filters_progress = [data for data in progress_events if data["phase"] == "filters"]
+    cleaning_progress = [data for data in progress_events if data["phase"] == "cleaning"]
+    done_events = [data for name, data in events if name == "done"]
+
+    assert filters_progress[-1]["completed"] == filters_progress[-1]["total"] == 2
+    assert cleaning_progress[-1]["completed"] == cleaning_progress[-1]["total"] == 1
+    payload = done_events[0]
+    assert payload["filters"]["summary"]["total_episodes"] == 1
+    assert [episode["episode_index"] for episode in payload["filters"]["summary"]["episodes"]] == [0]
+    assert payload["cleaning"]["summary"]["total"] == 206
 
 
 def test_pipeline_stream_returns_404_for_unknown_project(tmp_path: Path) -> None:

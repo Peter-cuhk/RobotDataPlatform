@@ -144,6 +144,40 @@ def test_kinematic_filter_accepts_urdf_upload_and_reports_missing_pinocchio(
     assert "Pinocchio" in detail.json()["findings"][0]["message"]
 
 
+def test_project_response_includes_updated_filter_config(tmp_path: Path) -> None:
+    client = TestClient(create_app(artifact_root=tmp_path))
+    project = client.post("/api/projects", json={"path": str(SAMPLE)}).json()
+
+    upload = client.post(
+        f"/api/projects/{project['id']}/filters/kinematics/urdf?filename=test_robot.urdf",
+        content=b"<robot name='test_robot'/>",
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert upload.status_code == 201
+
+    config = client.patch(
+        f"/api/projects/{project['id']}/filters/config",
+        json={
+            "kinematics": {
+                "end_effector_link": "tool0",
+                "joint_names": ["joint0", "joint1"],
+                "joint_state_indices": [0, 1],
+                "eef_position_indices": [0, 1, 2],
+            }
+        },
+    )
+    assert config.status_code == 200
+
+    response = client.get(f"/api/projects/{project['id']}")
+
+    assert response.status_code == 200
+    kinematics = response.json()["filter_config"]["kinematics"]
+    assert kinematics["urdf_path"].endswith("test_robot.urdf")
+    assert kinematics["end_effector_link"] == "tool0"
+    assert kinematics["joint_names"] == ["joint0", "joint1"]
+    assert kinematics["eef_position_indices"] == [0, 1, 2]
+
+
 def test_kinematic_filter_autoconfigures_robomimic_panda_dataset(tmp_path: Path) -> None:
     dataset = _write_robomimic_panda_fk_dataset(tmp_path / "robomimic_panda.hdf5")
     client = TestClient(create_app(artifact_root=tmp_path / "artifacts"))
