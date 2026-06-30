@@ -94,11 +94,21 @@ pnpm install
 
 **Optional: download sample data**
 
+The first-time walkthrough below uses the smaller PushT sample:
+
 ```bash
 python scripts/download_sample.py
 ```
 
-Sample data is saved to `data/samples/lerobot-pusht` for a first run.
+Sample data is saved to `data/samples/lerobot-pusht`.
+
+For multi-camera replay and report-signal coverage in the test suite, optionally download the ALOHA sample (larger):
+
+```bash
+python scripts/download_hf_dataset.py --repo lerobot/aloha_static_coffee
+```
+
+Data is saved to `data/samples/aloha_static_coffee`.
 
 ## Startup
 
@@ -191,6 +201,15 @@ pnpm test:web
 pnpm build:web
 ```
 
+After a minimal install (PushT sample only, no Forge checkout), `pytest -q` is expected to show most tests passing with a small number of skips and up to three failures that **do not affect the first-time walkthrough**:
+
+| Situation | Affected tests | Fix (optional) |
+| --- | --- | --- |
+| `aloha_static_coffee` not downloaded | 2 API tests for multi-camera views and report signals | `python scripts/download_hf_dataset.py --repo lerobot/aloha_static_coffee` |
+| `forge/` sibling checkout missing | 5 forge cross-validation tests skipped; 1 LeRobot v3 export cross-check may fail | Clone [forge](https://github.com/arpitg1304/forge) into `forge/`, create its venv at `forge/.venv`, or set `FORGE_PYTHON` |
+
+The PushT walkthrough and core API export flows pass without these optional dependencies.
+
 ## API summary
 
 Backend default: `http://127.0.0.1:8000`. Main endpoints: `/api/health`, `/api/formats`, `/api/projects`, `/api/projects/{id}/cleaning`, `/api/projects/{id}/exports`, `/api/artifacts/{filename}`. See `apps/api/main.py` for the full route list.
@@ -204,4 +223,4 @@ Backend default: `http://127.0.0.1:8000`. Main endpoints: `/api/health`, `/api/f
 
 ## License
 
-This repository does not currently include an open-source license file. Confirm licensing before redistribution or derivative work.
+Licensed under the [Apache License, Version 2.0](LICENSE).

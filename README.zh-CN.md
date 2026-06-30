@@ -94,11 +94,21 @@ pnpm install
 
 **可选：下载样例数据**
 
+下文「第一次使用」教程默认使用较小的 PushT 样例：
+
 ```bash
 python scripts/download_sample.py
 ```
 
-样例会保存到 `data/samples/lerobot-pusht`，便于第一次试用。
+样例会保存到 `data/samples/lerobot-pusht`。
+
+若需覆盖多相机回放与报告信号相关测试，可额外下载 ALOHA 样例（体积更大）：
+
+```bash
+python scripts/download_hf_dataset.py --repo lerobot/aloha_static_coffee
+```
+
+数据会保存到 `data/samples/aloha_static_coffee`。
 
 ## 启动
 
@@ -191,6 +201,15 @@ pnpm test:web
 pnpm build:web
 ```
 
+仅按最小安装（只下载 PushT 样例、未配置 Forge）时，`pytest -q` 通常会出现大部分通过、少量跳过、最多 3 个失败——**这些与上文教程主流程无关**：
+
+| 情况 | 影响的测试 | 可选修复方式 |
+| --- | --- | --- |
+| 未下载 `aloha_static_coffee` | 2 个 API 测试（多相机视图与报告信号） | `python scripts/download_hf_dataset.py --repo lerobot/aloha_static_coffee` |
+| 未配置 `forge/` 旁路仓库 | 5 个 forge 交叉校验测试跳过；1 个 LeRobot v3 导出交叉校验可能失败 | 将 [forge](https://github.com/arpitg1304/forge) clone 到 `forge/`，创建 `forge/.venv`，或设置 `FORGE_PYTHON` |
+
+PushT 教程与核心 API 导出流程不依赖上述可选项即可正常使用。
+
 ## API 摘要
 
 后端默认地址：`http://127.0.0.1:8000`。主要端点：`/api/health`、`/api/formats`、`/api/projects`、`/api/projects/{id}/cleaning`、`/api/projects/{id}/exports`、`/api/artifacts/{filename}`。完整路由见 `apps/api/main.py`。
@@ -204,4 +223,4 @@ pnpm build:web
 
 ## License
 
-仓库当前未附带开源许可证文件。如需对外分发或二次开发，请先自行确认授权方式。
+本项目采用 [Apache License 2.0](LICENSE) 开源协议。
